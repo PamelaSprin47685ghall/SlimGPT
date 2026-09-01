@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "SlimGPT",
+  "description": "A lightweight takeover UI for your own ChatGPT web session. The ChatGPT page keeps the login state; SlimGPT never reads cookies.",
+  "version": "0.3.0",
+  "minimum_chrome_version": "120",
+  "icons": {
+    "48": "icons/slimgpt-48.png",
+    "128": "icons/slimgpt-128.png"
+  },
+  "host_permissions": ["https://chatgpt.com/*"],
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["isolated-bridge.js"],
+      "run_at": "document_start",
+      "world": "ISOLATED"
+    },
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["main-mitm.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["index.html", "assets/*", "main-mitm.js"],
+      "matches": ["https://chatgpt.com/*"]
+    }
+  ]
+}

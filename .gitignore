@@ -1,0 +1,9 @@
+node_modules/
+dist-extension/
+dist-firefox/
+dist-orion/
+release/
+AGENTS.md
+*.log
+.DS_Store
+
