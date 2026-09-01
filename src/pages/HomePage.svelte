@@ -2,12 +2,15 @@
   import { onMount } from 'svelte';
   import { Button, Navbar, NavLeft, NavRight, Page } from 'framework7-svelte';
   import ConversationSidebar from '../components/ConversationSidebar.svelte';
-  import VirtualMessageList from '../components/VirtualMessageList.svelte';
+  import ConversationTurnStage from '../components/ConversationTurnStage.svelte';
+  import MessageOverview from '../components/MessageOverview.svelte';
   import Composer from '../components/Composer.svelte';
   import { createTransport } from '../lib/transport.js';
+  import { downloadConversationMarkdown } from '../lib/export.js';
   import { loadConversationIndex, saveConversationIndex } from '../lib/storage.js';
   import {
     buildConversationView,
+    contentToText,
     consumeSse,
     conversationIdFromPayload,
     conversationIdFromUrl,
@@ -16,6 +19,8 @@
     findConversationPayload,
     findMessageEvents,
     fingerprintCapture,
+    getToolMessageInfo,
+    groupConversationTurns,
     parseJson,
     parseWebMobilePartialConversation,
     stepConversationBranch,
@@ -30,6 +35,9 @@
   let liveMessages = $state(new Map());
   let pendingUser = $state(null);
   let currentConversationId = $state(null);
+  let presentedConversationId = $state(null);
+  let loadingConversationId = $state(null);
+  let navigationTimedOutId = $state(null);
   let captures = $state(0);
   let composerStatus = $state('');
   let composerError = $state(false);
@@ -37,9 +45,12 @@
   let sendInFlight = $state(false);
   let pendingCommandId = null;
   let sidebarOpen = $state(false);
+  let overviewOpen = $state(false);
+  let activeTurnIndex = $state(0);
   let followTail = $state(false);
   let saveTimer = null;
   let sendTimer = null;
+  let navigationTimer = null;
   const MAX_CAPTURE_BUFFER = 20 * 1024 * 1024;
   const sseBuffers = new Map();
   const xhrBuffers = new Map();
@@ -47,20 +58,63 @@
 
   const conversations = $derived([...conversationMap.values()].sort((a, b) => (Number(b.update_time) || 0) - (Number(a.update_time) || 0)));
   const currentPayload = $derived(currentConversationId ? payloads.get(currentConversationId) : null);
+  const currentHasRenderableContent = $derived(Boolean(
+    currentConversationId && hasRenderableConversationContent(currentConversationId)
+  ));
   const currentMeta = $derived(currentConversationId ? conversationMap.get(currentConversationId) : null);
+  const displayConversationId = $derived(
+    currentConversationId && currentHasRenderableContent
+      ? currentConversationId
+      : (presentedConversationId || currentConversationId)
+  );
   const messages = $derived.by(() => {
-    let rows = currentPayload ? buildConversationView(currentPayload, terminals.get(currentConversationId)) : [];
-    const live = currentConversationId ? liveMessages.get(currentConversationId) || [] : [];
+    const id = displayConversationId;
+    const payload = id ? payloads.get(id) : null;
+    let rows = payload ? buildConversationView(payload, terminals.get(id)) : [];
+    const live = id ? liveMessages.get(id) || [] : [];
     const liveById = new Map(live.map((item) => [item.id, item]));
     const rowIds = new Set(rows.map((row) => row.id));
     rows = rows.map((row) => liveById.has(row.id) ? { ...row, ...liveById.get(row.id) } : row);
-    if (pendingUser && (!pendingUser.conversationId || pendingUser.conversationId === currentConversationId)) rows.push(pendingUser.message);
+    if (pendingUser && id === currentConversationId && (!pendingUser.conversationId || pendingUser.conversationId === id)) rows.push(pendingUser.message);
     for (const item of live) if (!rowIds.has(item.id)) rows.push(item);
     return rows;
   });
+  const turns = $derived(groupConversationTurns(messages));
   const liveConnected = $derived(status.bridgeReady && status.captureMode === 'page');
   const statusState = $derived(status.bridgeError ? 'error' : (liveConnected ? 'online' : 'offline'));
   const statusLabel = $derived(status.bridgeError ? '连接失败' : (liveConnected ? (status.takeover === false ? '已连接' : '已接管') : '连接中'));
+  const conversationPending = $derived(Boolean(currentConversationId && !currentHasRenderableContent));
+  const conversationLoading = $derived(Boolean(conversationPending && loadingConversationId === currentConversationId));
+  const conversationTimedOut = $derived(Boolean(conversationPending && navigationTimedOutId === currentConversationId));
+  let previousDisplayConversationId = null;
+  let previousTurnCount = 0;
+  let previousFollowTail = false;
+
+  $effect(() => {
+    const key = displayConversationId || 'new';
+    const count = turns.length;
+    if (key !== previousDisplayConversationId) {
+      previousDisplayConversationId = key;
+      previousTurnCount = count;
+      activeTurnIndex = Math.max(0, count - 1);
+      return;
+    }
+    if (!count) {
+      previousTurnCount = 0;
+      activeTurnIndex = 0;
+      return;
+    }
+    const wasAtTail = activeTurnIndex >= Math.max(0, previousTurnCount - 1);
+    if (count > previousTurnCount && wasAtTail) activeTurnIndex = count - 1;
+    else if (activeTurnIndex >= count) activeTurnIndex = count - 1;
+    previousTurnCount = count;
+  });
+
+  $effect(() => {
+    const follow = followTail;
+    if (follow && !previousFollowTail && turns.length) activeTurnIndex = turns.length - 1;
+    previousFollowTail = follow;
+  });
 
   onMount(() => {
     let unsubscribe = transport.subscribe(handleTransportMessage);
@@ -71,6 +125,7 @@
       transport.stop();
       clearTimeout(saveTimer);
       clearTimeout(sendTimer);
+      clearTimeout(navigationTimer);
       sseBuffers.clear();
       xhrBuffers.clear();
     };
@@ -193,7 +248,12 @@
       const next = new Map(liveMessages);
       next.set(id, upsertLiveMessage(next.get(id) || [], event.message));
       liveMessages = next;
+      updateConversationPreviewFromMessage(id, event.message);
       if (id === currentConversationId) {
+        if (hasRenderableConversationContent(id)) {
+          presentedConversationId = id;
+          if (loadingConversationId === id || navigationTimedOutId === id) finishConversationLoading();
+        }
         reconcilePending(event.message);
         pulseFollowTail();
       }
@@ -207,9 +267,11 @@
     const pageConversationId = conversationIdFromUrl(status.pageUrl || '');
     if (id === currentConversationId || id === pageConversationId || (!currentConversationId && !pageConversationId)) {
       currentConversationId = id;
+      presentedConversationId = id;
     }
     const next = new Map(conversationMap);
     const previous = next.get(id) || {};
+    const details = conversationDetailsFromPayload(payload, previous);
     const pagePath = (() => {
       try { return new URL(status.pageUrl || 'https://chatgpt.com/').pathname; } catch { return ''; }
     })();
@@ -219,8 +281,11 @@
       create_time: payload.create_time || previous.create_time,
       update_time: payload.update_time || Date.now() / 1000,
       route: payload.metadata?.source === 'web-mobile-partial' || pagePath.startsWith('/uc/') ? 'uc' : (previous.route || 'c'),
+      last: details.last,
+      model: details.model,
     }, previous));
     conversationMap = next;
+    if (loadingConversationId === id) finishConversationLoading();
     reconcilePendingAgainstPayload(payload);
     schedulePersist();
     pulseFollowTail();
@@ -228,9 +293,18 @@
 
   function handlePageLocation(url) {
     if (!url) return;
+    status = { ...status, pageUrl: url };
     const id = conversationIdFromUrl(url);
-    if (id) currentConversationId = id;
-    else if (url.startsWith('https://chatgpt.com/')) currentConversationId = null;
+    if (id) {
+      currentConversationId = id;
+      if (payloads.has(id)) presentedConversationId = id;
+      startConversationLoading(id);
+    }
+    else if (url.startsWith('https://chatgpt.com/')) {
+      currentConversationId = null;
+      presentedConversationId = null;
+      finishConversationLoading();
+    }
   }
 
   function selectConversation(id) {
@@ -238,12 +312,20 @@
       setComposerStatus('当前消息仍在提交，请等待确认后再切换对话', true);
       return;
     }
+    if (!id || (id === currentConversationId && payloads.has(id))) {
+      sidebarOpen = false;
+      overviewOpen = false;
+      return;
+    }
     currentConversationId = id;
+    if (payloads.has(id)) presentedConversationId = id;
+    startConversationLoading(id);
     sidebarOpen = false;
+    overviewOpen = false;
     if (transport.supportsLiveChat) {
       const route = conversationMap.get(id)?.route === 'uc' ? 'uc' : 'c';
       transport.send({ type: 'navigate-conversation', conversationId: id, route });
-      setComposerStatus('正在让当前 ChatGPT 页面打开该对话…');
+      setComposerStatus('');
     }
   }
 
@@ -253,12 +335,66 @@
       return;
     }
     currentConversationId = null;
+    presentedConversationId = null;
+    finishConversationLoading();
     pendingUser = null;
     sidebarOpen = false;
+    overviewOpen = false;
     if (transport.supportsLiveChat) transport.send({ type: 'new-chat' });
   }
 
+  function startConversationLoading(id) {
+    clearTimeout(navigationTimer);
+    navigationTimer = null;
+    navigationTimedOutId = null;
+    if (!id || hasRenderableConversationContent(id)) {
+      loadingConversationId = null;
+      return;
+    }
+    loadingConversationId = id;
+    navigationTimer = setTimeout(() => {
+      if (loadingConversationId !== id || hasRenderableConversationContent(id)) return;
+      loadingConversationId = null;
+      navigationTimedOutId = id;
+      navigationTimer = null;
+      setComposerStatus('对话加载超时，可重新点击该会话重试', true);
+    }, 12_000);
+  }
+
+  function finishConversationLoading() {
+    clearTimeout(navigationTimer);
+    navigationTimer = null;
+    loadingConversationId = null;
+    navigationTimedOutId = null;
+  }
+
+  function hasRenderableConversationContent(id) {
+    if (!id) return false;
+    if (payloads.has(id)) return true;
+    const live = liveMessages.get(id) || [];
+    return live.some((message) => String(message?.text || '').trim());
+  }
+
+  function exportMarkdown() {
+    if (conversationPending) {
+      setComposerStatus('当前对话尚未加载完成，暂不能导出', true);
+      return;
+    }
+    const exportable = messages.filter((message) => !message?.pending && String(message?.text || '').trim());
+    if (!exportable.length) {
+      setComposerStatus('当前对话暂无可导出的消息', true);
+      return;
+    }
+    const title = currentMeta?.title || 'ChatGPT Conversation';
+    const { filename } = downloadConversationMarkdown(title, exportable);
+    setComposerStatus(`已导出 ${filename}`);
+  }
+
   function sendMessage(text) {
+    if (conversationPending) {
+      setComposerStatus('目标对话仍在加载，请加载完成后再发送', true);
+      return;
+    }
     if (!transport.supportsLiveChat || !status.bridgeReady) {
       setComposerStatus('ChatGPT 页面桥尚未就绪', true);
       return;
@@ -293,6 +429,7 @@
         pending: true,
       },
     };
+    if (currentConversationId) updateConversationPreview(currentConversationId, text, '');
     transport.send({ type: 'send-message', commandId, text });
     clearTimeout(sendTimer);
     sendTimer = setTimeout(() => {
@@ -384,18 +521,83 @@
       create_time: Number(item.create_time ?? item.createdAt ?? previous.create_time) || null,
       update_time: Number(item.update_time ?? item.updatedAt ?? previous.update_time) || null,
       route: item.route === 'uc' || previous.route === 'uc' ? 'uc' : 'c',
+      last: String(item.last ?? previous.last ?? ''),
+      model: String(item.model ?? previous.model ?? ''),
     };
+  }
+
+  function conversationDetailsFromPayload(payload, previous = {}) {
+    const rows = buildConversationView(payload, payload?.current_node);
+    const latest = [...rows].reverse().find((message) => !message?.tool) || rows[rows.length - 1] || null;
+    const last = String(latest?.text || previous.last || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 160);
+    let model = '';
+    for (let index = rows.length - 1; index >= 0 && !model; index -= 1) {
+      const metadata = rows[index]?.metadata || {};
+      model = metadata.model_slug || metadata.default_model_slug || metadata.model || '';
+    }
+    model ||= payload?.metadata?.model_slug || payload?.metadata?.default_model_slug || previous.model || '';
+    return { last, model: String(model || '') };
+  }
+
+  function updateConversationPreviewFromMessage(id, rawMessage) {
+    if (!rawMessage) return;
+    if (getToolMessageInfo(rawMessage)) return;
+    const metadata = rawMessage.metadata || {};
+    updateConversationPreview(
+      id,
+      contentToText(rawMessage.content),
+      metadata.model_slug || metadata.default_model_slug || metadata.model || '',
+    );
+  }
+
+  function updateConversationPreview(id, text, model = '') {
+    const previous = conversationMap.get(id);
+    if (!previous) return;
+    const preview = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+    if (!preview && !model) return;
+    const next = new Map(conversationMap);
+    next.set(id, normalizeConversationMeta({
+      ...previous,
+      last: preview || previous.last,
+      model: model || previous.model,
+      update_time: Date.now() / 1000,
+    }, previous));
+    conversationMap = next;
+    schedulePersist();
+  }
+
+  function selectOverviewMessage(index) {
+    activeTurnIndex = Math.max(0, Math.min(turns.length - 1, Number(index) || 0));
+    overviewOpen = false;
+  }
+
+  function toggleSidebar() {
+    sidebarOpen = !sidebarOpen;
+    if (sidebarOpen) overviewOpen = false;
+  }
+
+  function toggleOverview() {
+    overviewOpen = !overviewOpen;
+    if (overviewOpen) sidebarOpen = false;
+  }
+
+  function closeMobilePanels() {
+    sidebarOpen = false;
+    overviewOpen = false;
   }
 </script>
 
 <Page class="slimgpt-page">
   <Navbar class="mobile-navbar">
     <NavLeft>
-      <Button small onClick={() => sidebarOpen = !sidebarOpen}>☰</Button>
+      <Button small onClick={toggleSidebar}>☰</Button>
     </NavLeft>
     <div class="mobile-title">{currentMeta?.title || 'SlimGPT'}</div>
     <NavRight>
-      <Button small onClick={() => transport.openOfficial(currentConversationId)}>官方</Button>
+      <Button small onClick={toggleOverview}>概览</Button>
     </NavRight>
   </Navbar>
 
@@ -408,11 +610,11 @@
         {statusState}
         {captures}
         onShowOfficial={() => transport.send({ type: 'open-official', conversationId: currentConversationId })}
+        onExportMarkdown={exportMarkdown}
         onNewChat={newChat}
         onSelect={selectConversation}
       />
     </div>
-    {#if sidebarOpen}<button class="sidebar-scrim" aria-label="关闭侧栏" onclick={() => sidebarOpen = false}></button>{/if}
 
     <main class="chat-pane">
       <header class="desktop-chat-header">
@@ -424,18 +626,27 @@
       </header>
 
       <section class="message-stage">
-        {#if messages.length}
-          <VirtualMessageList
-            {messages}
-            conversationKey={currentConversationId || 'new'}
-            {followTail}
+        {#if turns.length}
+          <ConversationTurnStage
+            {turns}
+            activeIndex={activeTurnIndex}
+            conversationKey={displayConversationId || 'new'}
+            onActiveChange={(index) => activeTurnIndex = index}
             onBranch={stepBranch}
           />
-        {:else}
+        {:else if !conversationPending}
           <div class="empty-state">
             <div class="empty-logo">S</div>
             <h2>更轻的 ChatGPT 界面</h2>
             <p>登录、网络和发送仍由当前 ChatGPT 页面处理；SlimGPT 负责会话呈现，并在覆盖显示时暂停官方界面的布局和绘制。</p>
+          </div>
+        {/if}
+
+        {#if conversationPending}
+          <div class="conversation-loading" role="status" aria-live="polite">
+            <span class="conversation-loading-spinner" aria-hidden="true"></span>
+            <strong>{conversationTimedOut ? '对话暂未加载' : '正在加载对话'}</strong>
+            <span>{conversationTimedOut ? '可重新点击侧栏中的该会话重试' : (currentMeta?.title || '正在同步 ChatGPT 会话…')}</span>
           </div>
         {/if}
       </section>
@@ -443,11 +654,24 @@
       <Composer
         bind:value={draft}
         disabled={!transport.supportsLiveChat || !status.bridgeReady}
+        loading={conversationPending}
         busy={sendInFlight}
         status={composerStatus}
         error={composerError}
         onSend={sendMessage}
       />
     </main>
+
+    <div class:open={overviewOpen} class="overview-host">
+      <MessageOverview
+        {turns}
+        activeIndex={activeTurnIndex}
+        onSelect={selectOverviewMessage}
+      />
+    </div>
+
+    {#if sidebarOpen || overviewOpen}
+      <button class="sidebar-scrim" aria-label="关闭侧栏" onclick={closeMobilePanels}></button>
+    {/if}
   </div>
 </Page>

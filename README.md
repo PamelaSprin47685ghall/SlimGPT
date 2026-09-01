@@ -76,6 +76,19 @@ Production builds omit source maps to keep extension packages small. Set `SLIMGP
 
 Use **暂时显示官方界面** to hide the takeover frame. A small SlimGPT restore pill remains on the page.
 
+## Built-in reading layout
+
+The main interface has no feature toggles for its core reading behavior; these are always enabled:
+
+- Wide display: desktop uses a permanent left / center / right layout and expands the center reading area on large monitors.
+- Complete response: when the official ChatGPT page presents a clear `Continue` / `Continue generating` control, the page-world bridge clicks it automatically until the control no longer appears.
+- Rich history: the left conversation list shows title, latest captured message preview, date + weekday, and the captured model when known.
+- Distinct bubbles: user and ChatGPT messages use clearly different alignment, avatar, shape, and surface treatment.
+- Turn paging: the center pane renders exactly one **question + following response(s)** turn at a time. A long turn has its own visible scrollbar. Home/End jump to the active turn's start/end; arrows and PageUp/PageDown stay inside the active turn until its boundary. Crossing a turn boundary first expands a full-viewport blank runway/hint and moves the old content out; only an additional scroll/key action flips to the adjacent turn. Downward flips land at the next turn start and upward flips land at the previous turn end.
+- Overview: the right pane shows one single-line row per question/response turn and jumps the center pane to that turn when clicked.
+- Mobile: the center pane remains primary while both the conversation list and overview become independent slide-out drawers.
+- Tool traffic: structured tool calls/results bypass Markdown, use separate tool avatars, serialize JSON as TOML (including `[[array-of-tables]]` where applicable), and render highlighted monospace TOML code.
+
 ## Platform strategy: no native builds
 
 - Android: Firefox WebExtension.
@@ -86,17 +99,19 @@ Use **暂时显示官方界面** to hide the takeover frame. A small SlimGPT res
 
 ## Performance design
 
-- Message DOM is virtualized: visible rows plus an 8-message buffer on each side are mounted.
+- Only the active question/response turn is mounted in the center pane; the overview stores compact one-line labels for the other turns.
 - Markdown rendering runs in a Worker and caches stable blocks, so streaming text does not reparse the entire message every token.
+- Page synchronization is event-driven: fetch stream chunks, XHR progress, WebSocket messages, and official DOM message mutations all feed the same live message pipeline. There is no interval polling loop for message synchronization.
+- While takeover is active, hidden official-page autofocus is suppressed so it cannot steal focus from SlimGPT. Official focus is temporarily permitted only while SlimGPT submits through the real composer or explicitly reveals the official UI.
 - The full conversation payload is kept in the open SlimGPT UI memory; only compact conversation metadata is persisted locally.
 - The official server conversation graph (`mapping` + `current_node`) is treated as canonical. Local branch switching only selects a different graph leaf for presentation.
 - Current `text/vnd.openai.web-mobile-partial+html` streams are converted to incremental assistant messages. Only the final `data-conversation` payload crosses into the extension frame; conduit/resume tokens and unrelated Sentinel responses stay in the page world.
 
 ## Current phase
 
-`0.3.0` remains observe-only: it captures a canonical copy for SlimGPT but never rewrites or truncates the response seen by the official page. Chrome, Firefox and Orion share the same page-hook + takeover architecture; there is no CDP/debugger transport in the extension.
+`0.3.0` keeps the official ChatGPT conversation graph canonical: SlimGPT never rewrites or truncates the response data it captures. The only automatic host-page action beyond normal composer submission is clicking an explicit Continue/Continue-generating control to finish an interrupted long response. Chrome, Firefox and Orion share the same page-hook + takeover architecture; there is no CDP/debugger transport in the extension.
 
-The takeover bridge temporarily wakes the hidden official body only for composer submission or when the user explicitly chooses to show the official UI, then returns it to render sleep.
+The takeover bridge temporarily wakes the hidden official body for composer submission, automatic Continue handling, or when the user explicitly chooses to show the official UI, then returns it to render sleep.
 
 ## Known limits
 

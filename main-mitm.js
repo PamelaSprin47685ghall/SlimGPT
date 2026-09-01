@@ -19,10 +19,19 @@
   const INITIAL_SHELL_READY_TIMEOUT = 15_000;
   const COMPOSER_WAKE_TIMEOUT = 2_500;
   const SEND_CONTROL_TIMEOUT = 1_500;
+  const BLOCKED_TAKEOVER_RETRY_MS = 500;
+  const TAKEOVER_BLOCKER_GUARD_MS = 5_000;
+  const COMPLETE_RESPONSE_RECLICK_MS = 1_250;
   let requestCounter = 0;
   let resleepTimer = null;
+  let blockedTakeoverRetryTimer = null;
+  let takeoverBlockerGuardTimer = null;
+  let takeoverBlockerGuardDeadline = 0;
   let sendInFlight = false;
   let takeoverActive = false;
+  let officialFocusPermitDepth = 0;
+  let lastContinueControl = null;
+  let lastContinueClickAt = 0;
   const observedFetchResponses = new WeakSet();
   const XHR_RESPONSE_OBSERVED = Symbol("slimgpt-xhr-response-observed");
   const WEBSOCKET_OBSERVED = Symbol("slimgpt-websocket-observed");
@@ -53,24 +62,228 @@
   const nextRequestId = (prefix) => `${prefix}-${Date.now().toString(36)}-${(++requestCounter).toString(36)}`;
 
   installRenderSleepStyle();
+  installFocusGuard();
+  installCompleteResponse();
+  installDomMessageObserver();
   scheduleInitialTakeover();
   emit({ type: "page-hook-ready", timestamp: Date.now(), url: location.href });
 
   let observedFetch = null;
   installFetchObserver();
-  for (const delay of [0, 10, 50, 250, 1000, 3000]) {
-    setTimeout(ensureFetchObserver, delay);
-  }
 
   function installFetchObserver() {
-    observedFetch = wrapFetch(window.fetch);
-    window.fetch = observedFetch;
+    const initialFetch = window.fetch;
+    observedFetch = wrapFetch(initialFetch);
+    try {
+      Object.defineProperty(window, "fetch", {
+        configurable: true,
+        enumerable: true,
+        get() {
+          return observedFetch;
+        },
+        set(next) {
+          if (next === observedFetch || typeof next !== "function") return;
+          observedFetch = wrapFetch(next);
+        },
+      });
+    } catch {
+      window.fetch = observedFetch;
+    }
   }
 
-  function ensureFetchObserver() {
-    if (window.fetch === observedFetch) return;
-    observedFetch = wrapFetch(window.fetch);
-    window.fetch = observedFetch;
+  function installCompleteResponse() {
+    let scheduled = false;
+    let observer = null;
+    const scan = () => {
+      if (!findComposerElement() || findBlockingOfficialUi()) return;
+      const control = findContinueControl();
+      if (!control) {
+        lastContinueControl = null;
+        return;
+      }
+      const now = Date.now();
+      if (control === lastContinueControl && now - lastContinueClickAt < COMPLETE_RESPONSE_RECLICK_MS) return;
+      lastContinueControl = control;
+      lastContinueClickAt = now;
+      const shouldResleep = takeoverActive;
+      if (shouldResleep) wakeOfficialUi();
+      try {
+        control.click();
+        emit({ type: "complete-response-continued", timestamp: now, url: location.href });
+      } catch {
+        // The host can remove the control between discovery and click.
+      }
+      if (shouldResleep) scheduleRenderSleep(450);
+    };
+
+    const schedule = () => {
+      if (scheduled) return;
+      scheduled = true;
+      requestAnimationFrame(() => {
+        scheduled = false;
+        scan();
+      });
+    };
+
+    const mount = () => {
+      if (!document.documentElement || observer) return;
+      observer = new MutationObserver(schedule);
+      observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        characterData: true,
+      });
+      schedule();
+    };
+    if (document.documentElement) mount();
+    else new MutationObserver((_, readyObserver) => {
+      if (!document.documentElement) return;
+      readyObserver.disconnect();
+      mount();
+    }).observe(document, { childList: true, subtree: true });
+    addEventListener("popstate", schedule);
+    addEventListener("pagehide", () => observer?.disconnect(), { once: true });
+  }
+
+  function findContinueControl() {
+    const selectors = [
+      'button[data-testid*="continue" i]',
+      'button[aria-label*="continue" i]',
+      'button[aria-label*="继续"]',
+    ];
+    for (const selector of selectors) {
+      for (const button of document.querySelectorAll(selector)) {
+        if (isCompleteResponseControl(button)) return button;
+      }
+    }
+    for (const button of document.querySelectorAll('button')) {
+      if (isCompleteResponseControl(button)) return button;
+    }
+    return null;
+  }
+
+  function isCompleteResponseControl(button) {
+    if (!(button instanceof HTMLButtonElement) || button.disabled || button.getAttribute('aria-disabled') === 'true') return false;
+    const label = [button.textContent, button.getAttribute('aria-label')]
+      .filter(Boolean)
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return /^(?:continue(?: generating| response)?|继续(?:生成|回答|回复)?)[.!。…\s]*$/i.test(label);
+  }
+
+  function installFocusGuard() {
+    const nativeElementFocus = HTMLElement.prototype.focus;
+    HTMLElement.prototype.focus = function slimgptGuardedFocus() {
+      if (
+        takeoverActive &&
+        officialFocusPermitDepth === 0 &&
+        this?.id !== FRAME_ID
+      ) {
+        return;
+      }
+      return Reflect.apply(nativeElementFocus, this, arguments);
+    };
+
+    const nativeWindowFocus = window.focus;
+    try {
+      window.focus = function slimgptGuardedWindowFocus() {
+        if (takeoverActive && officialFocusPermitDepth === 0) return;
+        return Reflect.apply(nativeWindowFocus, window, arguments);
+      };
+    } catch {
+      // Some engines expose window.focus as non-writable. Element focus is the
+      // important path for ChatGPT's composer/autofocus behavior.
+    }
+  }
+
+  function focusTakeoverFrame() {
+    if (!takeoverActive) return;
+    const frame = document.getElementById(FRAME_ID);
+    if (!frame || frame.dataset.slimgptVisible !== "1") return;
+    try {
+      frame.focus({ preventScroll: true });
+    } catch {
+      try { frame.focus(); } catch {}
+    }
+  }
+
+  function installDomMessageObserver() {
+    let observer = null;
+    let scanScheduled = false;
+    let currentConversationId = null;
+    const seenText = new Map();
+
+    const schedule = () => {
+      if (scanScheduled) return;
+      scanScheduled = true;
+      requestAnimationFrame(() => {
+        scanScheduled = false;
+        scan();
+      });
+    };
+
+    const scan = () => {
+      const match = location.pathname.match(/\/(?:c|uc)\/([^/?#]+)/);
+      const conversationId = match?.[1] || null;
+      if (!conversationId) return;
+      if (conversationId !== currentConversationId) {
+        currentConversationId = conversationId;
+        seenText.clear();
+      }
+
+      for (const roleNode of document.querySelectorAll('[data-message-author-role]')) {
+        const role = String(roleNode.getAttribute('data-message-author-role') || '').toLowerCase();
+        if (!['user', 'assistant', 'tool'].includes(role)) continue;
+        const messageRoot = roleNode.closest('[data-message-id]') || roleNode.querySelector?.('[data-message-id]');
+        const messageId = messageRoot?.getAttribute?.('data-message-id') || roleNode.getAttribute('data-message-id');
+        if (!messageId) continue;
+        const text = String(roleNode.textContent || '').replace(/\u00a0/g, ' ').trim();
+        if (!text || seenText.get(messageId) === text) continue;
+        seenText.set(messageId, text);
+        emit({
+          type: "page-capture",
+          transport: "dom",
+          phase: "message",
+          requestId: `dom-${messageId}`,
+          url: location.href,
+          mimeType: "application/json",
+          timestamp: Date.now(),
+          data: JSON.stringify({
+            conversation_id: conversationId,
+            message: {
+              id: messageId,
+              author: { role },
+              content: { content_type: "text", parts: [text] },
+              status: role === 'assistant' ? "in_progress" : null,
+              end_turn: false,
+            },
+          }),
+        });
+      }
+    };
+
+    const mount = () => {
+      if (!document.documentElement || observer) return;
+      observer = new MutationObserver(schedule);
+      observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+        attributes: true,
+        attributeFilter: ['data-message-author-role', 'data-message-id'],
+      });
+      schedule();
+    };
+    if (document.documentElement) mount();
+    else new MutationObserver((_, readyObserver) => {
+      if (!document.documentElement) return;
+      readyObserver.disconnect();
+      mount();
+    }).observe(document, { childList: true, subtree: true });
+    addEventListener("popstate", schedule);
+    addEventListener("pagehide", () => observer?.disconnect(), { once: true });
   }
 
   function wrapFetch(upstreamFetch) {
@@ -310,7 +523,7 @@
   let observedXhrSend = null;
   let observedWebSocket = null;
   ensureXhrObserver();
-  ensureWebSocketObserver();
+  installWebSocketObserver();
 
   function ensureXhrObserver() {
     const prototype = window.XMLHttpRequest?.prototype;
@@ -375,10 +588,8 @@
     xhr.addEventListener("loadend", () => capture("complete"), { once: true });
   }
 
-  function ensureWebSocketObserver() {
-    if (!window.WebSocket || window.WebSocket === observedWebSocket) return;
-    const UpstreamWebSocket = window.WebSocket;
-    observedWebSocket = function ObservedWebSocket(url, protocols) {
+  function installWebSocketObserver() {
+    const wrap = (UpstreamWebSocket) => function ObservedWebSocket(url, protocols) {
       const socket = arguments.length > 1
         ? new UpstreamWebSocket(url, protocols)
         : new UpstreamWebSocket(url);
@@ -401,20 +612,35 @@
       }
       return socket;
     };
-    observedWebSocket.prototype = UpstreamWebSocket.prototype;
-    Object.setPrototypeOf(observedWebSocket, UpstreamWebSocket);
-    for (const key of ["CONNECTING", "OPEN", "CLOSING", "CLOSED"]) {
-      Object.defineProperty(observedWebSocket, key, { value: UpstreamWebSocket[key] });
-    }
-    window.WebSocket = observedWebSocket;
-  }
 
-  const observerGuard = setInterval(() => {
-    ensureFetchObserver();
-    ensureXhrObserver();
-    ensureWebSocketObserver();
-  }, 1000);
-  addEventListener("pagehide", () => clearInterval(observerGuard), { once: true });
+    const makeObserved = (UpstreamWebSocket) => {
+      if (typeof UpstreamWebSocket !== "function") return UpstreamWebSocket;
+      const Wrapped = wrap(UpstreamWebSocket);
+      Wrapped.prototype = UpstreamWebSocket.prototype;
+      Object.setPrototypeOf(Wrapped, UpstreamWebSocket);
+      for (const key of ["CONNECTING", "OPEN", "CLOSING", "CLOSED"]) {
+        Object.defineProperty(Wrapped, key, { value: UpstreamWebSocket[key] });
+      }
+      return Wrapped;
+    };
+
+    observedWebSocket = makeObserved(window.WebSocket);
+    try {
+      Object.defineProperty(window, "WebSocket", {
+        configurable: true,
+        enumerable: true,
+        get() {
+          return observedWebSocket;
+        },
+        set(next) {
+          if (next === observedWebSocket) return;
+          observedWebSocket = makeObserved(next);
+        },
+      });
+    } catch {
+      window.WebSocket = observedWebSocket;
+    }
+  }
 
   function interestingSocket(rawUrl) {
     try {
@@ -520,6 +746,7 @@
     sendInFlight = true;
     let result;
     try {
+      officialFocusPermitDepth += 1;
       wakeOfficialUi();
       await waitForComposerElement(COMPOSER_WAKE_TIMEOUT);
       await nextAnimationFrame();
@@ -527,8 +754,10 @@
     } catch (error) {
       result = { ok: false, commandId, error: String(error?.message || error) };
     } finally {
+      officialFocusPermitDepth = Math.max(0, officialFocusPermitDepth - 1);
       sendInFlight = false;
       scheduleRenderSleep();
+      queueMicrotask(focusTakeoverFrame);
     }
     emit({ type: "composer-result", result });
   }
@@ -560,7 +789,8 @@
     const schedule = async () => {
       // The current ChatGPT lightweight shell mounts its composer after
       // DOMContentLoaded. Keep both the official body and the takeover frame
-      // usable until the composer exists; auth/challenge pages must fail open.
+      // usable until the composer exists; auth/challenge/consent pages must
+      // fail open even when the composer is already mounted behind a modal.
       const ready = await waitForComposerElement(INITIAL_SHELL_READY_TIMEOUT);
       if (ready) showTakeover();
       else emit({ type: "takeover-state", active: false, reason: "composer-unavailable", url: location.href });
@@ -574,7 +804,12 @@
 
   function sleepOfficialUi() {
     const frame = document.getElementById(FRAME_ID);
-    if (!frame || frame.style.display === "none") return;
+    if (!frame || frame.dataset.slimgptVisible !== "1") return;
+    if (findBlockingOfficialUi()) {
+      suspendTakeoverForBlocker();
+      scheduleBlockedTakeoverRetry();
+      return;
+    }
     document.documentElement?.setAttribute(SLEEP_ATTR, "1");
   }
 
@@ -590,20 +825,86 @@
   function showTakeover() {
     const frame = document.getElementById(FRAME_ID);
     if (!frame) return;
+    if (findBlockingOfficialUi()) {
+      suspendTakeoverForBlocker();
+      scheduleBlockedTakeoverRetry();
+      return;
+    }
+    clearTimeout(blockedTakeoverRetryTimer);
+    blockedTakeoverRetryTimer = null;
     takeoverActive = true;
-    frame.style.display = "block";
+    frame.dataset.slimgptVisible = "1";
+    frame.style.pointerEvents = "auto";
+    frame.style.opacity = "1";
     document.getElementById(RESTORE_ID)?.remove();
     emit({ type: "takeover-state", active: true, url: location.href });
+    queueMicrotask(focusTakeoverFrame);
     scheduleRenderSleep(250);
+    scheduleTakeoverBlockerGuard();
+  }
+
+  function suspendTakeoverForBlocker() {
+    const frame = document.getElementById(FRAME_ID);
+    clearTimeout(resleepTimer);
+    resleepTimer = null;
+    clearTimeout(takeoverBlockerGuardTimer);
+    takeoverBlockerGuardTimer = null;
+    wakeOfficialUi();
+    takeoverActive = false;
+    if (frame) {
+      frame.dataset.slimgptVisible = "0";
+      frame.style.pointerEvents = "none";
+      frame.style.opacity = "0";
+    }
+    document.getElementById(RESTORE_ID)?.remove();
+    emit({ type: "takeover-state", active: false, reason: "blocking-official-ui", url: location.href });
+  }
+
+  function scheduleBlockedTakeoverRetry() {
+    if (blockedTakeoverRetryTimer) return;
+    blockedTakeoverRetryTimer = setTimeout(() => {
+      blockedTakeoverRetryTimer = null;
+      if (!findComposerElement()) return;
+      if (findBlockingOfficialUi()) {
+        scheduleBlockedTakeoverRetry();
+        return;
+      }
+      showTakeover();
+    }, BLOCKED_TAKEOVER_RETRY_MS);
+  }
+
+  function scheduleTakeoverBlockerGuard() {
+    clearTimeout(takeoverBlockerGuardTimer);
+    takeoverBlockerGuardDeadline = Date.now() + TAKEOVER_BLOCKER_GUARD_MS;
+
+    const guard = () => {
+      takeoverBlockerGuardTimer = null;
+      if (!takeoverActive) return;
+      if (findBlockingOfficialUi()) {
+        suspendTakeoverForBlocker();
+        scheduleBlockedTakeoverRetry();
+        return;
+      }
+      if (Date.now() >= takeoverBlockerGuardDeadline) return;
+      takeoverBlockerGuardTimer = setTimeout(guard, 250);
+    };
+
+    takeoverBlockerGuardTimer = setTimeout(guard, 100);
   }
 
   function hideTakeover() {
     const frame = document.getElementById(FRAME_ID);
     if (!frame) return;
     clearTimeout(resleepTimer);
+    clearTimeout(blockedTakeoverRetryTimer);
+    clearTimeout(takeoverBlockerGuardTimer);
+    blockedTakeoverRetryTimer = null;
+    takeoverBlockerGuardTimer = null;
     wakeOfficialUi();
     takeoverActive = false;
-    frame.style.display = "none";
+    frame.dataset.slimgptVisible = "0";
+    frame.style.pointerEvents = "none";
+    frame.style.opacity = "0";
     emit({ type: "takeover-state", active: false, reason: "user", url: location.href });
 
     let restore = document.getElementById(RESTORE_ID);
@@ -632,7 +933,29 @@
   }
 
   function navigate(pathname) {
-    location.assign(new URL(pathname, location.origin).href);
+    const target = new URL(pathname, location.origin);
+    if (target.origin !== location.origin) return;
+    if (target.href === location.href) {
+      emitLocation();
+      return;
+    }
+    // Never click host anchors here: an unhandled anchor can fall through to a
+    // real document navigation and tear down the takeover iframe. Route all
+    // SlimGPT-initiated navigation through same-document history instead.
+    navigateWithHistory(target);
+  }
+
+  function navigateWithHistory(target) {
+    try {
+      history.pushState(history.state, '', target.href);
+      dispatchEvent(new PopStateEvent('popstate', { state: history.state }));
+    } catch (error) {
+      emit({
+        type: 'command-error',
+        command: 'navigate-conversation',
+        error: `无法在当前页面切换会话：${String(error?.message || error)}`,
+      });
+    }
   }
 
   async function sendThroughOfficialComposer(text, commandId) {
@@ -691,6 +1014,8 @@
       document.querySelector("#prompt-textarea"),
       document.querySelector('textarea[name="prompt-textarea"]'),
       document.querySelector('textarea[placeholder*="Message"]'),
+      document.querySelector('textarea[placeholder*="发消息"]'),
+      document.querySelector('textarea[placeholder*="Ask"]'),
       document.querySelector('div[contenteditable="true"][data-virtualkeyboard="true"]'),
       ...document.querySelectorAll('div[contenteditable="true"]'),
     ].filter(Boolean);
@@ -701,10 +1026,14 @@
     const selectors = [
       '[data-composer-submit]',
       '[data-testid="send-button"]',
-      'button[aria-label="发送消息"]',
-      'button[aria-label="Send message"]',
-      'button[aria-label="Send prompt"]',
-      'button[aria-label="Send"]',
+      '[data-testid="fruitjuice-send-button"]',
+      '[data-testid="composer-send-button"]',
+      '[data-testid*="send"]',
+      'button[aria-label*="发送"]',
+      'button[aria-label*="Send"]',
+      'button[aria-label*="Prompt"]',
+      'form button[type="submit"]',
+      'button[type="submit"]',
     ];
     const form = composer?.closest("form");
     const roots = form ? [form, document] : [document];
@@ -744,6 +1073,8 @@
       document.querySelector("#prompt-textarea") ||
       document.querySelector('textarea[name="prompt-textarea"]') ||
       document.querySelector('textarea[placeholder*="Message"]') ||
+      document.querySelector('textarea[placeholder*="发消息"]') ||
+      document.querySelector('textarea[placeholder*="Ask"]') ||
       document.querySelector('div[contenteditable="true"][data-virtualkeyboard="true"]') ||
       document.querySelector('div[contenteditable="true"]')
     );
@@ -770,6 +1101,41 @@
       observer.observe(document.documentElement || document, { childList: true, subtree: true });
       timer = setTimeout(() => finish(null), timeoutMs);
     });
+  }
+
+  function findBlockingOfficialUi() {
+    // A modal dialog puts the rest of the document in the browser's inert
+    // top-layer state. On Firefox Android that inertness also prevents clicks
+    // inside our extension iframe, even if the official body is visually
+    // hidden. Detect :modal without a visibility check so it still works after
+    // render sleep has hidden the body.
+    try {
+      const modal = document.querySelector(":modal");
+      if (modal) return modal;
+    } catch {
+      // Older engines may not support :modal; fall through to DOM heuristics.
+    }
+
+    if (document.documentElement?.inert) return document.documentElement;
+    if (document.body?.inert) return document.body;
+
+    const selectors = [
+      "dialog[open]",
+      '[role="alertdialog"]',
+      '[role="dialog"][aria-modal="true"]',
+      "#onetrust-banner-sdk",
+      "#onetrust-pc-sdk",
+      "#onetrust-consent-sdk",
+      '[id*="cookie" i][role="dialog"]',
+      '[class*="cookie" i][role="dialog"]',
+    ];
+
+    for (const selector of selectors) {
+      for (const element of document.querySelectorAll(selector)) {
+        if (isVisible(element)) return element;
+      }
+    }
+    return null;
   }
 
   function isVisible(element) {

@@ -41,18 +41,23 @@
       frame.src = chrome.runtime.getURL('index.html?takeover=1');
       frame.setAttribute('title', 'SlimGPT');
       frame.setAttribute('allow', 'clipboard-write');
+      frame.dataset.slimgptVisible = '0';
       Object.assign(frame.style, {
         position: 'fixed',
         inset: '0',
-        width: '100vw',
-        height: '100dvh',
+        width: '100%',
+        height: '100%',
         border: '0',
         margin: '0',
         padding: '0',
         zIndex: '2147483647',
         background: '#111',
         colorScheme: 'light dark',
-        display: 'none',
+        display: 'block',
+        opacity: '0',
+        pointerEvents: 'none',
+        transition: 'opacity 90ms ease-out',
+        willChange: 'opacity',
       });
       document.documentElement.appendChild(frame);
       frame.addEventListener('load', () => {
@@ -60,7 +65,7 @@
         postToUi({
           type: 'status',
           bridgeReady: pageHookReady,
-          takeover: frame.style.display !== 'none',
+          takeover: frame.dataset.slimgptVisible === '1',
           captureMode: pageHookReady ? 'page' : null,
           pageUrl: location.href,
         });

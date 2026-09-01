@@ -221,6 +221,36 @@ export function buildConversationView(payload, terminalId = null) {
     .map((node) => messageNodeToView(node, mapping));
 }
 
+export function groupConversationTurns(messages) {
+  const source = Array.isArray(messages) ? messages.filter(Boolean) : [];
+  const turns = [];
+  let current = null;
+
+  for (const message of source) {
+    if (message?.role === "user") {
+      current = {
+        id: `turn-${message.id || message.nodeId || turns.length}`,
+        user: message,
+        replies: [],
+      };
+      turns.push(current);
+      continue;
+    }
+
+    if (!current) {
+      current = {
+        id: `turn-preamble-${message?.id || message?.nodeId || turns.length}`,
+        user: null,
+        replies: [],
+      };
+      turns.push(current);
+    }
+    current.replies.push(message);
+  }
+
+  return turns;
+}
+
 export function messageNodeToView(node, mapping) {
   const message = node.message || {};
   const siblings = node.parent && mapping[node.parent]?.children
@@ -241,7 +271,89 @@ export function messageNodeToView(node, mapping) {
     siblingCount: siblings.length,
     siblingNodeIds: siblings,
     metadata: message.metadata || {},
+    tool: getToolMessageInfo(message),
   };
+}
+
+export function getToolMessageInfo(message) {
+  if (!message || typeof message !== "object") return null;
+  const role = message.author?.role || "unknown";
+  const content = message.content && typeof message.content === "object" ? message.content : {};
+  const metadata = message.metadata && typeof message.metadata === "object" ? message.metadata : {};
+  const authorMetadata = message.author?.metadata && typeof message.author.metadata === "object"
+    ? message.author.metadata
+    : {};
+  const recipient = firstNonEmptyString(message.recipient, metadata.recipient, content.recipient);
+  const realAuthor = firstNonEmptyString(authorMetadata.real_author, metadata.real_author);
+  const toolCalls = Array.isArray(message.tool_calls)
+    ? message.tool_calls
+    : Array.isArray(metadata.tool_calls)
+      ? metadata.tool_calls
+      : Array.isArray(content.tool_calls)
+        ? content.tool_calls
+        : null;
+  const contentType = String(content.content_type || "");
+
+  let kind = null;
+  if (
+    role === "tool" ||
+    contentType === "execution_output" ||
+    realAuthor.startsWith("tool:")
+  ) {
+    kind = "tool-result";
+  } else if (
+    toolCalls?.length ||
+    (role === "assistant" && recipient && recipient !== "all")
+  ) {
+    kind = "tool-call";
+  }
+  if (!kind) return null;
+
+  const callName = toolCalls?.[0]?.function?.name || toolCalls?.[0]?.name || "";
+  const realAuthorName = realAuthor.startsWith("tool:") ? realAuthor.slice(5) : "";
+  const name = firstNonEmptyString(
+    kind === "tool-call" ? recipient : "",
+    message.author?.name,
+    metadata.tool_name,
+    content.name,
+    callName,
+    realAuthorName,
+    recipient,
+  ) || "tool";
+
+  return {
+    kind,
+    name,
+    recipient: recipient || null,
+    contentType: contentType || null,
+    payload: extractToolPayload(message, toolCalls),
+  };
+}
+
+function extractToolPayload(message, toolCalls) {
+  if (toolCalls?.length) return toolCalls.length === 1 ? toolCalls[0] : { calls: toolCalls };
+  const content = message.content;
+  if (content == null) return "";
+  if (typeof content !== "object") return content;
+  if (content.result != null) return content.result;
+  if (content.text != null) return content.text;
+  if (Array.isArray(content.parts)) {
+    if (content.parts.length === 1) return content.parts[0];
+    return { parts: content.parts };
+  }
+  const payload = {};
+  for (const [key, value] of Object.entries(content)) {
+    if (["content_type", "language", "response_format_name"].includes(key)) continue;
+    payload[key] = value;
+  }
+  return Object.keys(payload).length ? payload : "";
+}
+
+function firstNonEmptyString(...values) {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
 }
 
 export function contentToText(content) {
@@ -304,13 +416,21 @@ export function upsertLiveMessage(messages, rawMessage) {
     siblingCount: 1,
     siblingNodeIds: [rawMessage.id],
     metadata: rawMessage.metadata || {},
+    tool: getToolMessageInfo(rawMessage),
     live: true,
   };
 
   const index = messages.findIndex((message) => message.id === item.id);
   if (index === -1) return [...messages, item];
   const next = messages.slice();
-  next[index] = { ...next[index], ...item };
+  const previous = next[index];
+  next[index] = {
+    ...previous,
+    ...item,
+    name: item.name || previous.name || null,
+    metadata: Object.keys(item.metadata || {}).length ? item.metadata : (previous.metadata || {}),
+    tool: item.tool || previous.tool || null,
+  };
   return next;
 }
 

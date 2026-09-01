@@ -37,14 +37,17 @@ function splitBlocks(source) {
   const blocks = [];
   let buffer = [];
   let inFence = false;
+  let inTable = false;
 
   const flush = () => {
     if (!buffer.length) return;
     blocks.push(buffer.join("\n"));
     buffer = [];
+    inTable = false;
   };
 
-  for (const line of lines) {
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
     if (line.startsWith("```")) {
       if (!inFence) flush();
       inFence = !inFence;
@@ -56,10 +59,22 @@ function splitBlocks(source) {
       buffer.push(line);
       continue;
     }
+
     if (!line.trim()) {
       flush();
       continue;
     }
+
+    const tableLine = isTableLine(line);
+    if (tableLine) {
+      if (!inTable && buffer.length) flush();
+      inTable = true;
+      buffer.push(line);
+      continue;
+    } else if (inTable) {
+      flush();
+    }
+
     if (buffer.length && isStandaloneBlockStart(line)) flush();
     buffer.push(line);
     if (isStandaloneSingleLine(line)) flush();
@@ -68,34 +83,150 @@ function splitBlocks(source) {
   return blocks.length ? blocks : [""];
 }
 
+function isTableLine(line) {
+  const trimmed = line.trim();
+  return (trimmed.startsWith("|") && trimmed.endsWith("|")) ||
+    (trimmed.includes("|") && isTableDelimiter(trimmed));
+}
+
 function isStandaloneBlockStart(line) {
-  return /^(#{1,6}\s|>\s|[-*+]\s|\d+\.\s)/.test(line);
+  return /^(#{1,6}\s|>\s|[-*+]\s|\d+\.\s|\|)/.test(line);
 }
 
 function isStandaloneSingleLine(line) {
-  return /^#{1,6}\s/.test(line) || /^---+$/.test(line.trim());
+  return /^#{1,6}\s/.test(line) || /^---+$/.test(line.trim()) || /^\*\*\*+$/.test(line.trim()) || /^___+$/.test(line.trim());
 }
 
 function renderBlock(block) {
   if (!block) return "";
   if (block.startsWith("```")) return renderFence(block);
+  
   const lines = block.split("\n");
+  
+  // Table check
+  if (lines.length >= 2 && lines.some((l) => isTableDelimiter(l))) {
+    return renderTable(block);
+  }
+
+  // Heading check
   const heading = lines[0].match(/^(#{1,6})\s+(.*)$/);
   if (heading && lines.length === 1) {
     const level = heading[1].length;
     return `<h${level}>${inline(heading[2])}</h${level}>`;
   }
+
+  // Blockquote check
   if (lines.every((line) => /^>\s?/.test(line))) {
     return `<blockquote>${lines.map((line) => inline(line.replace(/^>\s?/, ""))).join("<br>")}</blockquote>`;
   }
+
+  // Unordered list
   if (lines.every((line) => /^[-*+]\s+/.test(line))) {
-    return `<ul>${lines.map((line) => `<li>${inline(line.replace(/^[-*+]\s+/, ""))}</li>`).join("")}</ul>`;
+    return `<ul>${lines.map((line) => `<li>${inline(line.replace(/^[-*+]\s+/, ""))}` ).join("</li>")}</li></ul>`;
   }
+
+  // Ordered list
   if (lines.every((line) => /^\d+\.\s+/.test(line))) {
-    return `<ol>${lines.map((line) => `<li>${inline(line.replace(/^\d+\.\s+/, ""))}</li>`).join("")}</ol>`;
+    return `<ol>${lines.map((line) => `<li>${inline(line.replace(/^\d+\.\s+/, ""))}` ).join("</li>")}</ol>`;
   }
-  if (lines.length === 1 && /^---+$/.test(lines[0].trim())) return "<hr>";
+
+  // Horizontal rule
+  if (lines.length === 1 && (/^---+$/.test(lines[0].trim()) || /^\*\*\*+$/.test(lines[0].trim()) || /^___+$/.test(lines[0].trim()))) {
+    return "<hr>";
+  }
+
   return `<p>${lines.map(inline).join("<br>")}</p>`;
+}
+
+function isTableDelimiter(line) {
+  const trimmed = line.trim();
+  if (!trimmed.includes("-") || !trimmed.includes("|")) return false;
+  const cells = splitTableRow(trimmed);
+  return cells.length >= 1 && cells.every((cell) => /^:?-+:?$/.test(cell.trim()));
+}
+
+function splitTableRow(line) {
+  let row = line.trim();
+  if (row.startsWith("|")) row = row.slice(1);
+  if (row.endsWith("|")) row = row.slice(0, -1);
+  const cells = [];
+  let current = "";
+  let inCode = false;
+  for (let i = 0; i < row.length; i += 1) {
+    const char = row[i];
+    if (char === "`") {
+      inCode = !inCode;
+      current += char;
+    } else if (char === "|" && !inCode) {
+      cells.push(current.trim());
+      current = "";
+    } else {
+      current += char;
+    }
+  }
+  cells.push(current.trim());
+  return cells;
+}
+
+function renderTable(block) {
+  const lines = block.split("\n").filter((l) => l.trim());
+  if (lines.length < 2) return `<p>${lines.map(inline).join("<br>")}</p>`;
+
+  let delimiterIndex = -1;
+  for (let i = 0; i < lines.length; i += 1) {
+    if (isTableDelimiter(lines[i])) {
+      delimiterIndex = i;
+      break;
+    }
+  }
+
+  if (delimiterIndex <= 0) return `<p>${lines.map(inline).join("<br>")}</p>`;
+
+  const headerLines = lines.slice(0, delimiterIndex);
+  const delimiterCells = splitTableRow(lines[delimiterIndex]);
+  const bodyLines = lines.slice(delimiterIndex + 1);
+
+  const alignments = delimiterCells.map((d) => {
+    const t = d.trim();
+    const left = t.startsWith(":");
+    const right = t.endsWith(":");
+    if (left && right) return "center";
+    if (right) return "right";
+    if (left) return "left";
+    return "";
+  });
+
+  const alignAttr = (index) => {
+    const a = alignments[index] || alignments[alignments.length - 1] || "";
+    return a ? ` style="text-align:${a}"` : "";
+  };
+
+  let html = `<div class="table-wrap"><table><thead>`;
+  for (const hLine of headerLines) {
+    const cells = splitTableRow(hLine);
+    html += `<tr>`;
+    for (let i = 0; i < delimiterCells.length; i += 1) {
+      html += `<th${alignAttr(i)}>${inline(cells[i] || "")}</th>`;
+    }
+    html += `</tr>`;
+  }
+  html += `</thead>`;
+
+  if (bodyLines.length) {
+    html += `<tbody>`;
+    for (const bLine of bodyLines) {
+      const cells = splitTableRow(bLine);
+      html += `<tr>`;
+      for (let i = 0; i < delimiterCells.length; i += 1) {
+        html += `<td${alignAttr(i)}>${inline(cells[i] || "")}</td>`;
+      }
+      html += `</tr>`;
+    }
+    html += `</tbody>`;
+  }
+
+  html += `</table></div>`;
+  return html;
 }
 
 function renderFence(block) {
@@ -104,7 +235,8 @@ function renderFence(block) {
   const language = opening.slice(3).trim().toLowerCase();
   if (lines[lines.length - 1]?.startsWith("```")) lines.pop();
   const code = lines.join("\n");
-  return `<pre data-language="${escapeAttr(language)}"><code>${highlight(code, language)}</code></pre>`;
+  const displayLang = language || "code";
+  return `<div class="code-block" data-language="${escapeAttr(displayLang)}"><div class="code-header"><span class="code-lang">${escapeHtml(displayLang)}</span><button type="button" class="code-copy-btn" data-action="copy-code" aria-label="复制代码">复制</button></div><pre data-language="${escapeAttr(language)}"><code>${highlight(code, language)}</code></pre></div>`;
 }
 
 function inline(source) {
@@ -115,31 +247,48 @@ function inline(source) {
     tokens.push(html);
     return token;
   };
+
+  // Inline code
   text = text.replace(/`([^`]+)`/g, (_, value) => {
     return stash(`<code>${escapeHtml(unescapeEntities(value))}</code>`);
   });
+
+  // Task list checkboxes
+  text = text.replace(/^\[ \]\s*/, () => stash(`<input type="checkbox" disabled class="task-checkbox" /> `));
+  text = text.replace(/^\[[xX]\]\s*/, () => stash(`<input type="checkbox" disabled checked class="task-checkbox" /> `));
+
+  // Inline math: $...$
+  text = text.replace(/\$([^\$\n]+)\$/g, (_, math) => {
+    return stash(`<span class="math-inline">${escapeHtml(unescapeEntities(math))}</span>`);
+  });
+
+  // Links
   text = text.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, label, url) => {
     return stash(`<a href="${escapeAttr(unescapeEntities(url))}" target="_blank" rel="noreferrer noopener">${label}</a>`);
   });
+
+  // Formatting
   text = text.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   text = text.replace(/__([^_]+)__/g, "<strong>$1</strong>");
   text = text.replace(/(^|[^*])\*([^*]+)\*(?!\*)/g, "$1<em>$2</em>");
+  text = text.replace(/(^|[^_])_([^_]+)_(?!_)/g, "$1<em>$2</em>");
   text = text.replace(/~~([^~]+)~~/g, "<del>$1</del>");
   text = text.replace(/\u0000TOKEN(\d+)\u0000/g, (_, index) => tokens[Number(index)] || "");
   return text;
 }
 
 function highlight(source, language) {
-  if (!/^(js|javascript|ts|typescript|json|css|html|xml|bash|sh|shell|python|py)$/.test(language)) {
+  const lang = (language || "").toLowerCase();
+  if (!/^(js|javascript|ts|typescript|json|jsonc|css|scss|html|xml|svg|bash|sh|zsh|shell|python|py|sql|rust|rs|go|golang|c|cpp|c\+\+|java|yaml|yml|dockerfile|toml|ini|md|markdown)$/.test(lang)) {
     return escapeHtml(source);
   }
-  if (/^(html|xml)$/.test(language)) {
+  if (/^(html|xml|svg)$/.test(lang)) {
     return highlightMatches(source, /<\/?([a-zA-Z][\w-]*)/g, (match) => {
       const prefix = match[0].startsWith("</") ? "&lt;/" : "&lt;";
       return `${prefix}<span class="tok-key">${escapeHtml(match[1])}</span>`;
     });
   }
-  const keywords = "const|let|var|function|return|if|else|for|while|class|new|import|from|export|async|await|true|false|null|undefined|def|in|and|or|not";
+  const keywords = "const|let|var|function|return|if|else|for|while|class|new|import|from|export|async|await|true|false|null|undefined|def|in|and|or|not|elif|is|lambda|with|as|yield|pass|raise|except|None|True|False|package|func|struct|go|chan|defer|fn|mut|pub|impl|trait|match|enum|self|Self|int|char|float|double|void|bool|public|private|protected|static|final|SELECT|FROM|WHERE|INSERT|INTO|UPDATE|DELETE|JOIN|LEFT|RIGHT|INNER|OUTER|ON|GROUP|BY|ORDER|HAVING|LIMIT|OFFSET|CREATE|TABLE|DROP|ALTER|INDEX";
   const pattern = new RegExp(`(["'\\x60])(?:\\\\.|(?!\\1)[\\s\\S])*\\1|\\b(?:${keywords})\\b|\\b\\d+(?:\\.\\d+)?\\b`, "g");
   return highlightMatches(source, pattern, (match) => {
     const token = match[0];

@@ -63,3 +63,12 @@ test('the project has no PWA or debugger runtime', async () => {
   const captureBlock = bridge.slice(bridge.indexOf("if (payload.type === 'page-capture')"));
   assert.ok(captureBlock.indexOf('...payload') < captureBlock.indexOf("type: 'canonical-capture'"));
 });
+
+test('page synchronization is event-driven instead of interval-polled', async () => {
+  const source = await readFile('main-mitm.js', 'utf8');
+  assert.equal(source.includes('setInterval('), false);
+  assert.equal(source.includes('new MutationObserver'), true);
+  assert.equal(source.includes('socket.addEventListener("message"'), true);
+  assert.equal(source.includes('xhr.addEventListener("progress"'), true);
+  assert.equal(source.includes('transport: "dom"'), true);
+});

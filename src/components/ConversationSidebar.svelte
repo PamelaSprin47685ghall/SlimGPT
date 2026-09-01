@@ -8,6 +8,7 @@
     statusState = 'offline',
     captures = 0,
     onShowOfficial = () => {},
+    onExportMarkdown = () => {},
     onNewChat = () => {},
     onSelect = () => {},
   } = $props();
@@ -23,7 +24,19 @@
     const numeric = Number(value || 0);
     if (!numeric) return '';
     const date = new Date(numeric < 10_000_000_000 ? numeric * 1000 : numeric);
-    return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' }).format(date);
+    return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', weekday: 'short' }).format(date);
+  }
+
+  function formatModel(item) {
+    const raw = String(item?.model || '').trim();
+    if (raw) return raw.replace(/^text-/, '').replace(/-latest$/, '').slice(0, 18);
+    return item?.route === 'uc' ? 'Mobile' : 'Web';
+  }
+
+  function preview(item) {
+    return String(item?.last || '')
+      .replace(/\s+/g, ' ')
+      .trim();
   }
 </script>
 
@@ -44,6 +57,7 @@
       <span>登录、网络和产品能力仍由当前 ChatGPT 页面处理；SlimGPT 只负责更轻的界面。</span>
     </div>
     <Button outline small onClick={onShowOfficial}>暂时显示官方界面</Button>
+    <Button outline small onClick={onExportMarkdown}>导出 Markdown</Button>
   </div>
 
   <Button class="new-chat" outline small onClick={onNewChat}>
@@ -61,17 +75,25 @@
 
   <div class="conversation-list">
     {#if filtered.length === 0}
-      <div class="empty-list">捕获到官方会话索引后，这里会显示历史对话。</div>
+      <div class="empty-list">
+        {query ? '未找到匹配的会话' : '捕获到官方会话索引后，这里会显示历史对话。'}
+      </div>
     {:else}
       {#each filtered as conversation (conversation.id)}
         <button
           type="button"
           class:active={conversation.id === currentId}
           class="conversation-item"
-          onClick={() => onSelect(conversation.id)}
+          onclick={() => onSelect(conversation.id)}
         >
-          <span class="conversation-title">{conversation.title || 'Untitled'}</span>
-          <span class="conversation-time">{formatTime(conversation.update_time || conversation.updatedAt)}</span>
+          <span class="conversation-item-topline">
+            <span class="conversation-title">{conversation.title || 'Untitled'}</span>
+            <span class="conversation-time">{formatTime(conversation.update_time || conversation.updatedAt)}</span>
+          </span>
+          <span class="conversation-item-bottomline">
+            <span class="conversation-model">{formatModel(conversation)}</span>
+            <span class="conversation-preview">{preview(conversation)}</span>
+          </span>
         </button>
       {/each}
     {/if}

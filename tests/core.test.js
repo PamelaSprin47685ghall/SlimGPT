@@ -6,6 +6,8 @@ import {
   conversationIdFromUrl,
   extractConversationItems,
   findConversationPayload,
+  getToolMessageInfo,
+  groupConversationTurns,
   parseWebMobilePartialConversation,
   stepConversationBranch,
   upsertLiveMessage,
@@ -27,6 +29,21 @@ const payload = {
 
 test('conversation view follows current parent chain', () => {
   assert.deepEqual(buildConversationView(payload).map((message) => message.text), ['hello', 'branch two']);
+});
+
+test('conversation turns keep each user question with its following replies', () => {
+  const turns = groupConversationTurns([
+    { id: 'u1', role: 'user', text: 'question one' },
+    { id: 'a1', role: 'assistant', text: 'answer one' },
+    { id: 'tool1', role: 'tool', text: 'tool detail' },
+    { id: 'u2', role: 'user', text: 'question two' },
+    { id: 'a2', role: 'assistant', text: 'answer two' },
+  ]);
+  assert.equal(turns.length, 2);
+  assert.equal(turns[0].user.text, 'question one');
+  assert.deepEqual(turns[0].replies.map((message) => message.text), ['answer one', 'tool detail']);
+  assert.equal(turns[1].user.text, 'question two');
+  assert.deepEqual(turns[1].replies.map((message) => message.text), ['answer two']);
 });
 
 test('branch stepping descends through selected sibling to a leaf', () => {
@@ -75,4 +92,34 @@ test('live streamed messages update in place', () => {
   const second = upsertLiveMessage(first, { id: 'm1', author: { role: 'assistant' }, content: { parts: ['hello'] } });
   assert.equal(second.length, 1);
   assert.equal(second[0].text, 'hello');
+});
+
+test('tool calls and tool results are classified from message structure, not arbitrary JSON text', () => {
+  const call = getToolMessageInfo({
+    author: { role: 'assistant' },
+    recipient: 'web.run',
+    content: {
+      content_type: 'code',
+      language: 'json',
+      text: '{"search_query":[{"q":"SlimGPT"}]}',
+    },
+  });
+  assert.equal(call.kind, 'tool-call');
+  assert.equal(call.name, 'web.run');
+  assert.equal(call.payload, '{"search_query":[{"q":"SlimGPT"}]}');
+
+  const result = getToolMessageInfo({
+    author: { role: 'tool', name: 'web.run' },
+    content: {
+      content_type: 'text',
+      parts: ['{"ok":true,"items":[1,2]}'],
+    },
+  });
+  assert.equal(result.kind, 'tool-result');
+  assert.equal(result.name, 'web.run');
+
+  assert.equal(getToolMessageInfo({
+    author: { role: 'assistant' },
+    content: { content_type: 'text', parts: ['```json\n{"ordinary":true}\n```'] },
+  }), null, 'ordinary assistant JSON must remain normal Markdown');
 });

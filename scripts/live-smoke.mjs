@@ -74,7 +74,7 @@ async function runFixtureSmoke(browser, extensionId) {
   await top.call('Runtime.enable');
   await top.call('Fetch.enable', {
     patterns: [
-      { urlPattern: 'https://chatgpt.com/slimgpt-smoke*', resourceType: 'Document', requestStage: 'Request' },
+      { urlPattern: 'https://chatgpt.com/*', resourceType: 'Document', requestStage: 'Request' },
       { urlPattern: 'https://chatgpt.com/backend-api/*', requestStage: 'Request' },
       { urlPattern: 'https://chatgpt.com/unauth-mweb/conversation/updates*', requestStage: 'Request' },
     ],
@@ -88,13 +88,31 @@ async function runFixtureSmoke(browser, extensionId) {
   await sleep(250);
   const failOpen = await top.evaluate(topStateExpression());
   assert.equal(failOpen.pageHook, true, 'page-world hook must install');
-  assert.equal(failOpen.frameDisplay, 'none', 'takeover must stay hidden without an official composer');
+  assert.equal(failOpen.frameDisplay, 'block', 'takeover iframe surface should stay mounted to avoid compositor flashes');
+  assert.equal(failOpen.frameVisible, false, 'takeover must stay visually hidden without an official composer');
+  assert.equal(failOpen.frameOpacity, '0');
+  assert.equal(failOpen.framePointerEvents, 'none');
   assert.equal(failOpen.sleep, null, 'official body must remain awake on auth/challenge pages');
 
+  await top.evaluate(`(() => {
+    const dialog = document.createElement('dialog');
+    dialog.id = 'fixture-cookie-dialog';
+    dialog.innerHTML = '<p>Cookie consent fixture</p><button type="button">Accept</button>';
+    document.body.appendChild(dialog);
+    dialog.showModal();
+    return true;
+  })()`);
   await top.evaluate(installComposerExpression());
+  await sleep(700);
+  const blockedByModal = await top.evaluate(topStateExpression());
+  assert.equal(blockedByModal.frameDisplay, 'block', 'modal handling must not tear down the iframe surface');
+  assert.equal(blockedByModal.frameVisible, false, 'takeover must stay hidden while an official modal is open');
+  assert.equal(blockedByModal.sleep, null, 'official body must remain actionable while a modal blocks takeover');
+
+  await top.evaluate(`document.getElementById('fixture-cookie-dialog')?.close()`);
   await waitFor(async () => {
     const state = await top.evaluate(topStateExpression());
-    return state.frameDisplay === 'block' && state.sleep === '1';
+    return state.frameVisible === true && state.frameOpacity === '1' && state.sleep === '1';
   });
 
   const frameTarget = await waitForTarget(
@@ -103,7 +121,81 @@ async function runFixtureSmoke(browser, extensionId) {
   );
   const ui = await connectCdp(frameTarget.webSocketDebuggerUrl);
   await ui.call('Runtime.enable');
+  await ui.evaluate(`(() => {
+    window.__slimgptWindowErrors = [];
+    addEventListener('error', (event) => {
+      window.__slimgptWindowErrors.push(String(event.message || ''));
+    });
+  })()`);
   await waitFor(async () => (await ui.evaluate(`document.querySelector('.status-pill')?.textContent?.trim()`)) === '已接管');
+
+  const focusGuard = await top.evaluate(`(() => {
+    const frame = document.getElementById('slimgpt-takeover-frame');
+    const composer = document.querySelector('#mobile-composer-prompt');
+    frame?.focus();
+    composer?.focus();
+    window.focus();
+    return {
+      activeId: document.activeElement?.id || '',
+      frameFocused: document.activeElement === frame,
+    };
+  })()`);
+  assert.equal(focusGuard.frameFocused, true, 'hidden official controls must not steal focus from the takeover frame');
+  assert.equal(focusGuard.activeId, 'slimgpt-takeover-frame');
+
+  const composerLayout = await ui.evaluate(`(() => {
+    const textarea = document.querySelector('.composer-shell textarea');
+    const style = getComputedStyle(textarea);
+    return {
+      clientHeight: textarea.clientHeight,
+      scrollHeight: textarea.scrollHeight,
+      overflowY: style.overflowY,
+      lineHeight: style.lineHeight,
+      paddingTop: style.paddingTop,
+      paddingBottom: style.paddingBottom,
+    };
+  })()`);
+  assert.equal(composerLayout.clientHeight, 34, 'single-line composer must align with the 34px send control');
+  assert.ok(composerLayout.scrollHeight <= composerLayout.clientHeight, 'empty composer must not show a fake vertical scrollbar');
+  assert.equal(composerLayout.overflowY, 'hidden');
+  assert.equal(composerLayout.lineHeight, '20px');
+  assert.equal(composerLayout.paddingTop, '7px');
+  assert.equal(composerLayout.paddingBottom, '7px');
+
+  await ui.evaluate(`(() => {
+    const textarea = document.querySelector('.composer-shell textarea');
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+    setter.call(textarea, 'one\\ntwo\\nthree');
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  await sleep(50);
+  const composerExpanded = await ui.evaluate(`(() => {
+    const textarea = document.querySelector('.composer-shell textarea');
+    return { height: textarea.clientHeight, overflowY: getComputedStyle(textarea).overflowY };
+  })()`);
+  assert.ok(composerExpanded.height > 34 && composerExpanded.height < 160, 'multiline composer must grow before scrolling');
+  assert.equal(composerExpanded.overflowY, 'hidden');
+
+  await ui.evaluate(`(() => {
+    const textarea = document.querySelector('.composer-shell textarea');
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+    setter.call(textarea, Array.from({ length: 20 }, (_, index) => 'line ' + index).join('\\n'));
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  await sleep(50);
+  const composerOverflow = await ui.evaluate(`(() => {
+    const textarea = document.querySelector('.composer-shell textarea');
+    return { height: textarea.clientHeight, overflowY: getComputedStyle(textarea).overflowY };
+  })()`);
+  assert.equal(composerOverflow.height, 160, 'composer must stop growing at the configured maximum');
+  assert.equal(composerOverflow.overflowY, 'auto', 'composer should scroll only after reaching its maximum height');
+
+  await ui.evaluate(`(() => {
+    const textarea = document.querySelector('.composer-shell textarea');
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+    setter.call(textarea, '');
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
 
   await top.evaluate(`Promise.all([
     fetch('/backend-api/conversations?offset=0').then((response) => response.json()),
@@ -116,11 +208,332 @@ async function runFixtureSmoke(browser, extensionId) {
   const canonicalUi = await ui.evaluate(uiStateExpression());
   assert.equal(canonicalUi.highlightedString, '"ok"', 'Markdown worker must emit valid, escaped string tokens');
   assert.equal(canonicalUi.unsafeNodes, 0, 'captured Markdown must not create raw scriptable elements');
-  assert.ok(canonicalUi.mountedRows < 40, `virtual list mounted ${canonicalUi.mountedRows} of 120 messages`);
-  assert.ok(canonicalUi.virtualHeight > 8_000, 'virtual list must preserve scroll height for unmounted rows');
+  assert.equal(canonicalUi.mountedCards, 2, 'the center pane must mount only the active user+assistant turn');
+  assert.equal(canonicalUi.overviewItems, 60, 'the right overview must index one row per user+assistant turn');
+  assert.equal(canonicalUi.activeOverview, '60', 'a newly opened conversation should start at the latest turn');
+  assert.ok(canonicalUi.modelLabel.toLowerCase().includes('gpt-5'), 'enhanced history must surface the captured model');
+  assert.ok(canonicalUi.historyPreview.includes('Fixture answer'), 'enhanced history must surface the latest message preview');
   await sleep(700);
   const persistedIndex = await ui.evaluate(`JSON.parse(localStorage.getItem('slimgpt:conversation-index:v1') || '[]')`);
-  assert.deepEqual(Object.keys(persistedIndex[0]).sort(), ['create_time', 'id', 'route', 'title', 'update_time']);
+  assert.deepEqual(Object.keys(persistedIndex[0]).sort(), ['create_time', 'id', 'last', 'model', 'route', 'title', 'update_time']);
+
+  await ui.evaluate(`document.querySelector('[data-overview-index="0"]')?.click()`);
+  await waitFor(async () => {
+    const state = await ui.evaluate(uiStateExpression());
+    return (
+      state.activeOverview === '1' &&
+      state.messages.includes('Fixture user message 1') &&
+      state.messages.includes('Fixture assistant message 2')
+    );
+  });
+  const firstTurn = await ui.evaluate(uiStateExpression());
+  assert.ok(firstTurn.messages.includes('Fixture assistant message 2'), 'question and answer must stay together in one center-page turn');
+  assert.equal(firstTurn.messages.includes('Fixture user message 3'), false, 'the next question must not leak into the active turn');
+  assert.equal(firstTurn.mountedCards, 2);
+
+  const longTurnScroll = await ui.evaluate(`(() => {
+    const scroller = document.querySelector('.single-message-scroller');
+    const style = scroller ? getComputedStyle(scroller) : null;
+    return {
+      clientHeight: scroller?.clientHeight || 0,
+      scrollHeight: scroller?.scrollHeight || 0,
+      overflowY: style?.overflowY || '',
+      scrollbarWidth: style?.scrollbarWidth || '',
+    };
+  })()`);
+  assert.ok(longTurnScroll.scrollHeight > longTurnScroll.clientHeight, 'a long answer must scroll inside its own question+answer turn');
+  assert.equal(longTurnScroll.overflowY, 'auto');
+  assert.notEqual(longTurnScroll.scrollbarWidth, 'none', 'only the active turn scroller should expose a visible scrollbar');
+
+  await ui.evaluate(`(() => {
+    const scroller = document.querySelector('.single-message-scroller');
+    scroller.scrollTop = Math.floor((scroller.scrollHeight - scroller.clientHeight) / 2);
+    document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', bubbles: true, cancelable: true }));
+  })()`);
+  assert.ok((await ui.evaluate(`document.querySelector('.single-message-scroller')?.scrollTop || 0`)) <= 1, 'Home must jump to the current turn start');
+  await ui.evaluate(`document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true, cancelable: true }))`);
+  assert.ok(await ui.evaluate(`(() => {
+    const scroller = document.querySelector('.single-message-scroller');
+    const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    return Math.abs(scroller.scrollTop - max) <= 1;
+  })()`), 'End must jump to the current turn end');
+
+  await ui.evaluate(`(() => {
+    const scroller = document.querySelector('.single-message-scroller');
+    scroller.scrollTop = scroller.scrollHeight;
+    const delta = Math.max(400, scroller.clientHeight * 0.96);
+    scroller.dispatchEvent(new WheelEvent('wheel', { deltaY: delta, bubbles: true, cancelable: true }));
+  })()`);
+  await sleep(80);
+  const downwardRunway = await ui.evaluate(`(() => {
+    const runway = document.querySelector('.turn-boundary-runway.down');
+    const stage = document.querySelector('.conversation-turn-stage');
+    return {
+      active: document.querySelector('.overview-item.active .overview-number')?.textContent?.trim() || '',
+      runwayRatio: runway && stage ? runway.clientHeight / stage.clientHeight : 0,
+      ready: runway?.classList.contains('ready') || false,
+      transform: document.querySelector('.single-message-content')?.style.transform || '',
+    };
+  })()`);
+  assert.equal(downwardRunway.active, '1', 'filling the downward runway must not flip immediately');
+  assert.ok(downwardRunway.runwayRatio > 0.9, 'boundary blank space should expand until it occupies the viewport');
+  assert.equal(downwardRunway.ready, true);
+  assert.match(downwardRunway.transform, /translateY\(-/);
+  await ui.evaluate(`document.querySelector('.single-message-scroller')?.dispatchEvent(new WheelEvent('wheel', { deltaY: 60, bubbles: true, cancelable: true }))`);
+  await waitFor(async () => {
+    const state = await ui.evaluate(uiStateExpression());
+    return state.activeOverview === '2' && state.messages.includes('Fixture user message 3');
+  });
+  const secondTurn = await ui.evaluate(uiStateExpression());
+  assert.ok(secondTurn.messages.includes('Fixture user message 3'));
+  assert.ok(secondTurn.messages.includes('Fixture assistant message 4'));
+  assert.equal(secondTurn.messages.includes('Fixture user message 5'), false);
+
+  const secondTurnStart = await ui.evaluate(`(() => {
+    const scroller = document.querySelector('.single-message-scroller');
+    return scroller?.scrollTop || 0;
+  })()`);
+  assert.ok(secondTurnStart <= 1, 'downward turn navigation must land at the next turn start');
+
+  await sleep(280);
+  await ui.evaluate(`(() => {
+    const scroller = document.querySelector('.single-message-scroller');
+    scroller.scrollTop = 0;
+    const delta = Math.max(400, scroller.clientHeight * 0.96);
+    scroller.dispatchEvent(new WheelEvent('wheel', { deltaY: -delta, bubbles: true, cancelable: true }));
+  })()`);
+  await sleep(80);
+  const upwardRunway = await ui.evaluate(`(() => ({
+    active: document.querySelector('.overview-item.active .overview-number')?.textContent?.trim() || '',
+    ready: document.querySelector('.turn-boundary-runway.up')?.classList.contains('ready') || false,
+  }))()`);
+  assert.equal(upwardRunway.active, '2', 'filling the upward runway must not flip immediately');
+  assert.equal(upwardRunway.ready, true);
+  await ui.evaluate(`document.querySelector('.single-message-scroller')?.dispatchEvent(new WheelEvent('wheel', { deltaY: -60, bubbles: true, cancelable: true }))`);
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).activeOverview === '1');
+  await waitFor(async () => await ui.evaluate(`(() => {
+    const scroller = document.querySelector('.single-message-scroller');
+    if (!scroller) return false;
+    const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    return Math.abs(scroller.scrollTop - max) <= 1;
+  })()`), 1_500);
+  assert.ok(await ui.evaluate(`(() => {
+    const scroller = document.querySelector('.single-message-scroller');
+    const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    return Math.abs(scroller.scrollTop - max) <= 1;
+  })()`), 'wheel-up across a turn boundary must land at the previous turn end');
+
+  await sleep(280);
+  await ui.evaluate(`(() => {
+    const scroller = document.querySelector('.single-message-scroller');
+    scroller.scrollTop = scroller.scrollHeight;
+    const delta = Math.max(400, scroller.clientHeight * 0.96);
+    scroller.dispatchEvent(new WheelEvent('wheel', { deltaY: delta, bubbles: true, cancelable: true }));
+    scroller.dispatchEvent(new WheelEvent('wheel', { deltaY: 60, bubbles: true, cancelable: true }));
+  })()`);
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).activeOverview === '2');
+  assert.ok((await ui.evaluate(`document.querySelector('.single-message-scroller')?.scrollTop || 0`)) <= 1, 'wheel-down across a turn boundary must land at the next turn start');
+
+  await sleep(280);
+  await ui.evaluate(`(() => {
+    const scroller = document.querySelector('.single-message-scroller');
+    scroller.scrollTop = 0;
+    const steps = Math.ceil(Math.max(360, scroller.clientHeight * 0.95) / 72);
+    for (let index = 0; index < steps; index += 1) {
+      document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true, cancelable: true }));
+    }
+  })()`);
+  assert.equal((await ui.evaluate(uiStateExpression())).activeOverview, '2', 'ArrowUp should fill the runway before crossing');
+  await ui.evaluate(`document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true, cancelable: true }))`);
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).activeOverview === '1');
+  await waitFor(async () => await ui.evaluate(`(() => {
+    const scroller = document.querySelector('.single-message-scroller');
+    if (!scroller) return false;
+    const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    return Math.abs(scroller.scrollTop - max) <= 1;
+  })()`), 1_500);
+  const arrowUpLanding = await ui.evaluate(`(() => {
+    const scroller = document.querySelector('.single-message-scroller');
+    return {
+      scrollTop: scroller?.scrollTop || 0,
+      maxScrollTop: Math.max(0, (scroller?.scrollHeight || 0) - (scroller?.clientHeight || 0)),
+    };
+  })()`);
+  assert.ok(Math.abs(arrowUpLanding.scrollTop - arrowUpLanding.maxScrollTop) <= 1, 'ArrowUp across a turn boundary must land at the previous turn end');
+
+  await sleep(280);
+  await ui.evaluate(`(() => {
+    const scroller = document.querySelector('.single-message-scroller');
+    scroller.scrollTop = scroller.scrollHeight;
+    const steps = Math.ceil(Math.max(360, scroller.clientHeight * 0.95) / 72);
+    for (let index = 0; index < steps; index += 1) {
+      document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }));
+    }
+  })()`);
+  assert.equal((await ui.evaluate(uiStateExpression())).activeOverview, '1', 'ArrowDown should fill the runway before crossing');
+  await ui.evaluate(`document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }))`);
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).activeOverview === '2');
+  assert.ok((await ui.evaluate(`document.querySelector('.single-message-scroller')?.scrollTop || 0`)) <= 1, 'ArrowDown across a turn boundary must land at the next turn start');
+
+  await sleep(280);
+  await ui.evaluate(`(() => {
+    const scroller = document.querySelector('.single-message-scroller');
+    scroller.scrollTop = 0;
+    document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'PageUp', bubbles: true, cancelable: true }));
+    document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'PageUp', bubbles: true, cancelable: true }));
+  })()`);
+  assert.equal((await ui.evaluate(uiStateExpression())).activeOverview, '2', 'PageUp should fill the runway before crossing');
+  await ui.evaluate(`document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'PageUp', bubbles: true, cancelable: true }))`);
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).activeOverview === '1');
+  await waitFor(async () => await ui.evaluate(`(() => {
+    const scroller = document.querySelector('.single-message-scroller');
+    if (!scroller) return false;
+    const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    return Math.abs(scroller.scrollTop - max) <= 1;
+  })()`), 1_500);
+  const pageUpLanding = await ui.evaluate(`(() => {
+    const scroller = document.querySelector('.single-message-scroller');
+    return {
+      scrollTop: scroller?.scrollTop || 0,
+      maxScrollTop: Math.max(0, (scroller?.scrollHeight || 0) - (scroller?.clientHeight || 0)),
+    };
+  })()`);
+  assert.ok(Math.abs(pageUpLanding.scrollTop - pageUpLanding.maxScrollTop) <= 1, 'PageUp across a turn boundary must land at the previous turn end');
+
+  await sleep(280);
+  await ui.evaluate(`(() => {
+    const scroller = document.querySelector('.single-message-scroller');
+    scroller.scrollTop = scroller.scrollHeight;
+    document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'PageDown', bubbles: true, cancelable: true }));
+    document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'PageDown', bubbles: true, cancelable: true }));
+  })()`);
+  assert.equal((await ui.evaluate(uiStateExpression())).activeOverview, '1', 'PageDown should fill the runway before crossing');
+  await ui.evaluate(`document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'PageDown', bubbles: true, cancelable: true }))`);
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).activeOverview === '2');
+  assert.ok((await ui.evaluate(`document.querySelector('.single-message-scroller')?.scrollTop || 0`)) <= 1, 'PageDown across a turn boundary must land at the next turn start');
+
+  await ui.evaluate(`document.querySelector('[data-overview-index="0"]')?.click()`);
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).activeOverview === '1');
+  const pageDownWithinTurnBefore = await ui.evaluate(`document.querySelector('.single-message-scroller')?.scrollTop || 0`);
+  await ui.evaluate(`document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'PageDown', bubbles: true, cancelable: true }))`);
+  await sleep(80);
+  const pageDownWithinTurn = await ui.evaluate(`(() => ({
+    active: document.querySelector('.overview-item.active .overview-number')?.textContent?.trim() || '',
+    scrollTop: document.querySelector('.single-message-scroller')?.scrollTop || 0,
+  }))()`);
+  assert.equal(pageDownWithinTurn.active, '1', 'PageDown must scroll within a long turn before crossing the turn boundary');
+  assert.ok(pageDownWithinTurn.scrollTop > pageDownWithinTurnBefore, 'PageDown must move the active turn viewport down');
+
+  await ui.evaluate(`document.querySelector('[data-overview-index="59"]')?.click()`);
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).activeOverview === '60');
+
+  const wideMetrics = {
+    width: 1920,
+    height: 1080,
+    deviceScaleFactor: 1,
+    mobile: false,
+  };
+  await top.call('Emulation.setDeviceMetricsOverride', wideMetrics);
+  await sleep(120);
+  const wideLayout = await ui.evaluate(`(() => {
+    const shell = document.querySelector('.app-shell');
+    const center = document.querySelector('.chat-pane');
+    const content = document.querySelector('.single-message-content');
+    const overview = document.querySelector('.overview-host');
+    const sidebar = document.querySelector('.sidebar-host');
+    return {
+      columns: getComputedStyle(shell).gridTemplateColumns,
+      centerWidth: center?.clientWidth || 0,
+      contentWidth: content?.clientWidth || 0,
+      overviewWidth: overview?.clientWidth || 0,
+      sidebarWidth: sidebar?.clientWidth || 0,
+    };
+  })()`);
+  assert.ok(wideLayout.columns.split(' ').length >= 3, 'desktop must use a permanent left-center-right layout');
+  assert.ok(wideLayout.contentWidth > 900, 'wide-screen mode must actually broaden the center conversation area');
+  assert.ok(wideLayout.sidebarWidth >= 270 && wideLayout.overviewWidth >= 250);
+
+  const mobileMetrics = {
+    width: 390,
+    height: 844,
+    deviceScaleFactor: 2,
+    mobile: true,
+  };
+  await top.call('Emulation.setDeviceMetricsOverride', mobileMetrics);
+  await top.evaluate(`(() => {
+    const frame = document.getElementById('slimgpt-takeover-frame');
+    if (!frame) return false;
+    frame.style.inset = '0 auto auto 0';
+    frame.style.width = '390px';
+    frame.style.height = '844px';
+    return true;
+  })()`);
+  await sleep(180);
+  const mobileInitial = await ui.evaluate(`(() => ({
+    navbar: getComputedStyle(document.querySelector('.mobile-navbar')).display,
+    sidebarOpen: document.querySelector('.sidebar-host')?.classList.contains('open') || false,
+    overviewOpen: document.querySelector('.overview-host')?.classList.contains('open') || false,
+  }))()`);
+  assert.notEqual(mobileInitial.navbar, 'none');
+  assert.equal(mobileInitial.sidebarOpen, false);
+  assert.equal(mobileInitial.overviewOpen, false);
+
+  await ui.evaluate(`[...document.querySelectorAll('.mobile-navbar .button')].find((button) => button.textContent.includes('☰'))?.click()`);
+  await waitFor(async () => await ui.evaluate(`document.querySelector('.sidebar-host')?.classList.contains('open') || false`));
+  assert.equal(await ui.evaluate(`document.querySelector('.overview-host')?.classList.contains('open') || false`), false);
+  await ui.evaluate(`document.querySelector('.sidebar-scrim')?.click()`);
+  await waitFor(async () => !(await ui.evaluate(`document.querySelector('.sidebar-host')?.classList.contains('open') || false`)));
+
+  await ui.evaluate(`[...document.querySelectorAll('.mobile-navbar .button')].find((button) => button.textContent.includes('概览'))?.click()`);
+  await waitFor(async () => await ui.evaluate(`document.querySelector('.overview-host')?.classList.contains('open') || false`));
+  assert.equal(await ui.evaluate(`document.querySelector('.sidebar-host')?.classList.contains('open') || false`), false);
+  await ui.evaluate(`document.querySelector('.sidebar-scrim')?.click()`);
+  await waitFor(async () => !(await ui.evaluate(`document.querySelector('.overview-host')?.classList.contains('open') || false`)));
+
+  const resetMetrics = {
+    width: 1280,
+    height: 800,
+    deviceScaleFactor: 1,
+    mobile: false,
+  };
+  await top.call('Emulation.setDeviceMetricsOverride', resetMetrics);
+  await top.evaluate(`(() => {
+    const frame = document.getElementById('slimgpt-takeover-frame');
+    if (!frame) return false;
+    frame.style.inset = '0';
+    frame.style.width = '100%';
+    frame.style.height = '100%';
+    return true;
+  })()`);
+  await sleep(120);
+
+  await ui.evaluate(`(() => {
+    window.__slimgptExportBlob = null;
+    window.__slimgptExportName = '';
+    URL.createObjectURL = (blob) => {
+      window.__slimgptExportBlob = blob;
+      return 'blob:slimgpt-smoke-export';
+    };
+    const nativeAnchorClick = HTMLAnchorElement.prototype.click;
+    HTMLAnchorElement.prototype.click = function () {
+      if (this.download) {
+        window.__slimgptExportName = this.download;
+        return;
+      }
+      return nativeAnchorClick.call(this);
+    };
+    [...document.querySelectorAll('.sidebar-actions .button')]
+      .find((button) => button.textContent.includes('导出 Markdown'))?.click();
+    return true;
+  })()`);
+  const markdownExport = await ui.evaluate(`(async () => ({
+    filename: window.__slimgptExportName,
+    content: window.__slimgptExportBlob ? await window.__slimgptExportBlob.text() : ''
+  }))()`);
+  assert.equal(markdownExport.filename, 'Fixture conversation.md');
+  assert.ok(markdownExport.content.startsWith('# Fixture conversation\n\n## 你\n\nFixture user message 1'));
+  assert.ok(markdownExport.content.includes('Fixture assistant message 118'), 'export must include messages outside the virtualized DOM');
+  assert.ok(markdownExport.content.includes('```js\nconst value = "ok";\n```'), 'export must preserve Markdown code blocks');
 
   await top.evaluate(`(() => {
     window.__slimgptRelayedPayloads = [];
@@ -150,6 +563,19 @@ async function runFixtureSmoke(browser, extensionId) {
   const sendSuccess = await ui.evaluate(uiStateExpression());
   assert.equal(sendSuccess.composerStatus, '消息已提交');
 
+  await top.evaluate(`(() => {
+    window.__slimgptContinueClicks = 0;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = 'Continue generating';
+    button.addEventListener('click', () => {
+      window.__slimgptContinueClicks += 1;
+      button.remove();
+    });
+    document.body.appendChild(button);
+  })()`);
+  await waitFor(async () => (await top.evaluate('window.__slimgptContinueClicks || 0')) === 1, 4_000);
+
   await top.evaluate(`document.getElementById('fixture-composer')?.remove()`);
   const failedText = 'Draft that must survive';
   await ui.evaluate(fillAndSubmitExpression(failedText));
@@ -160,23 +586,180 @@ async function runFixtureSmoke(browser, extensionId) {
   await ui.evaluate(`document.querySelector('.desktop-chat-header .button')?.click()`);
   await waitFor(async () => (await top.evaluate(topStateExpression())).restore === true);
   const official = await top.evaluate(topStateExpression());
-  assert.equal(official.frameDisplay, 'none');
+  assert.equal(official.frameDisplay, 'block', 'showing official UI must keep the takeover iframe mounted');
+  assert.equal(official.frameVisible, false);
+  assert.equal(official.frameOpacity, '0');
+  assert.equal(official.framePointerEvents, 'none');
   assert.equal(official.sleep, null);
   await top.evaluate(`document.getElementById('slimgpt-restore-button')?.click()`);
   await waitFor(async () => (await top.evaluate(topStateExpression())).sleep === '1');
   const restored = await top.evaluate(topStateExpression());
+
+  const navigationDocumentToken = await top.evaluate(`(() => {
+    window.__slimgptNavigationDocumentToken = crypto.randomUUID();
+    window.__slimgptPopstatePaths = [];
+    addEventListener('popstate', () => {
+      window.__slimgptPopstatePaths.push(location.pathname);
+      if (location.pathname === '/c/second') {
+        setTimeout(() => fetch('/backend-api/conversation/second').then((response) => response.json()), 300);
+      } else if (location.pathname === '/c/live-only') {
+        setTimeout(() => fetch('/backend-api/messages/live-only').then((response) => response.json()), 300);
+      }
+    });
+    return window.__slimgptNavigationDocumentToken;
+  })()`);
+  await ui.evaluate(`[...document.querySelectorAll('.conversation-item')]
+    .find((button) => button.textContent.includes('Second conversation'))?.click()`);
+  await waitFor(async () => {
+    const url = await top.evaluate('location.href');
+    return new URL(url).pathname === '/c/second';
+  });
+  await waitFor(async () => await ui.evaluate(`!!document.querySelector('.conversation-loading')`));
+  const navigationLoading = {
+    top: await top.evaluate(topStateExpression()),
+    token: await top.evaluate('window.__slimgptNavigationDocumentToken || null'),
+    popstatePaths: await top.evaluate('window.__slimgptPopstatePaths || []'),
+    ui: await ui.evaluate(`(() => ({
+      loading: !!document.querySelector('.conversation-loading'),
+      loadingText: document.querySelector('.conversation-loading')?.innerText?.replace(/\\s+/g, ' ').trim() || '',
+      composerDisabled: document.querySelector('.composer-shell textarea')?.disabled || false,
+      mountedCards: document.querySelectorAll('.message-card').length,
+    }))()`),
+  };
+  assert.equal(navigationLoading.token, navigationDocumentToken, 'conversation navigation must preserve the host document');
+  assert.equal(navigationLoading.top.frameVisible, true, 'takeover frame must stay visible during conversation navigation');
+  assert.equal(navigationLoading.top.frameOpacity, '1');
+  assert.equal(navigationLoading.top.sleep, '1', 'official UI must remain render-slept behind the stable takeover frame');
+  assert.equal(navigationLoading.ui.loading, true, 'right pane must show a loading state before target payload arrives');
+  assert.equal(navigationLoading.ui.composerDisabled, true, 'composer must be disabled while the target conversation is loading');
+  assert.ok(navigationLoading.ui.mountedCards > 0, 'previous question+answer turn should remain mounted behind the loading overlay');
+  assert.ok(navigationLoading.popstatePaths.includes('/c/second'), 'SPA fallback must notify the host router with popstate');
+
+  await waitFor(async () => {
+    const state = await ui.evaluate(uiStateExpression());
+    return state.title === 'Second conversation' && state.messages.includes('Second answer');
+  });
+  assert.equal(await ui.evaluate(`!!document.querySelector('.conversation-loading')`), false, 'loading state must disappear after payload arrives');
+  assert.equal(await top.evaluate('window.__slimgptNavigationDocumentToken'), navigationDocumentToken, 'payload load must not replace the host document');
+
+  const toolRendering = await ui.evaluate(`(() => {
+    const text = (selector) => {
+      const node = document.querySelector(selector);
+      return node ? String(node.textContent || '').trim() : '';
+    };
+    const tomlNodes = Array.from(document.querySelectorAll('.tool-toml-pre code.language-toml'));
+    const toolNameNodes = Array.from(document.querySelectorAll('.tool-message-name'));
+    return {
+      calls: document.querySelectorAll('.message-card.tool-call').length,
+      results: document.querySelectorAll('.message-card.tool-result').length,
+      callAvatar: text('.message-card.tool-call .message-avatar'),
+      resultAvatar: text('.message-card.tool-result .message-avatar'),
+      markdownInsideTools: document.querySelectorAll('.message-card.tool-call .message-markdown, .message-card.tool-result .message-markdown').length,
+      tomlBlocks: tomlNodes.length,
+      tomlText: tomlNodes.map((node) => String(node.textContent || '')).join('\\n---\\n'),
+      highlightedTokens: document.querySelectorAll('.tool-toml-pre .hljs-attr, .tool-toml-pre .hljs-string, .tool-toml-pre .hljs-number').length,
+      toolNames: toolNameNodes.map((node) => String(node.textContent || '').trim()),
+    };
+  })()`);
+  assert.equal(toolRendering.calls, 1, 'tool calls must render as their own card/avatar instead of Markdown');
+  assert.equal(toolRendering.results, 1, 'tool results must render as their own card/avatar instead of Markdown');
+  assert.equal(toolRendering.callAvatar, '↗');
+  assert.equal(toolRendering.resultAvatar, '↙');
+  assert.equal(toolRendering.markdownInsideTools, 0, 'structured tool payloads must bypass the Markdown renderer');
+  assert.equal(toolRendering.tomlBlocks, 2, 'tool call and result must each render a TOML code block');
+  assert.ok(toolRendering.tomlText.includes('query = "SlimGPT"'));
+  assert.ok(toolRendering.tomlText.includes('[options]'));
+  assert.ok(toolRendering.tomlText.includes('next = "<null>"'));
+  assert.ok(toolRendering.highlightedTokens > 0, 'TOML code must be syntax highlighted');
+  assert.deepEqual(toolRendering.toolNames, ['web.run', 'web.run']);
+
+  await ui.evaluate(`[...document.querySelectorAll('.conversation-item')]
+    .find((button) => button.textContent.includes('Live only conversation'))?.click()`);
+  await waitFor(async () => (await top.evaluate('location.pathname')) === '/c/live-only');
+  await waitFor(async () => await ui.evaluate(`!!document.querySelector('.conversation-loading')`));
+  await waitFor(async () => {
+    const state = await ui.evaluate(uiStateExpression());
+    return state.messages.includes('Live-only answer') && !state.loading;
+  });
+  const liveOnlyNavigation = await ui.evaluate(`(() => ({
+    loading: !!document.querySelector('.conversation-loading'),
+    messages: document.querySelector('.message-stage')?.innerText?.replace(/\\s+/g, ' ').trim() || '',
+    composerStatus: document.querySelector('.composer-status')?.textContent?.trim() || '',
+  }))()`);
+  assert.equal(liveOnlyNavigation.loading, false, 'visible live/stream content must dismiss the loading overlay without a full conversation payload');
+  assert.ok(liveOnlyNavigation.messages.includes('Live-only answer'));
+  assert.equal(liveOnlyNavigation.composerStatus.includes('加载超时'), false);
+
+  await top.evaluate(`(() => {
+    const article = document.createElement('article');
+    article.setAttribute('data-message-id', 'dom-stream-a2');
+    const content = document.createElement('div');
+    content.setAttribute('data-message-author-role', 'assistant');
+    content.textContent = 'DOM stream one';
+    article.appendChild(content);
+    document.body.appendChild(article);
+  })()`);
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).messages.includes('DOM stream one'));
+  await top.evaluate(`(() => {
+    const node = document.querySelector('[data-message-id="dom-stream-a2"] [data-message-author-role="assistant"]');
+    if (node) node.textContent = 'DOM stream two';
+  })()`);
+  await waitFor(async () => {
+    const state = await ui.evaluate(uiStateExpression());
+    return state.messages.includes('DOM stream two') && !state.messages.includes('DOM stream one');
+  });
+  const domRealtime = await ui.evaluate(`document.querySelector('.message-stage')?.innerText?.replace(/\\s+/g, ' ').trim() || ''`);
+  assert.ok(domRealtime.includes('DOM stream two'), 'official DOM streaming mutations must update SlimGPT without polling');
+
+  await ui.evaluate(`[...document.querySelectorAll('.conversation-item')]
+    .find((button) => button.textContent.includes('Fixture conversation'))?.click()`);
+  await waitFor(async () => {
+    const url = await top.evaluate('location.href');
+    return new URL(url).pathname === '/c/smoke';
+  });
+  const conversationNavigation = await top.evaluate('location.href');
+  assert.equal(await top.evaluate('window.__slimgptNavigationDocumentToken'), navigationDocumentToken, 'cached conversation switches must also stay in-document');
+
+  await ui.evaluate(`document.querySelector('.new-chat')?.click()`);
+  await waitFor(async () => (await top.evaluate('location.pathname')) === '/');
+  const newChatNavigation = {
+    token: await top.evaluate('window.__slimgptNavigationDocumentToken || null'),
+    top: await top.evaluate(topStateExpression()),
+    empty: await ui.evaluate(`!!document.querySelector('.empty-state')`),
+  };
+  assert.equal(newChatNavigation.token, navigationDocumentToken, 'new-chat navigation must preserve the host document');
+  assert.equal(newChatNavigation.top.frameVisible, true, 'new-chat navigation must keep the takeover visible');
+  assert.equal(newChatNavigation.empty, true, 'new-chat navigation should switch the right pane without a page flash');
+
+  await sleep(250);
+  const resizeObserverErrors = await ui.evaluate(`window.__slimgptWindowErrors.filter((message) => /ResizeObserver loop/i.test(message))`);
+  assert.deepEqual(resizeObserverErrors, [], 'turn-paged message rendering must not trigger ResizeObserver loop errors');
 
   return {
     mode: 'fixture',
     chrome: await chromeVersion(),
     extensionId,
     failOpen,
+    blockedByModal,
     canonicalUi,
     mobileUi,
     sendSuccess,
     sendFailure,
     official,
     restored,
+    navigationLoading,
+    liveOnlyNavigation,
+    wideLayout,
+    mobileDrawers: true,
+    composerLayout,
+    composerExpanded,
+    composerOverflow,
+    markdownExport: {
+      filename: markdownExport.filename,
+      bytes: markdownExport.content.length,
+    },
+    conversationNavigation,
+    newChatNavigation,
   };
 }
 
@@ -235,6 +818,12 @@ async function fulfillFixtureRequest(client, event, fixture) {
   } else if (url.includes('/backend-api/conversations')) {
     body = JSON.stringify(fixture.list);
     contentType = 'application/json; charset=utf-8';
+  } else if (url.includes('/backend-api/conversation/second')) {
+    body = JSON.stringify(fixture.secondConversation);
+    contentType = 'application/json; charset=utf-8';
+  } else if (url.includes('/backend-api/messages/live-only')) {
+    body = JSON.stringify(fixture.liveOnlyEvent);
+    contentType = 'application/json; charset=utf-8';
   } else if (url.includes('/backend-api/conversation/smoke')) {
     body = JSON.stringify(fixture.conversation);
     contentType = 'application/json; charset=utf-8';
@@ -264,7 +853,9 @@ function makeFixture() {
   for (let index = 0; index < 120; index += 1) {
     const id = `message-${index}`;
     const role = index % 2 === 0 ? 'user' : 'assistant';
-    const content = index === 119
+    const content = index === 1
+      ? `Fixture assistant message 2\n\n${Array.from({ length: 90 }, (_, line) => `Long answer line ${line + 1}: ${'detail '.repeat(12)}`).join('\n')}`
+      : index === 119
       ? 'Fixture answer <img src=x onerror="window.__slimgptXss=1">\n\n```js\nconst value = "ok";\n```'
       : `Fixture ${role} message ${index + 1}`;
     mapping[parent].children.push(id);
@@ -272,7 +863,12 @@ function makeFixture() {
       id,
       parent,
       children: [],
-      message: { id, author: { role }, content: { parts: [content] } },
+      message: {
+        id,
+        author: { role },
+        content: { parts: [content] },
+        metadata: index === 119 ? { model_slug: 'gpt-5' } : {},
+      },
     };
     parent = id;
   }
@@ -283,6 +879,56 @@ function makeFixture() {
     create_time: 1,
     update_time: 2,
     mapping,
+  };
+  const secondConversation = {
+    id: 'second',
+    title: 'Second conversation',
+    current_node: 'second-a1',
+    create_time: 3,
+    update_time: 4,
+    mapping: {
+      root: { id: 'root', parent: null, children: ['second-u1'] },
+      'second-u1': {
+        id: 'second-u1',
+        parent: 'root',
+        children: ['second-call'],
+        message: { id: 'second-u1', author: { role: 'user' }, content: { parts: ['Second question'] } },
+      },
+      'second-call': {
+        id: 'second-call',
+        parent: 'second-u1',
+        children: ['second-tool'],
+        message: {
+          id: 'second-call',
+          author: { role: 'assistant' },
+          recipient: 'web.run',
+          content: {
+            content_type: 'code',
+            language: 'json',
+            text: '{"query":"SlimGPT","options":{"limit":3,"exact":true}}',
+          },
+        },
+      },
+      'second-tool': {
+        id: 'second-tool',
+        parent: 'second-call',
+        children: ['second-a1'],
+        message: {
+          id: 'second-tool',
+          author: { role: 'tool', name: 'web.run' },
+          content: {
+            content_type: 'text',
+            parts: ['{"ok":true,"items":[{"title":"One","score":0.9}],"next":null}'],
+          },
+        },
+      },
+      'second-a1': {
+        id: 'second-a1',
+        parent: 'second-tool',
+        children: [],
+        message: { id: 'second-a1', author: { role: 'assistant' }, content: { parts: ['Second answer'] } },
+      },
+    },
   };
   const mobileConversation = {
     backendConversationId: 'mobile-smoke',
@@ -296,8 +942,22 @@ function makeFixture() {
   const encodedConversation = escapeHtmlAttribute(JSON.stringify(mobileConversation));
   return {
     document: '<!doctype html><html><head><meta charset="utf-8"><title>Fixture ChatGPT</title></head><body><main id="official">Official fixture</main></body></html>',
-    list: { items: [{ id: 'smoke', title: 'Fixture conversation', update_time: 2, secret: 'INDEX_SECRET_MUST_NOT_PERSIST' }] },
+    list: { items: [
+      { id: 'live-only', title: 'Live only conversation', update_time: 5 },
+      { id: 'second', title: 'Second conversation', update_time: 4 },
+      { id: 'smoke', title: 'Fixture conversation', update_time: 2, secret: 'INDEX_SECRET_MUST_NOT_PERSIST' },
+    ] },
     conversation,
+    secondConversation,
+    liveOnlyEvent: {
+      conversation_id: 'live-only',
+      message: {
+        id: 'live-only-a1',
+        author: { role: 'assistant' },
+        content: { parts: ['Live-only answer'] },
+        create_time: 5,
+      },
+    },
     mobile: [
       '<template data-web-mobile-dpu-frame="1"><span data-conversation-id="mobile-smoke" data-message-id="ma1" data-resume-token="SECRET_MUST_STAY_IN_PAGE"></span></template>',
       '<template data-web-mobile-dpu-frame="2"><template for="assistant-pending-fixture-pending" data-web-mobile-dpu-apply="replace"><p data-assistant-stream-block="" data-assistant-stream-block-index="0">Streaming fixture answer</p></template></template>',
@@ -354,6 +1014,9 @@ function topStateExpression() {
     title: document.title,
     takeover: !!document.getElementById('slimgpt-takeover-frame'),
     frameDisplay: document.getElementById('slimgpt-takeover-frame')?.style.display || '',
+    frameVisible: document.getElementById('slimgpt-takeover-frame')?.dataset.slimgptVisible === '1',
+    frameOpacity: document.getElementById('slimgpt-takeover-frame')?.style.opacity || '',
+    framePointerEvents: document.getElementById('slimgpt-takeover-frame')?.style.pointerEvents || '',
     restore: !!document.getElementById('slimgpt-restore-button'),
     sleep: document.documentElement.getAttribute('data-slimgpt-render-sleep'),
     pageHook: !!window.__SLIMGPT_MITM_INSTALLED__,
@@ -371,8 +1034,12 @@ function uiStateExpression() {
     assistant: [...document.querySelectorAll('.role-assistant')].map((row) => row.innerText).join(' '),
     highlightedString: document.querySelector('.tok-str')?.textContent || '',
     unsafeNodes: document.querySelectorAll('.message-markdown img, .message-markdown script, .message-markdown iframe').length,
-    mountedRows: document.querySelectorAll('.message-row').length,
-    virtualHeight: Number.parseFloat(document.querySelector('.virtual-spacer')?.style.height || '0'),
+    mountedCards: document.querySelectorAll('.message-card').length,
+    loading: !!document.querySelector('.conversation-loading'),
+    overviewItems: document.querySelectorAll('.overview-item').length,
+    activeOverview: document.querySelector('.overview-item.active .overview-number')?.textContent?.trim() || '',
+    modelLabel: document.querySelector('.conversation-item.active .conversation-model')?.textContent?.trim() || '',
+    historyPreview: document.querySelector('.conversation-item.active .conversation-preview')?.textContent?.trim() || '',
     conversations: document.querySelectorAll('.conversation-item').length
   }))()`;
 }
