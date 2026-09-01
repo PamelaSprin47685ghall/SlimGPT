@@ -50,6 +50,17 @@ test('conversation turns keep each user question with its following replies', ()
   assert.deepEqual(turns[1].replies.map((message) => message.text), ['answer two']);
 });
 
+test('transient thinking indicators stay after tool activity', () => {
+  const turns = groupConversationTurns([
+    { id: 'u1', role: 'user', text: 'research this' },
+    { id: 'thinking', role: 'assistant', text: '', status: 'in_progress', isThinking: true },
+    { id: 'call', role: 'assistant', text: '', tool: { kind: 'call', name: 'web.run' } },
+    { id: 'result', role: 'tool', text: 'result', tool: { kind: 'result', name: 'web.run' } },
+  ]);
+
+  assert.deepEqual(turns[0].replies.map((message) => message.id), ['call', 'result', 'thinking']);
+});
+
 test('branch stepping descends through selected sibling to a leaf', () => {
   const terminal = stepConversationBranch(payload, 'a2', -1);
   assert.equal(terminal, 'a3');

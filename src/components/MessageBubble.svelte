@@ -1,6 +1,6 @@
 <script>
   import { onDestroy } from 'svelte';
-  import { renderMarkdown } from '../lib/markdown.js';
+  import IncrementalMarkdown from './IncrementalMarkdown.svelte';
   import ToolPayloadBlock from './ToolPayloadBlock.svelte';
 
   let {
@@ -8,20 +8,14 @@
     onBranch = () => {},
   } = $props();
 
-  let html = $state('');
-  let thoughtHtml = $state('');
   let copied = $state(false);
   let thoughtOpen = $state(false);
-  let timer = null;
-  let thoughtTimer = null;
   let copyTimer = null;
-  let cancelWorkerListener = null;
-  let cancelThoughtWorkerListener = null;
-  let initial = true;
 
   const hasText = $derived(Boolean(String(message?.text || '').trim()));
   const hasThought = $derived(Boolean(String(message?.thought || '').trim()));
   const isThinking = $derived(Boolean(message?.isThinking || (!hasText && !message?.tool && (message?.status === 'in_progress' || message?.live))));
+  const isStreaming = $derived(Boolean(message?.live && message?.status !== 'finished_successfully' && message?.status !== 'finished'));
   const isError = $derived(Boolean(message?.error || message?.status === 'failed'));
 
   // Auto-expand thought if it's currently generating and has no text yet
@@ -31,54 +25,8 @@
     }
   });
 
-  $effect(() => {
-    const id = message?.id || message?.nodeId || 'message';
-    const source = String(message?.text || '');
-    clearTimeout(timer);
-    if (message?.tool) {
-      cancelWorkerListener?.();
-      cancelWorkerListener = null;
-      html = '';
-      return;
-    }
-    if (!source.trim()) {
-      html = '';
-      return;
-    }
-    const delay = initial ? 0 : 35;
-    initial = false;
-    timer = setTimeout(() => {
-      cancelWorkerListener?.();
-      cancelWorkerListener = renderMarkdown(id, source, (result) => {
-        html = result?.html || '';
-      });
-    }, delay);
-  });
-
-  $effect(() => {
-    const thoughtSource = String(message?.thought || '');
-    clearTimeout(thoughtTimer);
-    if (!thoughtSource.trim()) {
-      cancelThoughtWorkerListener?.();
-      cancelThoughtWorkerListener = null;
-      thoughtHtml = '';
-      return;
-    }
-    const thoughtId = `${message?.id || message?.nodeId || 'msg'}-thought`;
-    thoughtTimer = setTimeout(() => {
-      cancelThoughtWorkerListener?.();
-      cancelThoughtWorkerListener = renderMarkdown(thoughtId, thoughtSource, (result) => {
-        thoughtHtml = result?.html || '';
-      });
-    }, 40);
-  });
-
   onDestroy(() => {
-    clearTimeout(timer);
-    clearTimeout(thoughtTimer);
     clearTimeout(copyTimer);
-    cancelWorkerListener?.();
-    cancelThoughtWorkerListener?.();
   });
 
   async function copyMessage() {
@@ -248,13 +196,7 @@
             <span class="thought-toggle">{thoughtOpen ? '收起 ▲' : '展开 ▼'}</span>
           </button>
           {#if thoughtOpen}
-            <div class="thought-content message-markdown">
-              {#if thoughtHtml}
-                {@html thoughtHtml}
-              {:else}
-                <pre class="thought-plain">{message.thought}</pre>
-              {/if}
-            </div>
+            <IncrementalMarkdown class="thought-content" source={message.thought} streaming={isStreaming} />
           {/if}
         </div>
       {/if}
@@ -262,7 +204,7 @@
       {#if message?.tool}
         <ToolPayloadBlock tool={message.tool} />
       {:else if hasText}
-        <div class="message-markdown">{@html html}</div>
+        <IncrementalMarkdown source={message.text} streaming={isStreaming} />
       {:else if isThinking}
         <div class="thinking-indicator" role="status" aria-live="polite">
           <span class="thinking-spinner" aria-hidden="true"></span>

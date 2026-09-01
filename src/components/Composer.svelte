@@ -1,5 +1,5 @@
 <script>
-  import { Button } from 'framework7-svelte';
+  import { Button, Segmented } from 'framework7-svelte';
   import { tick } from 'svelte';
   import { THINKING_LEVELS } from '../lib/storage.js';
 
@@ -59,68 +59,68 @@
   function selectLevel(level) {
     if (disabled || loading || busy) return;
     onThinkingLevelChange(level);
+    queueMicrotask(() => {
+      document.querySelector(`.thinking-segmented [data-thinking-level="${level}"]`)?.focus();
+    });
   }
 
-  function onSliderKeydown(event) {
+  function onLevelKeydown(event) {
     if (disabled || loading || busy) return;
+    let next = thinkingLevel;
     if (event.key === 'ArrowRight' || event.key === 'ArrowUp') {
       event.preventDefault();
-      const next = Math.min(5, thinkingLevel + 1);
-      onThinkingLevelChange(next);
+      next = Math.min(5, thinkingLevel + 1);
     } else if (event.key === 'ArrowLeft' || event.key === 'ArrowDown') {
       event.preventDefault();
-      const next = Math.max(1, thinkingLevel - 1);
-      onThinkingLevelChange(next);
+      next = Math.max(1, thinkingLevel - 1);
+    } else if (event.key === 'Home') {
+      event.preventDefault();
+      next = 1;
+    } else if (event.key === 'End') {
+      event.preventDefault();
+      next = 5;
+    } else {
+      return;
     }
+    selectLevel(next);
+  }
+
+  function optionLabel(level) {
+    return ['即时', '标准', '深入', '专家', 'Pro'][level - 1] || '';
   }
 </script>
 
 <div class="composer-wrap">
   <div class="composer-top-bar">
-    <div
-      class="thinking-slider-container"
-      role="slider"
-      tabindex="0"
-      aria-label="思考强度滑块 (Thinking Slider)"
-      aria-valuemin="1"
-      aria-valuemax="5"
-      aria-valuenow={thinkingLevel}
-      aria-valuetext={`${currentLevelObj.label} (${currentLevelObj.cnLabel})`}
-      onkeydown={onSliderKeydown}
-    >
-      <div class="thinking-level-badge" title={currentLevelObj.tip}>
-        <span class="thinking-icon">{currentLevelObj.icon}</span>
-        <span class="thinking-name">{currentLevelObj.label}</span>
-        <span class="thinking-cn">{currentLevelObj.cnLabel}</span>
+    <div class="thinking-control" aria-label="思考强度">
+      <div class="thinking-control-copy">
+        <span class="thinking-control-label">思考强度</span>
+        <strong>{currentLevelObj.cnLabel}</strong>
+        <span class="thinking-control-tip">{currentLevelObj.tip}</span>
       </div>
-
-      <div class="thinking-slider-track-wrap">
-        <div class="thinking-track-bg"></div>
-        <div
-          class="thinking-progress-bar"
-          style={`width: ${((thinkingLevel - 1) / 4) * 100}%`}
-        ></div>
-
-        <div class="thinking-ticks">
-          {#each THINKING_LEVELS as item (item.level)}
-            <button
-              type="button"
-              class="thinking-tick-btn"
-              class:active={item.level === thinkingLevel}
-              class:passed={item.level <= thinkingLevel}
-              onclick={() => selectLevel(item.level)}
-              title={`${item.label} (${item.cnLabel}) - ${item.tip}`}
-              disabled={disabled || loading || busy}
-              aria-label={`${item.label} ${item.cnLabel}`}
-            >
-              <span class="tick-dot"></span>
-              <span class="tick-label">{item.label}</span>
-            </button>
-          {/each}
-        </div>
-      </div>
-
-      <span class="thinking-tip-text">{currentLevelObj.tip}</span>
+      <Segmented
+        strong
+        round
+        class="thinking-segmented"
+        role="radiogroup"
+        aria-label="选择思考强度"
+        onkeydown={onLevelKeydown}
+      >
+        {#each THINKING_LEVELS as item (item.level)}
+          <Button
+            small
+            active={item.level === thinkingLevel}
+            data-thinking-level={item.level}
+            role="radio"
+            aria-checked={item.level === thinkingLevel}
+            aria-label={`${item.label}，${item.tip}`}
+            title={item.tip}
+            tabindex={item.level === thinkingLevel ? 0 : -1}
+            disabled={disabled || loading || busy}
+            onClick={() => selectLevel(item.level)}
+          >{optionLabel(item.level)}</Button>
+        {/each}
+      </Segmented>
     </div>
 
     <div class:error class="composer-status" role="status" aria-live="polite">{status}</div>

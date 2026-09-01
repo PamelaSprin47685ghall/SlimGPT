@@ -11,8 +11,11 @@
   } = $props();
 
   let scroller = $state(null);
+  let content = $state(null);
   let pendingEdge = 'start';
   let previousKey = '';
+  let previousTurnCount = 0;
+  let tailPinned = false;
   let boundaryDirection = $state(0);
   let boundaryProgress = $state(0);
   let boundaryOffsetPx = $state(0);
@@ -24,17 +27,45 @@
   let edgeSettleTimers = [];
 
   const activeTurn = $derived(turns[activeIndex] || null);
+  const turnCount = $derived(turns.length);
+  const lastTurnActive = $derived(turnCount > 0 && activeIndex === turnCount - 1);
+  const TAIL_STICKY_DISTANCE = 56;
 
   $effect(() => {
     const key = conversationKey;
     const index = activeIndex;
-    if (!activeTurn) return;
-    const edge = key !== previousKey ? 'start' : pendingEdge;
+    const count = turnCount;
+    if (!count || !scroller) {
+      previousKey = key;
+      previousTurnCount = count;
+      tailPinned = false;
+      return;
+    }
+    const conversationChanged = key !== previousKey;
+    const appendedTurn = !conversationChanged && count > previousTurnCount;
+    if (appendedTurn && tailPinned && index !== count - 1) {
+      pendingEdge = 'end';
+      previousTurnCount = count;
+      onActiveChange(count - 1);
+      return;
+    }
+    const edge = conversationChanged ? 'start' : pendingEdge;
     previousKey = key;
+    previousTurnCount = count;
     pendingEdge = 'start';
     resetBoundaryRunway();
-    void index;
     settleEdge(edge);
+  });
+
+  $effect(() => {
+    const node = content;
+    if (!node || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(() => {
+      if (!tailPinned || !lastTurnActive || boundaryDirection || !scroller) return;
+      scroller.scrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    });
+    observer.observe(node);
+    return () => observer.disconnect();
   });
 
   function cancelEdgeSettle() {
@@ -52,6 +83,7 @@
         scroller.scrollTop = edge === 'end'
           ? Math.max(0, scroller.scrollHeight - scroller.clientHeight)
           : 0;
+        updateTailPinned();
       };
       apply();
       requestAnimationFrame(() => {
@@ -123,6 +155,15 @@
     return scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 1;
   }
 
+  function updateTailPinned() {
+    if (!scroller) {
+      tailPinned = false;
+      return;
+    }
+    const remaining = Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop);
+    tailPinned = lastTurnActive && remaining <= TAIL_STICKY_DISTANCE;
+  }
+
   function advance(direction) {
     if (!turns.length) return;
     const now = performance.now();
@@ -153,19 +194,22 @@
     if (event.key === 'Home' || event.key === 'End') {
       event.preventDefault();
       resetBoundaryRunway();
+      if (event.key === 'Home') tailPinned = false;
       scroller.scrollTop = event.key === 'Home'
         ? 0
         : Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+      updateTailPinned();
       return;
     }
 
     const direction = event.key === 'ArrowDown' || event.key === 'PageDown' ? 1 : -1;
+    if (direction < 0) tailPinned = false;
     const atBoundary = direction > 0 ? atBottom() : atTop();
     event.preventDefault();
 
     if (atBoundary) {
       const boundaryAmount = event.key === 'PageUp' || event.key === 'PageDown'
-        ? Math.max(160, Math.floor(scroller.clientHeight * 0.55))
+        ? Math.max(180, Math.ceil(scroller.clientHeight * 0.55))
         : 72;
       pushBoundary(direction, boundaryAmount);
       return;
@@ -181,6 +225,7 @@
   function handleWheel(event) {
     if (!activeTurn || !scroller) return;
     if (Math.abs(event.deltaX) > Math.abs(event.deltaY)) return;
+    if (event.deltaY < 0) tailPinned = false;
     cancelEdgeSettle();
 
     if (boundaryDirection) {
@@ -212,6 +257,7 @@
     const delta = endY - touchStartY;
     touchStartY = null;
     if (Math.abs(delta) < 54) return;
+    if (delta > 0) tailPinned = false;
     if (boundaryDirection || (delta < 0 && atBottom()) || (delta > 0 && atTop())) {
       pushBoundary(delta < 0 ? 1 : -1, Math.abs(delta) * 1.25);
     }
@@ -233,6 +279,7 @@
     <div
       class="single-message-scroller"
       bind:this={scroller}
+      onscroll={updateTailPinned}
       onwheel={handleWheel}
       ontouchstart={handleTouchStart}
       ontouchend={handleTouchEnd}
@@ -241,6 +288,7 @@
     >
       <div
         class="single-message-content conversation-turn-content"
+        bind:this={content}
         style={`transform:translateY(${boundaryOffsetPx}px)`}
       >
         {#if activeTurn.user}

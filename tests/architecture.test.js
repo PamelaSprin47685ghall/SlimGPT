@@ -54,7 +54,7 @@ test('the project has no PWA or debugger runtime', async () => {
   ]);
   const source = files.join('\n');
   assert.equal(source.includes('chrome.debugger'), false);
-  assert.equal(source.includes('content-visibility: hidden'), true);
+  assert.equal(source.includes('display: none !important'), true);
   assert.equal(source.includes('#mobile-composer-prompt'), true);
   assert.equal(source.includes('[data-composer-submit]'), true);
   assert.equal(source.includes('waitForComposerElement(INITIAL_SHELL_READY_TIMEOUT)'), true);

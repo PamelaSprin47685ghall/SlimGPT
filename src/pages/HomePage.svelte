@@ -48,7 +48,6 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
   let sidebarOpen = $state(false);
   let overviewOpen = $state(false);
   let activeTurnIndex = $state(0);
-  let followTail = $state(false);
   let saveTimer = null;
   let sendTimer = null;
   let navigationTimer = null;
@@ -90,33 +89,20 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
   const conversationLoading = $derived(Boolean(conversationPending && loadingConversationId === currentConversationId));
   const conversationTimedOut = $derived(Boolean(conversationPending && navigationTimedOutId === currentConversationId));
   let previousDisplayConversationId = null;
-  let previousTurnCount = 0;
-  let previousFollowTail = false;
 
   $effect(() => {
     const key = displayConversationId || 'new';
     const count = turns.length;
     if (key !== previousDisplayConversationId) {
       previousDisplayConversationId = key;
-      previousTurnCount = count;
       activeTurnIndex = Math.max(0, count - 1);
       return;
     }
     if (!count) {
-      previousTurnCount = 0;
       activeTurnIndex = 0;
       return;
     }
-    const wasAtTail = activeTurnIndex >= Math.max(0, previousTurnCount - 1);
-    if (count > previousTurnCount && wasAtTail) activeTurnIndex = count - 1;
-    else if (activeTurnIndex >= count) activeTurnIndex = count - 1;
-    previousTurnCount = count;
-  });
-
-  $effect(() => {
-    const follow = followTail;
-    if (follow && !previousFollowTail && turns.length) activeTurnIndex = turns.length - 1;
-    previousFollowTail = follow;
+    if (activeTurnIndex >= count) activeTurnIndex = count - 1;
   });
 
   onMount(() => {
@@ -280,7 +266,6 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
           if (loadingConversationId === id || navigationTimedOutId === id) finishConversationLoading();
         }
         reconcilePending(event.message);
-        pulseFollowTail();
       }
     }
   }
@@ -330,7 +315,6 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     if (loadingConversationId === id) finishConversationLoading();
     reconcilePendingAgainstPayload(payload);
     schedulePersist();
-    pulseFollowTail();
   }
 
   function handlePageLocation(url) {
@@ -492,7 +476,6 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
       setComposerStatus('官方输入框未确认提交；内容仍保留，请检查官方界面后手动决定是否重试', true);
     }, 8_000);
     setComposerStatus('正在通过 ChatGPT 页面发送；断线后不会自动重发');
-    pulseFollowTail();
   }
 
   function handleComposerResult(message) {
@@ -548,11 +531,6 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
   function setComposerStatus(text, error = false) {
     composerStatus = text;
     composerError = error;
-  }
-
-  function pulseFollowTail() {
-    followTail = false;
-    queueMicrotask(() => followTail = true);
   }
 
   function schedulePersist() {

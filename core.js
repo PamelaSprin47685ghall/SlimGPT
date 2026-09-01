@@ -325,10 +325,26 @@ export function groupConversationTurns(messages) {
       };
       turns.push(current);
     }
-    current.replies.push(message);
+    appendTurnReply(current, message);
   }
 
   return turns;
+}
+
+function appendTurnReply(turn, message) {
+  if (isTransientThinkingMessage(message)) {
+    turn.replies.push(message);
+    return;
+  }
+  let index = turn.replies.length;
+  while (index > 0 && isTransientThinkingMessage(turn.replies[index - 1])) index -= 1;
+  turn.replies.splice(index, 0, message);
+}
+
+function isTransientThinkingMessage(message) {
+  if (message?.isThinking) return true;
+  if (String(message?.text || "").trim() || message?.tool) return false;
+  return message?.status === "in_progress" || message?.status === "thinking" || message?.status === "live";
 }
 
 export function messageNodeToView(node, mapping) {

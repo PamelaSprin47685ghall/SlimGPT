@@ -114,6 +114,8 @@ async function runFixtureSmoke(browser, extensionId) {
     const state = await top.evaluate(topStateExpression());
     return state.frameVisible === true && state.frameOpacity === '1' && state.sleep === '1';
   });
+  const sleepingOfficial = await top.evaluate(topStateExpression());
+  assert.equal(sleepingOfficial.bodyDisplay, 'none', 'takeover must remove the official body from layout');
 
   const frameTarget = await waitForTarget(
     port,
@@ -205,8 +207,10 @@ async function runFixtureSmoke(browser, extensionId) {
     const state = await ui.evaluate(uiStateExpression());
     return state.title === 'Fixture conversation' && state.messages.includes('Fixture answer');
   });
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).mathNodes > 0);
   const canonicalUi = await ui.evaluate(uiStateExpression());
-  assert.equal(canonicalUi.highlightedString, '"ok"', 'Markdown worker must emit valid, escaped string tokens');
+  assert.equal(canonicalUi.highlightedString, '"ok"', 'incremental Markdown renderer must emit valid, escaped string tokens');
+  assert.ok(canonicalUi.mathNodes > 0, 'KaTeX must load on demand for finalized math');
   assert.equal(canonicalUi.unsafeNodes, 0, 'captured Markdown must not create raw scriptable elements');
   assert.equal(canonicalUi.mountedCards, 2, 'the center pane must mount only the active user+assistant turn');
   assert.equal(canonicalUi.overviewItems, 60, 'the right overview must index one row per user+assistant turn');
@@ -441,17 +445,35 @@ async function runFixtureSmoke(browser, extensionId) {
     const content = document.querySelector('.single-message-content');
     const overview = document.querySelector('.overview-host');
     const sidebar = document.querySelector('.sidebar-host');
+    const thinking = document.querySelector('.thinking-segmented');
     return {
       columns: getComputedStyle(shell).gridTemplateColumns,
       centerWidth: center?.clientWidth || 0,
       contentWidth: content?.clientWidth || 0,
       overviewWidth: overview?.clientWidth || 0,
       sidebarWidth: sidebar?.clientWidth || 0,
+      thinkingButtons: thinking?.querySelectorAll('.button').length || 0,
+      thinkingActive: thinking?.querySelectorAll('.button-active').length || 0,
+      thinkingFramework7: thinking?.classList.contains('segmented') || false,
+      thinkingOverflow: thinking ? thinking.scrollWidth - thinking.clientWidth : 0,
     };
   })()`);
   assert.ok(wideLayout.columns.split(' ').length >= 3, 'desktop must use a permanent left-center-right layout');
   assert.ok(wideLayout.contentWidth > 900, 'wide-screen mode must actually broaden the center conversation area');
   assert.ok(wideLayout.sidebarWidth >= 270 && wideLayout.overviewWidth >= 250);
+  assert.equal(wideLayout.thinkingButtons, 5);
+  assert.equal(wideLayout.thinkingActive, 1);
+  assert.equal(wideLayout.thinkingFramework7, true, 'thinking levels must use the Framework7 Segmented component');
+  assert.ok(wideLayout.thinkingOverflow <= 1, 'desktop thinking selector must not overflow');
+  await ui.evaluate(`(() => {
+    const active = document.querySelector('.thinking-segmented .button-active');
+    active?.focus();
+    active?.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true }));
+  })()`);
+  await waitFor(async () => await ui.evaluate(`document.querySelector('.thinking-segmented .button-active')?.textContent?.trim() === '深入'`));
+  assert.equal(await ui.evaluate(`document.querySelector('.thinking-segmented [aria-checked="true"]')?.getAttribute('data-thinking-level') || ''`), '3');
+  await ui.evaluate(`document.querySelector('.thinking-segmented [data-thinking-level="2"]')?.click()`);
+  await waitFor(async () => await ui.evaluate(`document.querySelector('.thinking-segmented .button-active')?.textContent?.trim() === '标准'`));
 
   const mobileMetrics = {
     width: 390,
@@ -473,10 +495,20 @@ async function runFixtureSmoke(browser, extensionId) {
     navbar: getComputedStyle(document.querySelector('.mobile-navbar')).display,
     sidebarOpen: document.querySelector('.sidebar-host')?.classList.contains('open') || false,
     overviewOpen: document.querySelector('.overview-host')?.classList.contains('open') || false,
+    thinkingButtons: document.querySelectorAll('.thinking-segmented .button').length,
+    thinkingWidth: document.querySelector('.thinking-segmented')?.getBoundingClientRect().width || 0,
+    composerWidth: document.querySelector('.composer-wrap')?.getBoundingClientRect().width || 0,
+    thinkingOverflow: (() => { const node = document.querySelector('.thinking-segmented'); return node ? node.scrollWidth - node.clientWidth : 0; })(),
   }))()`);
   assert.notEqual(mobileInitial.navbar, 'none');
   assert.equal(mobileInitial.sidebarOpen, false);
   assert.equal(mobileInitial.overviewOpen, false);
+  assert.equal(mobileInitial.thinkingButtons, 5);
+  assert.ok(
+    mobileInitial.thinkingWidth > 250 && mobileInitial.thinkingWidth <= mobileInitial.composerWidth,
+    `mobile thinking selector dimensions: ${JSON.stringify(mobileInitial)}`,
+  );
+  assert.ok(mobileInitial.thinkingOverflow <= 1, 'mobile thinking selector must fit without horizontal scrolling');
 
   await ui.evaluate(`[...document.querySelectorAll('.mobile-navbar .button')].find((button) => button.textContent.includes('☰'))?.click()`);
   await waitFor(async () => await ui.evaluate(`document.querySelector('.sidebar-host')?.classList.contains('open') || false`));
@@ -506,6 +538,102 @@ async function runFixtureSmoke(browser, extensionId) {
     return true;
   })()`);
   await sleep(120);
+
+  const incrementalBase = `Stable incremental paragraph.\n\n\`\`\`js\nconst stable = "kept";\n\`\`\`\n\n${Array.from({ length: 140 }, (_, index) => `Streaming line ${index + 1}: ${'content '.repeat(10)}`).join('\n')}`;
+  await ui.evaluate(`(() => {
+    const scroller = document.querySelector('.single-message-scroller');
+    if (!scroller) return false;
+    scroller.scrollTop = scroller.scrollHeight;
+    scroller.dispatchEvent(new Event('scroll'));
+    return true;
+  })()`);
+  await sleep(80);
+  await top.evaluate(`(() => {
+    history.replaceState(history.state, '', '/c/smoke');
+    window.__slimgptIncrementalCaptures = [];
+    if (!window.__slimgptIncrementalCaptureListener) {
+      window.__slimgptIncrementalCaptureListener = (event) => {
+        const payload = event.data?.payload;
+        if (event.data?.channel === 'slimgpt-page-v1' && payload?.requestId === 'dom-incremental-stream-message') {
+          window.__slimgptIncrementalCaptures.push(String(payload.data || ''));
+        }
+      };
+      addEventListener('message', window.__slimgptIncrementalCaptureListener);
+    }
+    document.getElementById('incremental-stream-message')?.remove();
+    const article = document.createElement('article');
+    article.id = 'incremental-stream-message';
+    article.setAttribute('data-message-id', 'incremental-stream-message');
+    const content = document.createElement('div');
+    content.setAttribute('data-message-author-role', 'assistant');
+    content.textContent = ${JSON.stringify(incrementalBase)};
+    article.appendChild(content);
+    document.body.appendChild(article);
+  })()`);
+  await waitFor(async () => await top.evaluate(`window.__slimgptIncrementalCaptures?.some((value) => value.includes('Streaming line 140:')) || false`));
+  await waitFor(async () => await ui.evaluate(`document.querySelector('.message-stage')?.innerText?.includes('Streaming line 140:') || false`));
+  const initialIncremental = await ui.evaluate(`(() => {
+    const card = [...document.querySelectorAll('.message-card')].find((node) => node.textContent.includes('Stable incremental paragraph.'));
+    const paragraph = card?.querySelector('.message-markdown p');
+    const code = card?.querySelector('.code-block');
+    window.__slimgptStableParagraph = paragraph || null;
+    window.__slimgptStableCode = code || null;
+    const scroller = document.querySelector('.single-message-scroller');
+    return {
+      paragraph: Boolean(paragraph),
+      code: Boolean(code),
+      highlighted: Boolean(code?.querySelector('.tok-key')),
+      tailRemaining: scroller ? Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) : Infinity,
+    };
+  })()`);
+  assert.equal(initialIncremental.paragraph, true);
+  assert.equal(initialIncremental.code, true);
+  assert.equal(initialIncremental.highlighted, true);
+  assert.ok(initialIncremental.tailRemaining <= 56, 'a reader already at the tail must follow new streamed content');
+
+  const incrementalExtension = `${incrementalBase}\nStreaming extension keeps completed blocks mounted.`;
+  await top.evaluate(`(() => {
+    const node = document.querySelector('#incremental-stream-message [data-message-author-role]')?.firstChild;
+    if (node) node.nodeValue = ${JSON.stringify(incrementalExtension)};
+  })()`);
+  await waitFor(async () => await top.evaluate(`window.__slimgptIncrementalCaptures?.some((value) => value.includes('Streaming extension keeps completed blocks mounted.')) || false`));
+  await waitFor(async () => await ui.evaluate(`document.querySelector('.message-stage')?.innerText?.includes('Streaming extension keeps completed blocks mounted') || false`));
+  const appendedIncremental = await ui.evaluate(`(() => {
+    const card = [...document.querySelectorAll('.message-card')].find((node) => node.textContent.includes('Stable incremental paragraph.'));
+    const scroller = document.querySelector('.single-message-scroller');
+    return {
+      sameParagraph: card?.querySelector('.message-markdown p') === window.__slimgptStableParagraph,
+      sameCode: card?.querySelector('.code-block') === window.__slimgptStableCode,
+      tailRemaining: scroller ? Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) : Infinity,
+    };
+  })()`);
+  assert.equal(appendedIncremental.sameParagraph, true, 'completed paragraphs must retain their DOM identity while a response grows');
+  assert.equal(appendedIncremental.sameCode, true, 'completed code blocks must retain their DOM identity while a response grows');
+  assert.ok(appendedIncremental.tailRemaining <= 56);
+
+  const detachedScrollTop = await ui.evaluate(`(() => {
+    const scroller = document.querySelector('.single-message-scroller');
+    const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    scroller.scrollTop = Math.max(0, max - 320);
+    scroller.dispatchEvent(new Event('scroll'));
+    return scroller.scrollTop;
+  })()`);
+  await sleep(80);
+  const detachedExtension = `${incrementalExtension}\n${Array.from({ length: 30 }, (_, index) => `Detached tail ${index + 1}: ${'new '.repeat(12)}`).join('\n')}`;
+  await top.evaluate(`(() => {
+    const node = document.querySelector('#incremental-stream-message [data-message-author-role]')?.firstChild;
+    if (node) node.nodeValue = ${JSON.stringify(detachedExtension)};
+  })()`);
+  await waitFor(async () => await ui.evaluate(`document.querySelector('.message-stage')?.innerText?.includes('Detached tail 30:') || false`));
+  const detachedAfter = await ui.evaluate(`(() => {
+    const scroller = document.querySelector('.single-message-scroller');
+    return {
+      scrollTop: scroller?.scrollTop || 0,
+      tailRemaining: scroller ? Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) : 0,
+    };
+  })()`);
+  assert.ok(Math.abs(detachedAfter.scrollTop - detachedScrollTop) <= 4, 'streaming must not move a reader who left the tail');
+  assert.ok(detachedAfter.tailRemaining > 56);
 
   await ui.evaluate(`(() => {
     window.__slimgptExportBlob = null;
@@ -591,9 +719,11 @@ async function runFixtureSmoke(browser, extensionId) {
   assert.equal(official.frameOpacity, '0');
   assert.equal(official.framePointerEvents, 'none');
   assert.equal(official.sleep, null);
+  assert.equal(official.bodyDisplay, 'block');
   await top.evaluate(`document.getElementById('slimgpt-restore-button')?.click()`);
   await waitFor(async () => (await top.evaluate(topStateExpression())).sleep === '1');
   const restored = await top.evaluate(topStateExpression());
+  assert.equal(restored.bodyDisplay, 'none');
 
   const navigationDocumentToken = await top.evaluate(`(() => {
     window.__slimgptNavigationDocumentToken = crypto.randomUUID();
@@ -659,6 +789,12 @@ async function runFixtureSmoke(browser, extensionId) {
       tomlText: tomlNodes.map((node) => String(node.textContent || '')).join('\\n---\\n'),
       highlightedTokens: document.querySelectorAll('.tool-toml-pre .hljs-attr, .tool-toml-pre .hljs-string, .tool-toml-pre .hljs-number').length,
       toolNames: toolNameNodes.map((node) => String(node.textContent || '').trim()),
+      replyKinds: Array.from(document.querySelectorAll('.turn-reply')).map((node) =>
+        node.querySelector('.thinking-indicator') ? 'thinking'
+          : node.querySelector('.message-card.tool-call') ? 'tool-call'
+          : node.querySelector('.message-card.tool-result') ? 'tool-result'
+          : 'message'
+      ),
     };
   })()`);
   assert.equal(toolRendering.calls, 1, 'tool calls must render as their own card/avatar instead of Markdown');
@@ -672,6 +808,7 @@ async function runFixtureSmoke(browser, extensionId) {
   assert.ok(toolRendering.tomlText.includes('next = "<null>"'));
   assert.ok(toolRendering.highlightedTokens > 0, 'TOML code must be syntax highlighted');
   assert.deepEqual(toolRendering.toolNames, ['web.run', 'web.run']);
+  assert.deepEqual(toolRendering.replyKinds, ['tool-call', 'tool-result', 'message', 'thinking'], 'the transient thinking indicator must remain after tool activity');
 
   await ui.evaluate(`[...document.querySelectorAll('.conversation-item')]
     .find((button) => button.textContent.includes('Live only conversation'))?.click()`);
@@ -702,14 +839,14 @@ async function runFixtureSmoke(browser, extensionId) {
   await waitFor(async () => (await ui.evaluate(uiStateExpression())).messages.includes('DOM stream one'));
   await top.evaluate(`(() => {
     const node = document.querySelector('[data-message-id="dom-stream-a2"] [data-message-author-role="assistant"]');
-    if (node) node.textContent = 'DOM stream two';
+    if (node?.firstChild) node.firstChild.nodeValue = 'DOM stream two';
   })()`);
   await waitFor(async () => {
     const state = await ui.evaluate(uiStateExpression());
     return state.messages.includes('DOM stream two') && !state.messages.includes('DOM stream one');
   });
   const domRealtime = await ui.evaluate(`document.querySelector('.message-stage')?.innerText?.replace(/\\s+/g, ' ').trim() || ''`);
-  assert.ok(domRealtime.includes('DOM stream two'), 'official DOM streaming mutations must update SlimGPT without polling');
+  assert.ok(domRealtime.includes('DOM stream two'), 'official character-data streaming mutations must update SlimGPT without polling');
 
   await ui.evaluate(`[...document.querySelectorAll('.conversation-item')]
     .find((button) => button.textContent.includes('Fixture conversation'))?.click()`);
@@ -719,6 +856,14 @@ async function runFixtureSmoke(browser, extensionId) {
   });
   const conversationNavigation = await top.evaluate('location.href');
   assert.equal(await top.evaluate('window.__slimgptNavigationDocumentToken'), navigationDocumentToken, 'cached conversation switches must also stay in-document');
+
+  const officialResumeBody = await top.evaluate(`fetch('/backend-api/f/conversation/resume', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ conversation_id: 'smoke', offset: 0 }),
+  }).then((response) => response.text())`);
+  assert.equal(officialResumeBody, 'data: [DONE]\n\n', 'takeover must stop the official resume parser after cloning its stream');
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).messages.includes('Diverted resume answer'));
 
   await ui.evaluate(`document.querySelector('.new-chat')?.click()`);
   await waitFor(async () => (await top.evaluate('location.pathname')) === '/');
@@ -815,6 +960,9 @@ async function fulfillFixtureRequest(client, event, fixture) {
   if (event.resourceType === 'Document') {
     body = fixture.document;
     contentType = 'text/html; charset=utf-8';
+  } else if (url.includes('/backend-api/f/conversation/resume')) {
+    body = fixture.resume;
+    contentType = 'text/event-stream; charset=utf-8';
   } else if (url.includes('/backend-api/conversations')) {
     body = JSON.stringify(fixture.list);
     contentType = 'application/json; charset=utf-8';
@@ -856,7 +1004,7 @@ function makeFixture() {
     const content = index === 1
       ? `Fixture assistant message 2\n\n${Array.from({ length: 90 }, (_, line) => `Long answer line ${line + 1}: ${'detail '.repeat(12)}`).join('\n')}`
       : index === 119
-      ? 'Fixture answer <img src=x onerror="window.__slimgptXss=1">\n\n```js\nconst value = "ok";\n```'
+      ? 'Fixture answer <img src=x onerror="window.__slimgptXss=1">\n\n```js\nconst value = "ok";\n```\n\nInline math $E=mc^2$.'
       : `Fixture ${role} message ${index + 1}`;
     mapping[parent].children.push(id);
     mapping[id] = {
@@ -891,12 +1039,24 @@ function makeFixture() {
       'second-u1': {
         id: 'second-u1',
         parent: 'root',
-        children: ['second-call'],
+        children: ['second-thinking'],
         message: { id: 'second-u1', author: { role: 'user' }, content: { parts: ['Second question'] } },
+      },
+      'second-thinking': {
+        id: 'second-thinking',
+        parent: 'second-u1',
+        children: ['second-call'],
+        message: {
+          id: 'second-thinking',
+          author: { role: 'assistant' },
+          content: { content_type: 'text', parts: [] },
+          status: 'in_progress',
+          end_turn: false,
+        },
       },
       'second-call': {
         id: 'second-call',
-        parent: 'second-u1',
+        parent: 'second-thinking',
         children: ['second-tool'],
         message: {
           id: 'second-call',
@@ -958,6 +1118,16 @@ function makeFixture() {
         create_time: 5,
       },
     },
+    resume: `data: ${JSON.stringify({
+      conversation_id: 'smoke',
+      message: {
+        id: 'resume-a1',
+        author: { role: 'assistant' },
+        content: { parts: ['Diverted resume answer'] },
+        status: 'finished_successfully',
+        end_turn: true,
+      },
+    })}\n\ndata: [DONE]\n\n`,
     mobile: [
       '<template data-web-mobile-dpu-frame="1"><span data-conversation-id="mobile-smoke" data-message-id="ma1" data-resume-token="SECRET_MUST_STAY_IN_PAGE"></span></template>',
       '<template data-web-mobile-dpu-frame="2"><template for="assistant-pending-fixture-pending" data-web-mobile-dpu-apply="replace"><p data-assistant-stream-block="" data-assistant-stream-block-index="0">Streaming fixture answer</p></template></template>',
@@ -1019,6 +1189,7 @@ function topStateExpression() {
     framePointerEvents: document.getElementById('slimgpt-takeover-frame')?.style.pointerEvents || '',
     restore: !!document.getElementById('slimgpt-restore-button'),
     sleep: document.documentElement.getAttribute('data-slimgpt-render-sleep'),
+    bodyDisplay: document.body ? getComputedStyle(document.body).display : '',
     pageHook: !!window.__SLIMGPT_MITM_INSTALLED__,
     composer: !!document.querySelector('#mobile-composer-prompt, textarea[data-mobile-composer-prompt], #prompt-textarea')
   }))()`;
@@ -1033,6 +1204,7 @@ function uiStateExpression() {
     messages: document.querySelector('.message-stage')?.innerText?.replace(/\\s+/g, ' ').trim() || '',
     assistant: [...document.querySelectorAll('.role-assistant')].map((row) => row.innerText).join(' '),
     highlightedString: document.querySelector('.tok-str')?.textContent || '',
+    mathNodes: document.querySelectorAll('.message-markdown .katex').length,
     unsafeNodes: document.querySelectorAll('.message-markdown img, .message-markdown script, .message-markdown iframe').length,
     mountedCards: document.querySelectorAll('.message-card').length,
     loading: !!document.querySelector('.conversation-loading'),

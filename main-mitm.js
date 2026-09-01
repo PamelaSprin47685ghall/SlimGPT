@@ -276,6 +276,7 @@
       observer.observe(document.documentElement, {
         childList: true,
         subtree: true,
+        characterData: true,
         attributeFilter: ['data-message-author-role', 'data-message-id'],
       });
       schedule();
@@ -336,8 +337,49 @@
         }
       }
 
+      if (shouldDivertOfficialResume(response, url, mimeType)) {
+        return completeOfficialResume(response);
+      }
       return response;
     };
+  }
+
+  function shouldDivertOfficialResume(response, rawUrl, mimeType) {
+    if (
+      !takeoverActive ||
+      !response.ok ||
+      !response.body ||
+      !String(mimeType).includes("text/event-stream")
+    ) {
+      return false;
+    }
+    try {
+      const url = new URL(String(rawUrl || ""), location.href);
+      return url.origin === location.origin && url.pathname === "/backend-api/f/conversation/resume";
+    } catch {
+      return false;
+    }
+  }
+
+  function completeOfficialResume(response) {
+    try {
+      void response.body.cancel().catch(() => {});
+    } catch {
+      // The capture clone already owns the stream; cancellation is only a
+      // best-effort release of the official parser's tee branch.
+    }
+    const headers = new Headers(response.headers);
+    headers.delete("content-encoding");
+    headers.delete("content-length");
+    headers.delete("transfer-encoding");
+    headers.set("content-type", "text/event-stream; charset=utf-8");
+    const completed = new Response("data: [DONE]\n\n", {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+    observedFetchResponses.add(completed);
+    return completed;
   }
 
   async function captureReadableStream(stream, meta) {
@@ -800,11 +842,7 @@
       style.id = SLEEP_STYLE_ID;
       style.textContent = `
         html[${SLEEP_ATTR}="1"] > body {
-          visibility: hidden !important;
-          content-visibility: hidden !important;
-          pointer-events: none !important;
-          contain: strict !important;
-          transform: translateZ(0) !important;
+          display: none !important;
         }
       `;
       document.documentElement.appendChild(style);

@@ -71,7 +71,7 @@ Production builds omit source maps to keep extension packages small. Set `SLIMGP
 1. Install the package for the current browser.
 2. Open `https://chatgpt.com` and log in normally.
 3. At `document_start`, SlimGPT installs the page observer and mounts a hidden Svelte/Framework7 frame. It becomes visible only after the official composer exists.
-4. The original ChatGPT page remains underneath and handles authentication, network traffic and product writes. While SlimGPT is visible, the official body is put into render sleep (`content-visibility: hidden`) to avoid unnecessary layout/paint work.
+4. The original ChatGPT page remains underneath and handles authentication, network traffic and product writes. While SlimGPT is visible, the official body is removed from layout (`display: none`) to avoid hidden layout/paint work.
 5. Sending a message from SlimGPT fills and submits the official composer in that same page. The draft is cleared only after that submit is confirmed. SlimGPT never queues or automatically retries a send after a disconnect.
 
 Use **暂时显示官方界面** to hide the takeover frame. A small SlimGPT restore pill remains on the page.
@@ -85,6 +85,9 @@ The main interface has no feature toggles for its core reading behavior; these a
 - Rich history: the left conversation list shows title, latest captured message preview, date + weekday, and the captured model when known.
 - Distinct bubbles: user and ChatGPT messages use clearly different alignment, avatar, shape, and surface treatment.
 - Turn paging: the center pane renders exactly one **question + following response(s)** turn at a time. A long turn has its own visible scrollbar. Home/End jump to the active turn's start/end; arrows and PageUp/PageDown stay inside the active turn until its boundary. Crossing a turn boundary first expands a full-viewport blank runway/hint and moves the old content out; only an additional scroll/key action flips to the adjacent turn. Downward flips land at the next turn start and upward flips land at the previous turn end.
+- Tail following: streaming content follows the viewport only while the reader is at the end of the latest turn. Scrolling away disables following until the reader returns to the tail.
+- Thinking state: transient "thinking" activity is presented after tool calls/results at the end of the current turn, rather than at its canonical graph position in the middle of the visible stream.
+- Thinking level: the five reasoning levels use a responsive Framework7 segmented control on desktop and mobile, with arrow/Home/End keyboard selection.
 - Overview: the right pane shows one single-line row per question/response turn and jumps the center pane to that turn when clicked.
 - Mobile: the center pane remains primary while both the conversation list and overview become independent slide-out drawers.
 - Tool traffic: structured tool calls/results bypass Markdown, use separate tool avatars, serialize JSON as TOML (including `[[array-of-tables]]` where applicable), and render highlighted monospace TOML code.
@@ -100,8 +103,9 @@ The main interface has no feature toggles for its core reading behavior; these a
 ## Performance design
 
 - Only the active question/response turn is mounted in the center pane; the overview stores compact one-line labels for the other turns.
-- Markdown rendering runs in a Worker and caches stable blocks, so streaming text does not reparse the entire message every token.
-- Page synchronization is event-driven: fetch stream chunks, XHR progress, WebSocket messages, and official DOM message mutations all feed the same live message pipeline. There is no interval polling loop for message synchronization.
+- Markdown uses [`streaming-markdown`](https://github.com/thetarnav/streaming-markdown) directly. New source suffixes append through its parser/DOM renderer; completed paragraphs, code blocks, tables, and math nodes retain their DOM identity instead of being regenerated for every chunk.
+- Page synchronization is event-driven: fetch stream chunks, XHR progress, WebSocket messages, and official DOM child/character-data mutations all feed the same live message pipeline. There is no interval polling loop for message synchronization.
+- While takeover is active, `/backend-api/f/conversation/resume` is cloned into SlimGPT and completed immediately for the hidden official consumer. This keeps the full stream in SlimGPT without making ChatGPT's hidden renderer parse and lay out the same response a second time. The response passes through unchanged while the official UI is visible.
 - While takeover is active, hidden official-page autofocus is suppressed so it cannot steal focus from SlimGPT. Official focus is temporarily permitted only while SlimGPT submits through the real composer or explicitly reveals the official UI.
 - The full conversation payload is kept in the open SlimGPT UI memory; only compact conversation metadata is persisted locally.
 - The official server conversation graph (`mapping` + `current_node`) is treated as canonical. Local branch switching only selects a different graph leaf for presentation.
@@ -109,7 +113,7 @@ The main interface has no feature toggles for its core reading behavior; these a
 
 ## Current phase
 
-`0.3.0` keeps the official ChatGPT conversation graph canonical: SlimGPT never rewrites or truncates the response data it captures. The only automatic host-page action beyond normal composer submission is clicking an explicit Continue/Continue-generating control to finish an interrupted long response. Chrome, Firefox and Orion share the same page-hook + takeover architecture; there is no CDP/debugger transport in the extension.
+`0.3.0` keeps the official ChatGPT conversation graph canonical: SlimGPT never rewrites or truncates the response data it captures. During takeover it does terminate the hidden official consumer's resume stream after cloning that stream for SlimGPT, preventing duplicate parsing; normal product writes and official-visible traffic remain owned by ChatGPT. The page bridge also clicks an explicit Continue/Continue-generating control to finish an interrupted long response. Chrome, Firefox and Orion share the same page-hook + takeover architecture; there is no CDP/debugger transport in the extension.
 
 The takeover bridge temporarily wakes the hidden official body for composer submission, automatic Continue handling, or when the user explicitly chooses to show the official UI, then returns it to render sleep.
 
