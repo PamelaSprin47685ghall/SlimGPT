@@ -1,7 +1,7 @@
 import katex from 'katex';
 
 const cache = new Map();
-const MAX_CACHE_ENTRIES = 512;
+const MAX_CACHE_ENTRIES = 128;
 
 if (typeof self !== 'undefined') {
   self.onmessage = (event) => {

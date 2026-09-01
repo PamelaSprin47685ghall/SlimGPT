@@ -54,6 +54,7 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
   let navigationTimer = null;
   let userSettings = $state({ ...DEFAULT_SETTINGS });
   const MAX_CAPTURE_BUFFER = 20 * 1024 * 1024;
+  const MAX_CACHED_PAYLOADS = 24;
   const sseBuffers = new Map();
   const xhrBuffers = new Map();
   const recentFingerprints = new Map();
@@ -285,9 +286,26 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
   }
 
   function acceptConversationPayload(id, payload) {
-    payloads = new Map(payloads).set(id, payload);
-    terminals = new Map(terminals).set(id, payload.current_node);
-    liveMessages = new Map(liveMessages).set(id, []);
+    const nextPayloads = new Map(payloads);
+    const nextTerminals = new Map(terminals);
+    const nextLive = new Map(liveMessages);
+    
+    nextPayloads.set(id, payload);
+    nextTerminals.set(id, payload.current_node);
+    nextLive.set(id, []);
+
+    // Evict oldest cached conversation trees if exceeding limit
+    while (nextPayloads.size > MAX_CACHED_PAYLOADS) {
+      const oldestId = nextPayloads.keys().next().value;
+      if (oldestId === id || oldestId === currentConversationId || oldestId === presentedConversationId) break;
+      nextPayloads.delete(oldestId);
+      nextTerminals.delete(oldestId);
+      nextLive.delete(oldestId);
+    }
+
+    payloads = nextPayloads;
+    terminals = nextTerminals;
+    liveMessages = nextLive;
     const pageConversationId = conversationIdFromUrl(status.pageUrl || '');
     if (id === currentConversationId || id === pageConversationId || (!currentConversationId && !pageConversationId)) {
       currentConversationId = id;

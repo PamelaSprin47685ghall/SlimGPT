@@ -24,9 +24,6 @@
   const COMPLETE_RESPONSE_RECLICK_MS = 1_250;
   let requestCounter = 0;
   let resleepTimer = null;
-  let blockedTakeoverRetryTimer = null;
-  let takeoverBlockerGuardTimer = null;
-  let takeoverBlockerGuardDeadline = 0;
   let sendInFlight = false;
   let takeoverActive = false;
   let officialFocusPermitDepth = 0;
@@ -48,6 +45,7 @@
       const url = new URL(String(rawUrl || ""), location.href);
       if (url.origin !== location.origin) return false;
       if (url.pathname.includes("/backend-api/sentinel/")) return false;
+      if (url.pathname.includes("/ces/v1/") || url.pathname.includes("/beacons/")) return false;
       if (/\/conversation\/(?:prepare|runtime)$/.test(url.pathname)) return false;
       return (
         url.pathname.includes("conversation") ||
@@ -67,6 +65,7 @@
   installFocusGuard();
   installCompleteResponse();
   installDomMessageObserver();
+  installBlockerObserver();
   scheduleInitialTakeover();
   emit({ type: "page-hook-ready", timestamp: Date.now(), url: location.href });
 
@@ -153,14 +152,15 @@
       'button[data-testid*="continue" i]',
       'button[aria-label*="continue" i]',
       'button[aria-label*="继续"]',
+      'form button[data-testid*="continue" i]',
+      'main button[data-testid*="continue" i]',
+      'form button',
+      'button',
     ];
     for (const selector of selectors) {
       for (const button of document.querySelectorAll(selector)) {
         if (isCompleteResponseControl(button)) return button;
       }
-    }
-    for (const button of document.querySelectorAll('button')) {
-      if (isCompleteResponseControl(button)) return button;
     }
     return null;
   }
@@ -213,20 +213,18 @@
 
   function installDomMessageObserver() {
     let observer = null;
-    let scanScheduled = false;
+    let scanTimer = null;
     let currentConversationId = null;
     const seenText = new Map();
+    const MAX_SEEN_MESSAGES = 120;
 
     const schedule = () => {
-      if (scanScheduled) return;
-      scanScheduled = true;
-      requestAnimationFrame(() => {
-        scanScheduled = false;
-        scan();
-      });
+      if (scanTimer) return;
+      scanTimer = setTimeout(scan, 350);
     };
 
     const scan = () => {
+      scanTimer = null;
       const match = location.pathname.match(/\/(?:c|uc)\/([^/?#]+)/);
       const conversationId = match?.[1] || null;
       if (!conversationId) return;
@@ -235,7 +233,9 @@
         seenText.clear();
       }
 
-      for (const roleNode of document.querySelectorAll('[data-message-author-role]')) {
+      const nodes = document.querySelectorAll('[data-message-author-role]');
+      for (let i = Math.max(0, nodes.length - 15); i < nodes.length; i += 1) {
+        const roleNode = nodes[i];
         const role = String(roleNode.getAttribute('data-message-author-role') || '').toLowerCase();
         if (!['user', 'assistant', 'tool'].includes(role)) continue;
         const messageRoot = roleNode.closest('[data-message-id]') || roleNode.querySelector?.('[data-message-id]');
@@ -244,6 +244,10 @@
         const text = String(roleNode.textContent || '').replace(/\u00a0/g, ' ').trim();
         if (!text || seenText.get(messageId) === text) continue;
         seenText.set(messageId, text);
+        if (seenText.size > MAX_SEEN_MESSAGES) {
+          const oldest = seenText.keys().next().value;
+          seenText.delete(oldest);
+        }
         emit({
           type: "page-capture",
           transport: "dom",
@@ -272,8 +276,6 @@
       observer.observe(document.documentElement, {
         childList: true,
         subtree: true,
-        characterData: true,
-        attributes: true,
         attributeFilter: ['data-message-author-role', 'data-message-id'],
       });
       schedule();
@@ -285,7 +287,10 @@
       mount();
     }).observe(document, { childList: true, subtree: true });
     addEventListener("popstate", schedule);
-    addEventListener("pagehide", () => observer?.disconnect(), { once: true });
+    addEventListener("pagehide", () => {
+      clearTimeout(scanTimer);
+      observer?.disconnect();
+    }, { once: true });
   }
 
   function wrapFetch(upstreamFetch) {
@@ -798,6 +803,8 @@
           visibility: hidden !important;
           content-visibility: hidden !important;
           pointer-events: none !important;
+          contain: strict !important;
+          transform: translateZ(0) !important;
         }
       `;
       document.documentElement.appendChild(style);
@@ -833,7 +840,6 @@
     if (!frame || frame.dataset.slimgptVisible !== "1") return;
     if (findBlockingOfficialUi()) {
       suspendTakeoverForBlocker();
-      scheduleBlockedTakeoverRetry();
       return;
     }
     document.documentElement?.setAttribute(SLEEP_ATTR, "1");
@@ -853,11 +859,8 @@
     if (!frame) return;
     if (findBlockingOfficialUi()) {
       suspendTakeoverForBlocker();
-      scheduleBlockedTakeoverRetry();
       return;
     }
-    clearTimeout(blockedTakeoverRetryTimer);
-    blockedTakeoverRetryTimer = null;
     takeoverActive = true;
     frame.dataset.slimgptVisible = "1";
     frame.style.pointerEvents = "auto";
@@ -866,15 +869,12 @@
     emit({ type: "takeover-state", active: true, url: location.href });
     queueMicrotask(focusTakeoverFrame);
     scheduleRenderSleep(250);
-    scheduleTakeoverBlockerGuard();
   }
 
   function suspendTakeoverForBlocker() {
     const frame = document.getElementById(FRAME_ID);
     clearTimeout(resleepTimer);
     resleepTimer = null;
-    clearTimeout(takeoverBlockerGuardTimer);
-    takeoverBlockerGuardTimer = null;
     wakeOfficialUi();
     takeoverActive = false;
     if (frame) {
@@ -886,46 +886,46 @@
     emit({ type: "takeover-state", active: false, reason: "blocking-official-ui", url: location.href });
   }
 
-  function scheduleBlockedTakeoverRetry() {
-    if (blockedTakeoverRetryTimer) return;
-    blockedTakeoverRetryTimer = setTimeout(() => {
-      blockedTakeoverRetryTimer = null;
-      if (!findComposerElement()) return;
-      if (findBlockingOfficialUi()) {
-        scheduleBlockedTakeoverRetry();
-        return;
-      }
-      showTakeover();
-    }, BLOCKED_TAKEOVER_RETRY_MS);
-  }
-
-  function scheduleTakeoverBlockerGuard() {
-    clearTimeout(takeoverBlockerGuardTimer);
-    takeoverBlockerGuardDeadline = Date.now() + TAKEOVER_BLOCKER_GUARD_MS;
-
-    const guard = () => {
-      takeoverBlockerGuardTimer = null;
-      if (!takeoverActive) return;
-      if (findBlockingOfficialUi()) {
+  function installBlockerObserver() {
+    let scheduled = false;
+    const check = () => {
+      if (takeoverActive && findBlockingOfficialUi()) {
         suspendTakeoverForBlocker();
-        scheduleBlockedTakeoverRetry();
-        return;
+      } else if (!takeoverActive && findComposerElement() && !findBlockingOfficialUi()) {
+        showTakeover();
       }
-      if (Date.now() >= takeoverBlockerGuardDeadline) return;
-      takeoverBlockerGuardTimer = setTimeout(guard, 250);
     };
-
-    takeoverBlockerGuardTimer = setTimeout(guard, 100);
+    const schedule = () => {
+      if (scheduled) return;
+      scheduled = true;
+      requestAnimationFrame(() => {
+        scheduled = false;
+        check();
+      });
+    };
+    const mount = () => {
+      if (!document.documentElement) return;
+      const observer = new MutationObserver(schedule);
+      observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['open', 'inert', 'aria-modal', 'class', 'style'],
+      });
+    };
+    if (document.documentElement) mount();
+    else new MutationObserver((_, obs) => {
+      if (!document.documentElement) return;
+      obs.disconnect();
+      mount();
+    }).observe(document, { childList: true, subtree: true });
+    addEventListener('popstate', schedule);
   }
 
   function hideTakeover() {
     const frame = document.getElementById(FRAME_ID);
     if (!frame) return;
     clearTimeout(resleepTimer);
-    clearTimeout(blockedTakeoverRetryTimer);
-    clearTimeout(takeoverBlockerGuardTimer);
-    blockedTakeoverRetryTimer = null;
-    takeoverBlockerGuardTimer = null;
     wakeOfficialUi();
     takeoverActive = false;
     frame.dataset.slimgptVisible = "0";
