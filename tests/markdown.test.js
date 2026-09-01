@@ -1,29 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { splitBlocks, renderBlock } from '../markdown-worker.js';
 
-// Run markdown worker functions in node context for testing
-const workerCode = await readFile('markdown-worker.js', 'utf8');
-
-function createMarkdownRenderer() {
-  const workerSelf = {
-    onmessage: null,
-    postMessage(msg) {
-      this.lastResult = msg;
-    },
-  };
-  const fn = new Function('self', workerCode);
-  fn(workerSelf);
-  
-  return function render(text) {
-    workerSelf.onmessage({
-      data: { requestId: 1, cacheKey: 'test', text },
-    });
-    return workerSelf.lastResult?.html || '';
-  };
+function render(text) {
+  const blocks = splitBlocks(String(text || ''));
+  return blocks.map(renderBlock).join('');
 }
-
-const render = createMarkdownRenderer();
 
 test('markdown renders GFM tables with alignment', () => {
   const markdown = `| Header 1 | Header 2 | Header 3 |
@@ -56,10 +38,23 @@ test('markdown renders task lists, math, and inline styles', () => {
   const html = render(markdown);
   assert.ok(html.includes('<input type="checkbox" disabled class="task-checkbox"'), 'Must render task checkbox');
   assert.ok(html.includes('<input type="checkbox" disabled checked class="task-checkbox"'), 'Must render checked task checkbox');
-  assert.ok(html.includes('<span class="math-inline">E = mc^2</span>'), 'Must render inline math');
+  assert.ok(html.includes('class="katex"') || html.includes('katex-mathml'), 'Must render inline math with KaTeX');
   assert.ok(html.includes('<strong>bold</strong>'), 'Must render bold');
   assert.ok(html.includes('<em>italic</em>'), 'Must render italic');
   assert.ok(html.includes('<del>strike</del>'), 'Must render strikethrough');
+});
+
+test('markdown renders display math blocks with KaTeX', () => {
+  const markdown = `$$\n\\sum_{i=1}^n x_i = \\frac{n(n+1)}{2}\n$$`;
+  const html = render(markdown);
+  assert.ok(html.includes('class="math-block"'), 'Must wrap in math-block container');
+  assert.ok(html.includes('class="katex-display"') || html.includes('class="katex"'), 'Must render display math with KaTeX');
+});
+
+test('markdown handles LaTeX syntax errors gracefully', () => {
+  const markdown = `$$\n\\invalidmacro{test\n$$`;
+  const html = render(markdown);
+  assert.ok(html.length > 0, 'Must not crash on invalid LaTeX');
 });
 
 test('markdown prevents XSS injection via images/scripts/iframes', () => {

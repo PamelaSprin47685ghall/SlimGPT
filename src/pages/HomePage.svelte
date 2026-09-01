@@ -7,7 +7,7 @@
   import Composer from '../components/Composer.svelte';
   import { createTransport } from '../lib/transport.js';
   import { downloadConversationMarkdown } from '../lib/export.js';
-  import { loadConversationIndex, saveConversationIndex } from '../lib/storage.js';
+import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUserSettings, DEFAULT_SETTINGS, THINKING_LEVELS } from '../lib/storage.js';
   import {
     buildConversationView,
     contentToText,
@@ -16,6 +16,7 @@
     conversationIdFromUrl,
     decodeCaptureBody,
     extractConversationItems,
+  getThinkingLevel,
     findConversationPayload,
     findMessageEvents,
     fingerprintCapture,
@@ -51,6 +52,7 @@
   let saveTimer = null;
   let sendTimer = null;
   let navigationTimer = null;
+  let userSettings = $state({ ...DEFAULT_SETTINGS });
   const MAX_CAPTURE_BUFFER = 20 * 1024 * 1024;
   const sseBuffers = new Map();
   const xhrBuffers = new Map();
@@ -120,6 +122,7 @@
     let unsubscribe = transport.subscribe(handleTransportMessage);
     transport.start();
     restoreIndex();
+    restoreSettings();
     return () => {
       unsubscribe?.();
       transport.stop();
@@ -137,6 +140,27 @@
       conversationMap = new Map(items.filter((item) => item?.id).map((item) => [item.id, normalizeConversationMeta(item)]));
     } catch {
       setComposerStatus('无法读取本地会话索引；当前聊天仍可正常使用', true);
+    }
+  }
+
+  async function restoreSettings() {
+    try {
+      userSettings = await loadUserSettings();
+    } catch {
+      userSettings = { ...DEFAULT_SETTINGS };
+    }
+  }
+
+  async function handleThinkingLevelChange(thinkingLevel) {
+    userSettings = { ...userSettings, thinkingLevel };
+    await saveUserSettings(userSettings);
+    if (transport.supportsLiveChat) {
+      const levelObj = THINKING_LEVELS.find((item) => item.level === thinkingLevel) || THINKING_LEVELS[2];
+      transport.send({
+        type: 'set-thinking-level',
+        thinkingLevel,
+        reasoningEffort: levelObj.effort,
+      });
     }
   }
 
@@ -340,7 +364,9 @@
     pendingUser = null;
     sidebarOpen = false;
     overviewOpen = false;
-    if (transport.supportsLiveChat) transport.send({ type: 'new-chat' });
+    if (transport.supportsLiveChat) {
+      transport.send({ type: 'new-chat', thinkingLevel: userSettings.thinkingLevel });
+    }
   }
 
   function startConversationLoading(id) {
@@ -390,7 +416,7 @@
     setComposerStatus(`已导出 ${filename}`);
   }
 
-  function sendMessage(text) {
+  function sendMessage(text, options = {}) {
     if (conversationPending) {
       setComposerStatus('目标对话仍在加载，请加载完成后再发送', true);
       return;
@@ -409,6 +435,8 @@
     }
     const stamp = Date.now();
     const commandId = crypto.randomUUID();
+    const thinkingLevel = options?.thinkingLevel || userSettings.thinkingLevel || 3;
+    const levelObj = THINKING_LEVELS.find((item) => item.level === thinkingLevel) || THINKING_LEVELS[2];
     sendInFlight = true;
     pendingCommandId = commandId;
     pendingUser = {
@@ -430,7 +458,13 @@
       },
     };
     if (currentConversationId) updateConversationPreview(currentConversationId, text, '');
-    transport.send({ type: 'send-message', commandId, text });
+    transport.send({
+      type: 'send-message',
+      commandId,
+      text,
+      thinkingLevel,
+      reasoningEffort: levelObj.effort,
+    });
     clearTimeout(sendTimer);
     sendTimer = setTimeout(() => {
       if (pendingCommandId !== commandId) return;
@@ -620,7 +654,7 @@
       <header class="desktop-chat-header">
         <div class="header-title-group">
           <strong>{currentMeta?.title || (currentConversationId ? '加载中的对话' : '新对话')}</strong>
-          <span>{currentConversationId ? 'ChatGPT 会话' : 'SlimGPT · 轻量模式'}</span>
+          <span>{currentMeta?.model ? `${currentMeta.model} · ` : ''}{currentConversationId ? 'ChatGPT 会话' : 'SlimGPT · 轻量模式'}</span>
         </div>
         <Button small onClick={() => transport.openOfficial(currentConversationId)}>暂时显示官方界面</Button>
       </header>
@@ -653,6 +687,8 @@
 
       <Composer
         bind:value={draft}
+        thinkingLevel={userSettings.thinkingLevel || 3}
+        onThinkingLevelChange={handleThinkingLevelChange}
         disabled={!transport.supportsLiveChat || !status.bridgeReady}
         loading={conversationPending}
         busy={sendInFlight}

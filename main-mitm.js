@@ -52,7 +52,9 @@
       return (
         url.pathname.includes("conversation") ||
         url.pathname.includes("messages") ||
-        url.pathname.includes("history")
+        url.pathname.includes("history") ||
+        url.pathname.includes("models") ||
+        url.pathname.includes("/backend-api/me")
       );
     } catch {
       return false;
@@ -708,6 +710,17 @@
       case "connect":
         emitPageStatus();
         return;
+      case "set-thinking-level":
+        syncOfficialThinkingLevel(payload.thinkingLevel);
+        return;
+      case "set-model-preference":
+        if (payload.model && payload.model !== "auto" && location.pathname === "/") {
+          const currentModel = new URL(location.href).searchParams.get("model");
+          if (currentModel !== payload.model) {
+            navigate(`/?model=${encodeURIComponent(payload.model)}`);
+          }
+        }
+        return;
       case "send-message":
         await handleSendCommand(payload);
         return;
@@ -716,9 +729,11 @@
         navigate(`/${route}/${encodeURIComponent(payload.conversationId || "")}`);
         return;
       }
-      case "new-chat":
-        navigate("/");
+      case "new-chat": {
+        const model = payload.model && payload.model !== "auto" ? `?model=${encodeURIComponent(payload.model)}` : "";
+        navigate(`/${model}`);
         return;
+      }
       case "open-official":
       case "focus-authority":
         hideTakeover();
@@ -731,6 +746,17 @@
   function emitPageStatus() {
     emit({ type: "page-hook-ready", timestamp: Date.now(), url: location.href });
     emit({ type: "takeover-state", active: takeoverActive, url: location.href });
+  }
+
+  function syncOfficialThinkingLevel(level) {
+    try {
+      const slider = document.querySelector('input[type="range"][aria-label*="thinking" i], input[type="range"][aria-label*="reasoning" i], [role="slider"][aria-label*="thinking" i], [role="slider"][aria-label*="reasoning" i], [data-testid*="reasoning-slider"]');
+      if (slider) {
+        slider.value = level;
+        slider.dispatchEvent(new Event('input', { bubbles: true }));
+        slider.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    } catch {}
   }
 
   async function handleSendCommand(payload) {

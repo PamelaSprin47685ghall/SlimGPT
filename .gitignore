@@ -4,6 +4,8 @@ dist-firefox/
 dist-orion/
 release/
 AGENTS.md
+screenshots/
+enable-debug-ssh-frp.sh
 *.log
 .DS_Store
 

@@ -5,9 +5,13 @@ import {
   consumeSse,
   conversationIdFromUrl,
   extractConversationItems,
+  extractModelsList,
+  extractThought,
   findConversationPayload,
+  getThinkingLevel,
   getToolMessageInfo,
   groupConversationTurns,
+  messageNodeToView,
   parseWebMobilePartialConversation,
   stepConversationBranch,
   upsertLiveMessage,
@@ -122,4 +126,118 @@ test('tool calls and tool results are classified from message structure, not arb
     author: { role: 'assistant' },
     content: { content_type: 'text', parts: ['```json\n{"ordinary":true}\n```'] },
   }), null, 'ordinary assistant JSON must remain normal Markdown');
+});
+
+test('extractThought extracts reasoning from metadata or content parts', () => {
+  const fromMeta = extractThought({
+    metadata: { thought: 'Let me think about this step by step.' },
+  });
+  assert.equal(fromMeta, 'Let me think about this step by step.');
+
+  const fromParts = extractThought({
+    content: {
+      parts: [
+        { content_type: 'thought', text: 'Analyzing math problem.' },
+        'Final answer is 42.',
+      ],
+    },
+  });
+  assert.equal(fromParts, 'Analyzing math problem.');
+
+  const none = extractThought({
+    content: { parts: ['Just normal text'] },
+  });
+  assert.equal(none, null);
+});
+
+test('messageNodeToView handles empty messages and identifies thinking state', () => {
+  const node = {
+    id: 'msg-thinking',
+    parent: 'root',
+    message: {
+      id: 'msg-thinking',
+      author: { role: 'assistant' },
+      content: { parts: [''] },
+      status: 'in_progress',
+      metadata: { model_slug: 'gpt-5.6', reasoning_effort: 'high' },
+    },
+  };
+  const view = messageNodeToView(node, { root: { children: ['msg-thinking'] }, 'msg-thinking': node });
+  assert.equal(view.isThinking, true);
+  assert.equal(view.text, '');
+  assert.equal(view.model, 'gpt-5.6');
+  assert.equal(view.reasoningEffort, 'high');
+  assert.equal(view.error, false);
+});
+
+test('upsertLiveMessage preserves reasoning thoughts and model metadata during streaming', () => {
+  const initial = upsertLiveMessage([], {
+    id: 'stream-1',
+    author: { role: 'assistant' },
+    content: { parts: [{ content_type: 'thought', text: 'Step 1' }] },
+    status: 'in_progress',
+    metadata: { model_slug: 'gpt-5.6-pro' },
+  });
+  assert.equal(initial[0].thought, 'Step 1');
+  assert.equal(initial[0].model, 'gpt-5.6-pro');
+  assert.equal(initial[0].isThinking, true);
+
+  const streamed = upsertLiveMessage(initial, {
+    id: 'stream-1',
+    author: { role: 'assistant' },
+    content: { parts: ['Here is the answer.'] },
+    status: 'finished_successfully',
+    metadata: { model_slug: 'gpt-5.6-pro' },
+  });
+  assert.equal(streamed[0].text, 'Here is the answer.');
+  assert.equal(streamed[0].thought, 'Step 1');
+  assert.equal(streamed[0].isThinking, false);
+});
+
+test('extractModelsList extracts and normalizes models from ChatGPT /backend-api/models', () => {
+  const payload = {
+    models: [
+      {
+        slug: 'gpt-5.6',
+        title: 'GPT-5.6 Sol',
+        description: 'Unified flagship reasoning model',
+        tags: ['gpt-5.6', 'multimodal', 'reasoning'],
+      },
+      {
+        slug: 'gpt-5.6-pro',
+        title: 'GPT-5.6 Sol Pro',
+        description: 'Maximum reasoning effort model',
+        tags: ['reasoning', 'gpt-5.6-pro'],
+        qualitative_properties: { reasoning_effort: ['none', 'medium', 'high', 'xhigh', 'max'] },
+      },
+    ],
+  };
+  const models = extractModelsList(payload);
+  assert.equal(models.length, 2);
+  assert.equal(models[0].slug, 'gpt-5.6');
+  assert.equal(models[0].isReasoning, true);
+  assert.equal(models[1].slug, 'gpt-5.6-pro');
+  assert.equal(models[1].isReasoning, true);
+});
+
+test('getThinkingLevel resolves 5-level thinking slider from instant to pro', () => {
+  const instant = getThinkingLevel(1);
+  assert.equal(instant.id, 'instant');
+  assert.equal(instant.level, 1);
+
+  const medium = getThinkingLevel('medium');
+  assert.equal(medium.id, 'medium');
+  assert.equal(medium.level, 2);
+
+  const high = getThinkingLevel('high');
+  assert.equal(high.id, 'high');
+  assert.equal(high.level, 3);
+
+  const extraHigh = getThinkingLevel('extra_high');
+  assert.equal(extraHigh.id, 'extra_high');
+  assert.equal(extraHigh.level, 4);
+
+  const pro = getThinkingLevel(5);
+  assert.equal(pro.id, 'pro');
+  assert.equal(pro.level, 5);
 });

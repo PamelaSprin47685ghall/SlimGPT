@@ -9,14 +9,28 @@
   } = $props();
 
   let html = $state('');
+  let thoughtHtml = $state('');
   let copied = $state(false);
+  let thoughtOpen = $state(false);
   let timer = null;
+  let thoughtTimer = null;
   let copyTimer = null;
   let cancelWorkerListener = null;
+  let cancelThoughtWorkerListener = null;
   let initial = true;
 
-  // The worker escapes every source fragment before adding its own fixed tags.
-  // Never pass server-rendered HTML directly to this sink.
+  const hasText = $derived(Boolean(String(message?.text || '').trim()));
+  const hasThought = $derived(Boolean(String(message?.thought || '').trim()));
+  const isThinking = $derived(Boolean(message?.isThinking || (!hasText && !message?.tool && (message?.status === 'in_progress' || message?.live))));
+  const isError = $derived(Boolean(message?.error || message?.status === 'failed'));
+
+  // Auto-expand thought if it's currently generating and has no text yet
+  $effect(() => {
+    if (isThinking && hasThought && !hasText) {
+      thoughtOpen = true;
+    }
+  });
+
   $effect(() => {
     const id = message?.id || message?.nodeId || 'message';
     const source = String(message?.text || '');
@@ -24,6 +38,10 @@
     if (message?.tool) {
       cancelWorkerListener?.();
       cancelWorkerListener = null;
+      html = '';
+      return;
+    }
+    if (!source.trim()) {
       html = '';
       return;
     }
@@ -37,14 +55,34 @@
     }, delay);
   });
 
+  $effect(() => {
+    const thoughtSource = String(message?.thought || '');
+    clearTimeout(thoughtTimer);
+    if (!thoughtSource.trim()) {
+      cancelThoughtWorkerListener?.();
+      cancelThoughtWorkerListener = null;
+      thoughtHtml = '';
+      return;
+    }
+    const thoughtId = `${message?.id || message?.nodeId || 'msg'}-thought`;
+    thoughtTimer = setTimeout(() => {
+      cancelThoughtWorkerListener?.();
+      cancelThoughtWorkerListener = renderMarkdown(thoughtId, thoughtSource, (result) => {
+        thoughtHtml = result?.html || '';
+      });
+    }, 40);
+  });
+
   onDestroy(() => {
     clearTimeout(timer);
+    clearTimeout(thoughtTimer);
     clearTimeout(copyTimer);
     cancelWorkerListener?.();
+    cancelThoughtWorkerListener?.();
   });
 
   async function copyMessage() {
-    const text = String(message?.text || '');
+    const text = String(message?.text || message?.thought || '');
     if (!text) return;
     try {
       if (navigator.clipboard) {
@@ -96,31 +134,72 @@
       btn.classList.remove('copied');
     }, 1800);
   }
+
+  function formatModelBadge(raw) {
+    if (!raw) return '';
+    const str = String(raw).toLowerCase();
+    if (str.includes('pro')) return 'GPT-5.6 Pro';
+    if (str.includes('luna')) return 'GPT-5.6 Luna';
+    if (str.includes('sol') || str.includes('5.6') || str.includes('gpt-5')) return 'GPT-5.6';
+    return String(raw)
+      .replace(/^text-/, '')
+      .replace(/-latest$/, '')
+      .slice(0, 16);
+  }
 </script>
 
-<div class={`message-card role-${message?.role || 'unknown'} ${message?.tool?.kind || ''}`}>
+<div class={`message-card role-${message?.role || 'unknown'} ${message?.tool?.kind || ''} ${isError ? 'is-error' : ''}`}>
   <div class="message-avatar" aria-hidden="true">
-    {message?.tool?.kind === 'tool-call'
-      ? '↗'
-      : message?.tool?.kind === 'tool-result'
-        ? '↙'
-        : message?.role === 'assistant'
-          ? 'S'
-          : (message?.role === 'user' ? '你' : '·')}
+    {#if message?.tool?.kind === 'tool-call'}
+      ↗
+    {:else if message?.tool?.kind === 'tool-result'}
+      ↙
+    {:else if message?.role === 'assistant'}
+      S
+    {:else if message?.role === 'user'}
+      你
+    {:else if message?.role === 'system'}
+      ⚙
+    {:else}
+      ·
+    {/if}
   </div>
+
   <div class="message-card-body">
     <div class="message-meta">
       <div class="message-meta-left">
-        <span>
-          {message?.tool?.kind === 'tool-call'
-            ? '工具调用'
-            : message?.tool?.kind === 'tool-result'
-              ? '工具返回'
-              : message?.role === 'assistant'
-                ? 'ChatGPT'
-                : (message?.role === 'user' ? '你' : (message?.name || message?.role || '消息'))}
+        <span class="message-author-name">
+          {#if message?.tool?.kind === 'tool-call'}
+            工具调用
+          {:else if message?.tool?.kind === 'tool-result'}
+            工具返回
+          {:else if message?.role === 'assistant'}
+            ChatGPT
+          {:else if message?.role === 'user'}
+            你
+          {:else if message?.role === 'system'}
+            系统消息
+          {:else}
+            {message?.name || message?.role || '消息'}
+          {/if}
         </span>
-        {#if message?.tool}<code class="tool-message-name">{message.tool.name}</code>{/if}
+
+        {#if message?.thinkingLevel}
+          <span class="meta-badge thinking-badge" title={message.thinkingLevel.tip}>
+            {message.thinkingLevel.icon} {message.thinkingLevel.label}
+          </span>
+        {:else if message?.model}
+          <span class="meta-badge model-badge">{formatModelBadge(message.model)}</span>
+        {/if}
+
+        {#if message?.tool}
+          <code class="tool-message-name">{message.tool.name}</code>
+        {/if}
+
+        {#if isError}
+          <span class="meta-badge error-badge">生成异常</span>
+        {/if}
+
         {#if (message?.siblingCount || 0) > 1}
           <span class="branch-control">
             <button
@@ -139,8 +218,9 @@
           </span>
         {/if}
       </div>
+
       <div class="message-meta-right">
-        {#if !message?.tool}
+        {#if !message?.tool && (hasText || hasThought)}
           <button
             type="button"
             class="message-action-btn"
@@ -151,13 +231,47 @@
         {/if}
       </div>
     </div>
+
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div class="message-bubble" onclick={handleBubbleClick}>
+      {#if hasThought}
+        <div class="thought-block" class:open={thoughtOpen}>
+          <button
+            type="button"
+            class="thought-header"
+            onclick={() => thoughtOpen = !thoughtOpen}
+            aria-expanded={thoughtOpen}
+          >
+            <span class="thought-icon">💭</span>
+            <span class="thought-title">思考过程</span>
+            <span class="thought-toggle">{thoughtOpen ? '收起 ▲' : '展开 ▼'}</span>
+          </button>
+          {#if thoughtOpen}
+            <div class="thought-content message-markdown">
+              {#if thoughtHtml}
+                {@html thoughtHtml}
+              {:else}
+                <pre class="thought-plain">{message.thought}</pre>
+              {/if}
+            </div>
+          {/if}
+        </div>
+      {/if}
+
       {#if message?.tool}
         <ToolPayloadBlock tool={message.tool} />
-      {:else}
+      {:else if hasText}
         <div class="message-markdown">{@html html}</div>
+      {:else if isThinking}
+        <div class="thinking-indicator" role="status" aria-live="polite">
+          <span class="thinking-spinner" aria-hidden="true"></span>
+          <span>ChatGPT 正在思考与生成…</span>
+        </div>
+      {:else if isError}
+        <div class="error-notice">⚠️ 消息生成失败或被官方界面中断</div>
+      {:else if !hasThought}
+        <div class="empty-notice">（无文字内容）</div>
       {/if}
     </div>
   </div>

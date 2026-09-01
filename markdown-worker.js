@@ -1,42 +1,47 @@
+import katex from 'katex';
+
 const cache = new Map();
 const MAX_CACHE_ENTRIES = 512;
 
-self.onmessage = (event) => {
-  const { requestId, cacheKey, text } = event.data || {};
-  if (!requestId || !cacheKey) return;
-  const source = String(text || "");
-  const blocks = splitBlocks(source);
-  const previous = cache.get(cacheKey);
-  const htmlBlocks = [];
+if (typeof self !== 'undefined') {
+  self.onmessage = (event) => {
+    const { requestId, cacheKey, text } = event.data || {};
+    if (!requestId || !cacheKey) return;
+    const source = String(text || "");
+    const blocks = splitBlocks(source);
+    const previous = cache.get(cacheKey);
+    const htmlBlocks = [];
 
-  let common = 0;
-  if (previous) {
-    while (
-      common < blocks.length &&
-      common < previous.blocks.length &&
-      blocks[common] === previous.blocks[common]
-    ) {
-      htmlBlocks.push(previous.htmlBlocks[common]);
-      common += 1;
+    let common = 0;
+    if (previous) {
+      while (
+        common < blocks.length &&
+        common < previous.blocks.length &&
+        blocks[common] === previous.blocks[common]
+      ) {
+        htmlBlocks.push(previous.htmlBlocks[common]);
+        common += 1;
+      }
     }
-  }
 
-  for (let index = common; index < blocks.length; index += 1) {
-    htmlBlocks.push(renderBlock(blocks[index]));
-  }
+    for (let index = common; index < blocks.length; index += 1) {
+      htmlBlocks.push(renderBlock(blocks[index]));
+    }
 
-  cache.delete(cacheKey);
-  cache.set(cacheKey, { blocks, htmlBlocks });
-  while (cache.size > MAX_CACHE_ENTRIES) cache.delete(cache.keys().next().value);
-  self.postMessage({ requestId, cacheKey, html: htmlBlocks.join(""), sourceLength: source.length });
-};
+    cache.delete(cacheKey);
+    cache.set(cacheKey, { blocks, htmlBlocks });
+    while (cache.size > MAX_CACHE_ENTRIES) cache.delete(cache.keys().next().value);
+    self.postMessage({ requestId, cacheKey, html: htmlBlocks.join(""), sourceLength: source.length });
+  };
+}
 
-function splitBlocks(source) {
+export function splitBlocks(source) {
   if (!source) return [""];
   const lines = source.replace(/\r\n/g, "\n").split("\n");
   const blocks = [];
   let buffer = [];
   let inFence = false;
+  let inMath = false;
   let inTable = false;
 
   const flush = () => {
@@ -48,6 +53,8 @@ function splitBlocks(source) {
 
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
+
+    // Code fence
     if (line.startsWith("```")) {
       if (!inFence) flush();
       inFence = !inFence;
@@ -60,7 +67,35 @@ function splitBlocks(source) {
       continue;
     }
 
-    if (!line.trim()) {
+    // Display math $$ ... $$
+    const trimmed = line.trim();
+    if (trimmed.startsWith("$$")) {
+      if (!inMath) {
+        flush();
+        // Check if single line $$...$$
+        if (trimmed.length > 2 && trimmed.endsWith("$$")) {
+          blocks.push(line);
+          continue;
+        }
+        inMath = true;
+        buffer.push(line);
+      } else {
+        buffer.push(line);
+        inMath = false;
+        flush();
+      }
+      continue;
+    }
+    if (inMath) {
+      buffer.push(line);
+      if (trimmed.endsWith("$$")) {
+        inMath = false;
+        flush();
+      }
+      continue;
+    }
+
+    if (!trimmed) {
       flush();
       continue;
     }
@@ -90,16 +125,23 @@ function isTableLine(line) {
 }
 
 function isStandaloneBlockStart(line) {
-  return /^(#{1,6}\s|>\s|[-*+]\s|\d+\.\s|\|)/.test(line);
+  return /^(#{1,6}\s|>\s|[-*+]\s|\d+\.\s|\||\$\$)/.test(line);
 }
 
 function isStandaloneSingleLine(line) {
   return /^#{1,6}\s/.test(line) || /^---+$/.test(line.trim()) || /^\*\*\*+$/.test(line.trim()) || /^___+$/.test(line.trim());
 }
 
-function renderBlock(block) {
+export function renderBlock(block) {
   if (!block) return "";
+  const trimmed = block.trim();
   if (block.startsWith("```")) return renderFence(block);
+  if (trimmed.startsWith("$$") && trimmed.endsWith("$$") && trimmed.length >= 4) {
+    return renderMathBlock(trimmed);
+  }
+  if (trimmed.startsWith("\\[") && trimmed.endsWith("\\]")) {
+    return renderMathBlock(trimmed);
+  }
   
   const lines = block.split("\n");
   
@@ -109,7 +151,7 @@ function renderBlock(block) {
   }
 
   // Heading check
-  const heading = lines[0].match(/^(#{1,6})\s+(.*)$/);
+  const heading = lines[0].match(/^(#{1,6})\s+(.*?)(?:\s+#+)?$/);
   if (heading && lines.length === 1) {
     const level = heading[1].length;
     return `<h${level}>${inline(heading[2])}</h${level}>`;
@@ -136,6 +178,24 @@ function renderBlock(block) {
   }
 
   return `<p>${lines.map(inline).join("<br>")}</p>`;
+}
+
+function renderMathBlock(block) {
+  let expr = block.trim();
+  if (expr.startsWith("$$") && expr.endsWith("$$")) {
+    expr = expr.slice(2, -2).trim();
+  } else if (expr.startsWith("\\[") && expr.endsWith("\\]")) {
+    expr = expr.slice(2, -2).trim();
+  }
+  try {
+    const rendered = katex.renderToString(expr, {
+      displayMode: true,
+      throwOnError: false,
+    });
+    return `<div class="math-block">${rendered}</div>`;
+  } catch {
+    return `<div class="math-block math-error"><pre><code>${escapeHtml(expr)}</code></pre></div>`;
+  }
 }
 
 function isTableDelimiter(line) {
@@ -239,7 +299,7 @@ function renderFence(block) {
   return `<div class="code-block" data-language="${escapeAttr(displayLang)}"><div class="code-header"><span class="code-lang">${escapeHtml(displayLang)}</span><button type="button" class="code-copy-btn" data-action="copy-code" aria-label="复制代码">复制</button></div><pre data-language="${escapeAttr(language)}"><code>${highlight(code, language)}</code></pre></div>`;
 }
 
-function inline(source) {
+export function inline(source) {
   let text = escapeHtml(source);
   const tokens = [];
   const stash = (html) => {
@@ -257,9 +317,33 @@ function inline(source) {
   text = text.replace(/^\[ \]\s*/, () => stash(`<input type="checkbox" disabled class="task-checkbox" /> `));
   text = text.replace(/^\[[xX]\]\s*/, () => stash(`<input type="checkbox" disabled checked class="task-checkbox" /> `));
 
-  // Inline math: $...$
-  text = text.replace(/\$([^\$\n]+)\$/g, (_, math) => {
-    return stash(`<span class="math-inline">${escapeHtml(unescapeEntities(math))}</span>`);
+  // LaTeX inline math \( ... \)
+  text = text.replace(/\\\(([\s\S]+?)\\\)/g, (_, math) => {
+    const expr = unescapeEntities(math).trim();
+    try {
+      const rendered = katex.renderToString(expr, {
+        displayMode: false,
+        throwOnError: false,
+      });
+      return stash(rendered);
+    } catch {
+      return stash(`<span class="math-inline math-error">${escapeHtml(expr)}</span>`);
+    }
+  });
+
+  // Inline math $...$
+  text = text.replace(/(^|[^\$])\$([^\$\n]+?)\$(?!\$)/g, (match, prefix, math) => {
+    const expr = unescapeEntities(math).trim();
+    if (!expr) return match;
+    try {
+      const rendered = katex.renderToString(expr, {
+        displayMode: false,
+        throwOnError: false,
+      });
+      return `${prefix}${stash(rendered)}`;
+    } catch {
+      return `${prefix}${stash(`<span class="math-inline math-error">${escapeHtml(expr)}</span>`)}`;
+    }
   });
 
   // Links
