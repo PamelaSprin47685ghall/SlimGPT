@@ -10,7 +10,7 @@ It has three browser-only build targets from the same UI codebase. There is no A
 - **Firefox desktop + Firefox Android** — `dist-firefox/`.
 - **Orion on macOS + iOS/iPadOS** — `dist-orion/`, using the smallest practical WebExtension API surface.
 
-There is no PWA target, no `chrome.debugger`, and no background transport. The actual `chatgpt.com` page remains the host: SlimGPT injects a full-screen extension frame above the official UI and talks to one page-world observer. SlimGPT does **not** request `cookies` permission and does not read, copy, export, or persist ChatGPT cookies/access tokens.
+There is no PWA target, no `chrome.debugger`, and no background transport. The actual `chatgpt.com` page remains the host: SlimGPT injects a full-screen extension frame above the official UI and talks to one page-world observer. The only extension permission is `storage`, used for a local compact observation ledger so recent tool/reasoning traffic survives reloads. SlimGPT does **not** request `cookies`, `tabs`, `webRequest`, or debugger permissions and does not read, copy, export, or persist ChatGPT cookies/access tokens.
 
 ## Stack
 
@@ -107,7 +107,7 @@ The main interface has no feature toggles for its core reading behavior; these a
 - Page synchronization is event-driven: fetch stream chunks, XHR progress, WebSocket messages, and official DOM child/character-data mutations all feed the same live message pipeline. There is no interval polling loop for message synchronization.
 - While takeover is active, `/backend-api/f/conversation/resume` is cloned into SlimGPT and completed immediately for the hidden official consumer. This keeps the full stream in SlimGPT without making ChatGPT's hidden renderer parse and lay out the same response a second time. The response passes through unchanged while the official UI is visible.
 - While takeover is active, hidden official-page autofocus is suppressed so it cannot steal focus from SlimGPT. Official focus is temporarily permitted only while SlimGPT submits through the real composer or explicitly reveals the official UI.
-- The full conversation payload is kept in the open SlimGPT UI memory; only compact conversation metadata is persisted locally.
+- The official conversation graph stays in UI memory. A compact local observation ledger persists normalized recent tool/reasoning/message observations using WebExtension `storage.local`; credential-shaped fields and raw transport envelopes are excluded. Persistence is bounded by whole conversations rather than a per-message sliding window, so one conversation is never silently reduced to its newest few tool calls.
 - The official server conversation graph (`mapping` + `current_node`) is treated as canonical. Local branch switching only selects a different graph leaf for presentation.
 - Current `text/vnd.openai.web-mobile-partial+html` streams are converted to incremental assistant messages. Only the final `data-conversation` payload crosses into the extension frame; conduit/resume tokens and unrelated Sentinel responses stay in the page world.
 

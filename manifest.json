@@ -8,6 +8,7 @@
     "48": "icons/slimgpt-48.png",
     "128": "icons/slimgpt-128.png"
   },
+  "permissions": ["storage"],
   "host_permissions": ["https://chatgpt.com/*"],
   "content_scripts": [
     {

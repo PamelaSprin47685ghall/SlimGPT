@@ -1,6 +1,44 @@
 const INDEX_KEY = 'slimgpt:conversation-index:v1';
 const SETTINGS_KEY = 'slimgpt:user-settings:v1';
 const MODELS_CACHE_KEY = 'slimgpt:models-cache:v1';
+const OBSERVATION_LEDGER_KEY = 'slimgpt:observation-ledger:v1';
+const MAX_LEDGER_CONVERSATIONS = 24;
+const MAX_LEDGER_BYTES = 4 * 1024 * 1024;
+const MAX_LEDGER_STRING = 512 * 1024;
+const MAX_LEDGER_ARRAY = 256;
+const MAX_LEDGER_OBJECT_KEYS = 160;
+
+const PERSISTED_METADATA_KEYS = new Set([
+  'model_slug',
+  'default_model_slug',
+  'model',
+  'thinking_effort',
+  'reasoning_effort',
+  'reasoning_effort_level',
+  'thinking_level',
+  'reasoning_start_time',
+  'reasoning_end_time',
+  'finished_duration_sec',
+  'thought',
+  'reasoning',
+  'reasoning_content',
+  'initial_text',
+  'finished_text',
+  'async_source',
+  'cot_version',
+  'parent_id',
+  'real_author',
+  'tool_name',
+  'reasoning_title',
+  'tool_calls',
+  'search_result_groups',
+  'search_queries',
+  'inline_cot_expandable_content',
+  'aggregate_result',
+  'attachments',
+  'is_error',
+  'error',
+]);
 
 export const THINKING_LEVELS = [
   {
@@ -65,8 +103,9 @@ export const DEFAULT_SETTINGS = {
 };
 
 export async function loadConversationIndex() {
-  if (isExtensionStorage()) {
-    const value = await chrome.storage.local.get('conversationIndex');
+  const storage = extensionStorageArea();
+  if (storage) {
+    const value = await storage.get('conversationIndex');
     return Array.isArray(value.conversationIndex) ? value.conversationIndex : [];
   }
   try {
@@ -78,16 +117,161 @@ export async function loadConversationIndex() {
 
 export async function saveConversationIndex(items) {
   const limited = items.slice(0, 500);
-  if (isExtensionStorage()) {
-    await chrome.storage.local.set({ conversationIndex: limited });
+  const storage = extensionStorageArea();
+  if (storage) {
+    await storage.set({ conversationIndex: limited });
     return;
   }
   localStorage.setItem(INDEX_KEY, JSON.stringify(limited));
 }
 
+export async function loadObservationLedger() {
+  let stored = [];
+  try {
+    const storage = extensionStorageArea();
+    if (storage) {
+      const value = await storage.get('observationLedger');
+      stored = value.observationLedger;
+    } else {
+      stored = JSON.parse(localStorage.getItem(OBSERVATION_LEDGER_KEY) || '[]');
+    }
+  } catch {
+    return [];
+  }
+  return compactObservationLedger(stored);
+}
+
+export async function saveObservationLedger(records) {
+  const compact = compactObservationLedger(records);
+  const storage = extensionStorageArea();
+  if (storage) {
+    await storage.set({ observationLedger: compact });
+    return compact;
+  }
+  localStorage.setItem(OBSERVATION_LEDGER_KEY, JSON.stringify(compact));
+  return compact;
+}
+
+export function compactObservationLedger(records) {
+  const source = normalizeLedgerSource(records);
+  const output = [];
+  let usedBytes = 2;
+
+  for (const entry of source.slice(0, MAX_LEDGER_CONVERSATIONS)) {
+    const id = String(entry?.id || '').trim();
+    const observations = Array.isArray(entry?.observations)
+      ? entry.observations
+      : [];
+    if (!id || !observations.length) continue;
+
+    const kept = observations.map(compactObservation).filter(Boolean);
+    if (!kept.length) continue;
+    const compactEntry = { id, observations: kept };
+    const entryBytes = JSON.stringify(compactEntry).length + 1;
+    // Persistence is all-or-nothing per conversation. Never create a hidden
+    // message-level sliding window just to satisfy a storage budget.
+    if (entryBytes + 2 > MAX_LEDGER_BYTES) continue;
+    if (usedBytes + entryBytes > MAX_LEDGER_BYTES) continue;
+    output.push(compactEntry);
+    usedBytes += entryBytes;
+    if (usedBytes >= MAX_LEDGER_BYTES) break;
+  }
+  return output;
+}
+
+function normalizeLedgerSource(records) {
+  let source;
+  if (records instanceof Map) {
+    source = [...records.entries()].map(([id, record]) => ({
+      id,
+      observations: record?.observations || [],
+    }));
+  } else if (Array.isArray(records)) {
+    source = records.map((entry) => ({
+      id: entry?.id,
+      observations: entry?.observations || entry?.record?.observations || [],
+    }));
+  } else {
+    return [];
+  }
+  return source.sort((left, right) => ledgerRecency(right) - ledgerRecency(left));
+}
+
+function ledgerRecency(entry) {
+  let latest = 0;
+  for (const observation of entry?.observations || []) {
+    latest = Math.max(
+      latest,
+      Number(observation?.lastSeenAt || 0),
+      Number(observation?.createTime || 0) * 1000,
+    );
+  }
+  return latest;
+}
+
+function compactObservation(observation) {
+  if (!observation?.id) return null;
+  const compact = compactValue({
+    id: observation.id,
+    nodeId: observation.nodeId,
+    role: observation.role,
+    name: observation.name,
+    text: observation.text,
+    thought: observation.thought,
+    thinkingDuration: observation.thinkingDuration,
+    createTime: observation.createTime,
+    status: observation.status,
+    error: observation.error,
+    endTurn: observation.endTurn,
+    siblingIndex: observation.siblingIndex,
+    siblingCount: observation.siblingCount,
+    siblingNodeIds: observation.siblingNodeIds,
+    metadata: compactMetadata(observation.metadata),
+    tool: observation.tool,
+    model: observation.model,
+    reasoningEffort: observation.reasoningEffort,
+    thinkingLevel: observation.thinkingLevel,
+    unrecognized: observation.unrecognized,
+    parentId: observation.parentId,
+    firstSeenAt: observation.firstSeenAt,
+    lastSeenAt: observation.lastSeenAt,
+  });
+  return compact && typeof compact === 'object' ? compact : null;
+}
+
+function compactMetadata(metadata) {
+  if (!metadata || typeof metadata !== 'object') return {};
+  const output = {};
+  for (const key of PERSISTED_METADATA_KEYS) {
+    if (metadata[key] == null) continue;
+    output[key] = compactValue(metadata[key]);
+  }
+  return output;
+}
+
+function compactValue(value, depth = 0) {
+  if (value == null || typeof value === 'number' || typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    if (value.length <= MAX_LEDGER_STRING) return value;
+    return `${value.slice(0, MAX_LEDGER_STRING)}\n… [SlimGPT local cache truncated oversized field]`;
+  }
+  if (depth >= 10) return null;
+  if (Array.isArray(value)) {
+    return value.slice(0, MAX_LEDGER_ARRAY).map((item) => compactValue(item, depth + 1));
+  }
+  if (typeof value !== 'object') return null;
+  const output = {};
+  for (const [key, child] of Object.entries(value).slice(0, MAX_LEDGER_OBJECT_KEYS)) {
+    if (/^(?:authorization|cookie|set-cookie|access_token|refresh_token|session_token|resume_token|conduit_token|credential|credentials)$/i.test(key)) continue;
+    output[key] = compactValue(child, depth + 1);
+  }
+  return output;
+}
+
 export async function loadUserSettings() {
-  if (isExtensionStorage()) {
-    const value = await chrome.storage.local.get('userSettings');
+  const storage = extensionStorageArea();
+  if (storage) {
+    const value = await storage.get('userSettings');
     return { ...DEFAULT_SETTINGS, ...(value.userSettings || {}) };
   }
   try {
@@ -100,8 +284,9 @@ export async function loadUserSettings() {
 
 export async function saveUserSettings(settings) {
   const safe = { ...DEFAULT_SETTINGS, ...settings };
-  if (isExtensionStorage()) {
-    await chrome.storage.local.set({ userSettings: safe });
+  const storage = extensionStorageArea();
+  if (storage) {
+    await storage.set({ userSettings: safe });
     return safe;
   }
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(safe));
@@ -109,8 +294,9 @@ export async function saveUserSettings(settings) {
 }
 
 export async function loadCachedModels() {
-  if (isExtensionStorage()) {
-    const value = await chrome.storage.local.get('cachedModels');
+  const storage = extensionStorageArea();
+  if (storage) {
+    const value = await storage.get('cachedModels');
     return Array.isArray(value.cachedModels) && value.cachedModels.length ? value.cachedModels : DEFAULT_MODELS;
   }
   try {
@@ -123,13 +309,19 @@ export async function loadCachedModels() {
 
 export async function saveCachedModels(models) {
   if (!Array.isArray(models) || !models.length) return;
-  if (isExtensionStorage()) {
-    await chrome.storage.local.set({ cachedModels: models });
+  const storage = extensionStorageArea();
+  if (storage) {
+    await storage.set({ cachedModels: models });
     return;
   }
   localStorage.setItem(MODELS_CACHE_KEY, JSON.stringify(models));
 }
 
-function isExtensionStorage() {
-  return typeof chrome !== 'undefined' && Boolean(chrome.storage?.local) && location.protocol === 'chrome-extension:';
+export function extensionStorageArea(
+  protocol = globalThis.location?.protocol || '',
+  chromeApi = globalThis.chrome,
+  browserApi = globalThis.browser,
+) {
+  if (!/^(?:chrome|moz)-extension:$/.test(protocol)) return null;
+  return chromeApi?.storage?.local || browserApi?.storage?.local || null;
 }

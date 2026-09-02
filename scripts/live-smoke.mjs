@@ -228,7 +228,13 @@ async function runFixtureSmoke(browser, extensionId) {
   assert.ok(canonicalUi.historyPreview.includes('Fixture answer'), 'enhanced history must surface the latest message preview');
   assert.equal(canonicalUi.sidebarWorkState, 'stopped', 'an hydrated composer with no stop control is direct idle evidence');
   await sleep(700);
-  const persistedIndex = await ui.evaluate(`JSON.parse(localStorage.getItem('slimgpt:conversation-index:v1') || '[]')`);
+  const persistedIndex = await ui.evaluate(`(async () => {
+    if (globalThis.chrome?.storage?.local) {
+      const value = await chrome.storage.local.get('conversationIndex');
+      return value.conversationIndex || [];
+    }
+    return JSON.parse(localStorage.getItem('slimgpt:conversation-index:v1') || '[]');
+  })()`);
   assert.deepEqual(Object.keys(persistedIndex[0]).sort(), ['create_time', 'id', 'last', 'model', 'route', 'title', 'update_time']);
 
   await ui.evaluate(`document.querySelector('[data-overview-index="0"]')?.click()`);
@@ -492,6 +498,7 @@ async function runFixtureSmoke(browser, extensionId) {
     mobile: true,
   };
   await top.call('Emulation.setDeviceMetricsOverride', mobileMetrics);
+  await top.call('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 });
   await top.evaluate(`(() => {
     const frame = document.getElementById('slimgpt-takeover-frame');
     if (!frame) return false;
@@ -513,6 +520,8 @@ async function runFixtureSmoke(browser, extensionId) {
   assert.notEqual(mobileInitial.navbar, 'none');
   assert.equal(mobileInitial.sidebarOpen, false);
   assert.equal(mobileInitial.overviewOpen, false);
+  assert.equal(await ui.evaluate(`document.querySelector('.sidebar-host')?.hidden || false`), true, 'closed mobile sidebar must be structurally hidden');
+  assert.equal(await ui.evaluate(`document.querySelector('.overview-host')?.hidden || false`), true, 'closed mobile overview must be structurally hidden');
   assert.equal(mobileInitial.thinkingButtons, 5);
   assert.ok(
     mobileInitial.thinkingWidth > 250 && mobileInitial.thinkingWidth <= mobileInitial.composerWidth,
@@ -520,32 +529,61 @@ async function runFixtureSmoke(browser, extensionId) {
   );
   assert.ok(mobileInitial.thinkingOverflow <= 1, 'mobile thinking selector must fit without horizontal scrolling');
 
-  await ui.evaluate(`[...document.querySelectorAll('.mobile-navbar .button')].find((button) => button.textContent.includes('☰'))?.click()`);
+  const mobileButtonRect = async (label) => ui.evaluate(`(() => {
+    const label = ${JSON.stringify(label)};
+    const button = [...document.querySelectorAll('.mobile-navbar .button')]
+      .find((node) => node.textContent.includes(label));
+    if (!button) return null;
+    const rect = button.getBoundingClientRect();
+    return { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+  })()`);
+  const trustedTap = async (label) => {
+    const rect = await mobileButtonRect(label);
+    assert.ok(rect, `missing mobile control: ${label}`);
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    await top.call('Input.dispatchTouchEvent', {
+      type: 'touchStart',
+      touchPoints: [{ x, y, radiusX: 1, radiusY: 1, force: 1, id: 1 }],
+    });
+    await top.call('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  };
+  const trustedDragAcross = async (label) => {
+    const rect = await mobileButtonRect(label);
+    assert.ok(rect, `missing mobile control: ${label}`);
+    const y = rect.top + rect.height / 2;
+    const startX = rect.left + rect.width * 0.8;
+    const endX = rect.left + rect.width * 0.2;
+    await top.call('Input.dispatchTouchEvent', {
+      type: 'touchStart',
+      touchPoints: [{ x: startX, y, radiusX: 1, radiusY: 1, force: 1, id: 2 }],
+    });
+    await top.call('Input.dispatchTouchEvent', {
+      type: 'touchMove',
+      touchPoints: [{ x: endX, y, radiusX: 1, radiusY: 1, force: 1, id: 2 }],
+    });
+    await top.call('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  };
+
+  await ui.evaluate(`[...document.querySelectorAll('.mobile-navbar .button')]
+    .find((button) => button.textContent.includes('概览'))?.click()`);
+  await sleep(80);
+  assert.equal(await ui.evaluate(`document.querySelector('.overview-host')?.hidden || false`), true, 'scripted/synthetic clicks must not open the mobile overview');
+
+  await trustedTap('☰');
   await waitFor(async () => await ui.evaluate(`document.querySelector('.sidebar-host')?.classList.contains('open') || false`));
   assert.equal(await ui.evaluate(`document.querySelector('.overview-host')?.classList.contains('open') || false`), false);
   await ui.evaluate(`document.querySelector('.sidebar-scrim')?.click()`);
   await waitFor(async () => !(await ui.evaluate(`document.querySelector('.sidebar-host')?.classList.contains('open') || false`)));
 
-  await ui.evaluate(`(() => {
-    const button = [...document.querySelectorAll('.mobile-navbar .button')].find((node) => node.textContent.includes('概览'));
-    if (!button) return false;
-    button.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerId: 11, pointerType: 'touch', isPrimary: true, clientX: 360, clientY: 24 }));
-    button.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerId: 11, pointerType: 'touch', isPrimary: true, clientX: 320, clientY: 24 }));
-    return true;
-  })()`);
+  await trustedDragAcross('概览');
   await sleep(80);
   assert.equal(
     await ui.evaluate(`document.querySelector('.overview-host')?.classList.contains('open') || false`),
     false,
     'a mobile swipe/drag across the overview control must not open the drawer',
   );
-  await ui.evaluate(`(() => {
-    const button = [...document.querySelectorAll('.mobile-navbar .button')].find((node) => node.textContent.includes('概览'));
-    if (!button) return false;
-    button.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerId: 12, pointerType: 'touch', isPrimary: true, clientX: 350, clientY: 24 }));
-    button.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerId: 12, pointerType: 'touch', isPrimary: true, clientX: 352, clientY: 25 }));
-    return true;
-  })()`);
+  await trustedTap('概览');
   await waitFor(async () => await ui.evaluate(`document.querySelector('.overview-host')?.classList.contains('open') || false`));
   assert.equal(await ui.evaluate(`document.querySelector('.sidebar-host')?.classList.contains('open') || false`), false);
   await ui.evaluate(`document.querySelector('.sidebar-scrim')?.click()`);
@@ -558,6 +596,7 @@ async function runFixtureSmoke(browser, extensionId) {
     mobile: false,
   };
   await top.call('Emulation.setDeviceMetricsOverride', resetMetrics);
+  await top.call('Emulation.setTouchEmulationEnabled', { enabled: false });
   await top.evaluate(`(() => {
     const frame = document.getElementById('slimgpt-takeover-frame');
     if (!frame) return false;
@@ -971,6 +1010,45 @@ async function runFixtureSmoke(browser, extensionId) {
   assert.deepEqual(toolRendering.toolNames, ['web.run', 'web.run']);
   assert.deepEqual(toolRendering.replyKinds, ['tool-call', 'tool-result', 'message', 'thinking'], 'the transient thinking indicator must remain after tool activity');
 
+  await top.evaluate(`fetch('/backend-api/messages/second-ledger-a').then((response) => response.json())`);
+  await top.evaluate(`fetch('/backend-api/messages/second-ledger-b').then((response) => response.json())`);
+  await waitFor(async () => await ui.evaluate(`(() => {
+    const thought = document.querySelector('.thought-content')?.textContent || '';
+    return thought.includes('先把证据链完整串起来，不能只留半句话。') &&
+      document.querySelectorAll('.message-card.tool-call').length === 3 &&
+      document.querySelectorAll('.message-card.tool-result').length === 3;
+  })()`));
+  await top.evaluate(`fetch('/backend-api/conversation/second?window=1').then((response) => response.json())`);
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).messages.includes('Short-window latest answer'));
+  const ledgerPersistence = await ui.evaluate(`(() => ({
+    calls: document.querySelectorAll('.message-card.tool-call').length,
+    results: document.querySelectorAll('.message-card.tool-result').length,
+    thought: document.querySelector('.thought-content')?.textContent?.replace(/\\s+/g, ' ').trim() || '',
+    toolText: Array.from(document.querySelectorAll('.tool-toml-pre')).map((node) => node.textContent || '').join(' '),
+    messages: document.querySelector('.message-stage')?.innerText?.replace(/\\s+/g, ' ').trim() || '',
+  }))()`);
+  assert.equal(ledgerPersistence.calls, 3, 'short canonical windows must not evict previously observed tool calls');
+  assert.equal(ledgerPersistence.results, 3, 'short canonical windows must not evict previously observed tool results');
+  assert.ok(ledgerPersistence.thought.includes('先把证据链完整串起来，不能只留半句话。'), 'reasoning deltas must render as one complete accumulated thought');
+  assert.ok(ledgerPersistence.toolText.includes('ledger two'));
+  assert.ok(ledgerPersistence.toolText.includes('ledger three'));
+  assert.ok(ledgerPersistence.messages.includes('Short-window latest answer'));
+
+  await sleep(700);
+  const persistedObservationLedger = await ui.evaluate(`(async () => {
+    if (globalThis.chrome?.storage?.local) {
+      const value = await chrome.storage.local.get('observationLedger');
+      return value.observationLedger || [];
+    }
+    return JSON.parse(localStorage.getItem('slimgpt:observation-ledger:v1') || '[]');
+  })()`);
+  const persistedSecond = persistedObservationLedger.find((entry) => entry?.id === 'second');
+  assert.ok(persistedSecond?.observations?.length >= 5, 'recent reasoning/tool observations must be written to the local ledger');
+  const persistedSecondText = JSON.stringify(persistedSecond);
+  assert.ok(persistedSecondText.includes('先把证据链完整串起来，不能只留半句话。'));
+  assert.ok(persistedSecondText.includes('ledger two'));
+  assert.ok(persistedSecondText.includes('ledger three'));
+
   await ui.evaluate(`[...document.querySelectorAll('.conversation-item')]
     .find((button) => button.textContent.includes('Live only conversation'))?.click()`);
   await waitFor(async () => (await top.evaluate('location.pathname')) === '/c/live-only');
@@ -1110,6 +1188,41 @@ async function runFixtureSmoke(browser, extensionId) {
   const resizeObserverErrors = await ui.evaluate(`window.__slimgptWindowErrors.filter((message) => /ResizeObserver loop/i.test(message))`);
   assert.deepEqual(resizeObserverErrors, [], 'turn-paged message rendering must not trigger ResizeObserver loop errors');
 
+  // Persistence is validated last so reloading only the extension iframe
+  // cannot invalidate canonical in-memory fixtures used by earlier tests.
+  await ui.evaluate(`(() => {
+    setTimeout(() => location.reload(), 0);
+    return true;
+  })()`);
+  await sleep(250);
+  await waitFor(async () => (await ui.evaluate(`document.readyState`)) === 'complete');
+  await waitFor(async () => (await ui.evaluate(`document.querySelector('.status-pill')?.textContent?.trim() || ''`)) === '已接管');
+  await waitFor(async () => await ui.evaluate(`[...document.querySelectorAll('.conversation-item')]
+    .some((button) => button.textContent.includes('Second conversation'))`));
+  await ui.evaluate(`[...document.querySelectorAll('.conversation-item')]
+    .find((button) => button.textContent.includes('Second conversation'))?.click()`);
+  await waitFor(async () => await ui.evaluate(`(() => {
+    const toolText = Array.from(document.querySelectorAll('.tool-toml-pre')).map((node) => node.textContent || '').join(' ');
+    return toolText.includes('ledger two') && toolText.includes('ledger three');
+  })()`));
+  await ui.evaluate(`(() => {
+    for (const button of document.querySelectorAll('.thought-header')) {
+      if (button.getAttribute('aria-expanded') !== 'true') button.click();
+    }
+  })()`);
+  await waitFor(async () => await ui.evaluate(`Array.from(document.querySelectorAll('.thought-content'))
+    .some((node) => String(node.textContent || '').includes('先把证据链完整串起来，不能只留半句话。'))`));
+  const restoredLedgerUi = await ui.evaluate(`(() => ({
+    thought: Array.from(document.querySelectorAll('.thought-content')).map((node) => node.textContent || '').join(' ').replace(/\\s+/g, ' ').trim(),
+    toolText: Array.from(document.querySelectorAll('.tool-toml-pre')).map((node) => node.textContent || '').join(' '),
+    calls: document.querySelectorAll('.message-card.tool-call').length,
+    results: document.querySelectorAll('.message-card.tool-result').length,
+  }))()`);
+  assert.ok(restoredLedgerUi.thought.includes('先把证据链完整串起来，不能只留半句话。'), 'reasoning must survive a SlimGPT UI reload via the local observation ledger');
+  assert.ok(restoredLedgerUi.toolText.includes('ledger two'));
+  assert.ok(restoredLedgerUi.toolText.includes('ledger three'));
+  assert.ok(restoredLedgerUi.calls >= 2 && restoredLedgerUi.results >= 2, 'recent tool calls/results must survive a SlimGPT UI reload');
+
   return {
     mode: 'fixture',
     chrome: await chromeVersion(),
@@ -1212,8 +1325,20 @@ async function fulfillFixtureRequest(client, event, fixture) {
     fixture.conversationListRequests = (fixture.conversationListRequests || 0) + 1;
     body = JSON.stringify(fixture.list);
     contentType = 'application/json; charset=utf-8';
-  } else if (url.includes('/backend-api/conversation/second')) {
+  } else if (
+    new URL(url).pathname === '/backend-api/conversation/second' &&
+    new URL(url).searchParams.get('window') === '1'
+  ) {
+    body = JSON.stringify(fixture.secondWindowConversation);
+    contentType = 'application/json; charset=utf-8';
+  } else if (new URL(url).pathname === '/backend-api/conversation/second') {
     body = JSON.stringify(fixture.secondConversation);
+    contentType = 'application/json; charset=utf-8';
+  } else if (url.includes('/backend-api/messages/second-ledger-a')) {
+    body = JSON.stringify(fixture.secondLedgerA);
+    contentType = 'application/json; charset=utf-8';
+  } else if (url.includes('/backend-api/messages/second-ledger-b')) {
+    body = JSON.stringify(fixture.secondLedgerB);
     contentType = 'application/json; charset=utf-8';
     } else if (url.includes('/backend-api/messages/smoke-partial')) {
       body = JSON.stringify(fixture.smokePartialConversation);
@@ -1348,6 +1473,108 @@ function makeFixture() {
       },
     },
   };
+  const secondWindowConversation = {
+    id: 'second',
+    conversation_id: 'second',
+    current_node: 'second-window-a1',
+    metadata: { source: 'optimized-conversation' },
+    mapping: {
+      'second-window-a1': {
+        id: 'second-window-a1',
+        parent: null,
+        children: [],
+        message: {
+          id: 'second-window-a1',
+          author: { role: 'assistant' },
+          content: { parts: ['Short-window latest answer'] },
+          create_time: 9,
+          status: 'finished_successfully',
+          end_turn: true,
+        },
+      },
+    },
+  };
+  const secondLedgerA = {
+    conversation_id: 'second',
+    updates: [
+      {
+        message: {
+          id: 'second-reason-live',
+          parent_id: 'second-a1',
+          author: { role: 'assistant' },
+          content: { content_type: 'thought', text: '先把证据链' },
+          status: 'in_progress',
+          end_turn: false,
+          create_time: 5,
+        },
+      },
+      {
+        message: {
+          id: 'second-reason-live',
+          parent_id: 'second-a1',
+          author: { role: 'assistant' },
+          content: { content_type: 'thought', text: '完整串起来，' },
+          status: 'in_progress',
+          end_turn: false,
+          create_time: 5,
+        },
+      },
+      {
+        message: {
+          id: 'second-call-live-2',
+          parent_id: 'second-reason-live',
+          author: { role: 'assistant' },
+          recipient: 'web.run',
+          content: { content_type: 'code', text: '{"query":"ledger two"}' },
+          create_time: 6,
+        },
+      },
+      {
+        message: {
+          id: 'second-tool-live-2',
+          parent_id: 'second-call-live-2',
+          author: { role: 'tool', name: 'web.run' },
+          content: { parts: ['{"ok":true,"step":2}'] },
+          create_time: 7,
+        },
+      },
+    ],
+  };
+  const secondLedgerB = {
+    conversation_id: 'second',
+    updates: [
+      {
+        message: {
+          id: 'second-reason-live',
+          parent_id: 'second-a1',
+          author: { role: 'assistant' },
+          content: { content_type: 'thought', text: '不能只留半句话。' },
+          status: 'in_progress',
+          end_turn: false,
+          create_time: 5,
+        },
+      },
+      {
+        message: {
+          id: 'second-call-live-3',
+          parent_id: 'second-tool-live-2',
+          author: { role: 'assistant' },
+          recipient: 'web.run',
+          content: { content_type: 'code', text: '{"query":"ledger three"}' },
+          create_time: 8,
+        },
+      },
+      {
+        message: {
+          id: 'second-tool-live-3',
+          parent_id: 'second-call-live-3',
+          author: { role: 'tool', name: 'web.run' },
+          content: { parts: ['{"ok":true,"step":3}'] },
+          create_time: 8.5,
+        },
+      },
+    ],
+  };
   const mobileConversation = {
     backendConversationId: 'mobile-smoke',
     messages: [
@@ -1367,6 +1594,9 @@ function makeFixture() {
     ] },
     conversation,
     secondConversation,
+    secondWindowConversation,
+    secondLedgerA,
+    secondLedgerB,
     delayedScopedEvent: {
       message: {
         id: 'delayed-smoke-a1',

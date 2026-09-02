@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  buildConversationRecordView,
   buildConversationView,
+  contentToText,
   consumeSse,
   conversationIdFromUrl,
   conversationThinkingLevel,
@@ -14,10 +16,14 @@ import {
   getToolMessageInfo,
   groupConversationTurns,
   hasNonTextExtras,
+  ingestConversationMessage,
+  ingestConversationPayload,
   mergeConversationPayload,
   messageNodeToView,
+  mergeProgressiveText,
   parseWebMobilePartialConversation,
   resolveConversationScope,
+  setConversationRecordTerminal,
   stepConversationBranch,
   upsertLiveMessage,
 } from '../core.js';
@@ -72,6 +78,29 @@ test('branch stepping descends through selected sibling to a leaf', () => {
   assert.deepEqual(buildConversationView(payload, terminal).map((message) => message.text), ['hello', 'branch one', 'follow up', 'deep leaf']);
 });
 
+test('persistent observations stay stored but only render on the branch they are anchored to', () => {
+  let record = ingestConversationPayload(null, payload);
+  record = ingestConversationMessage(record, {
+    id: 'latest-branch-tool',
+    parent_id: 'a2',
+    author: { role: 'assistant' },
+    recipient: 'web.run',
+    content: { content_type: 'code', text: '{"branch":"latest"}' },
+  });
+  record = ingestConversationMessage(record, {
+    id: 'old-branch-tool',
+    parent_id: 'a3',
+    author: { role: 'assistant' },
+    recipient: 'web.run',
+    content: { content_type: 'code', text: '{"branch":"old"}' },
+  });
+  record = setConversationRecordTerminal(record, 'a3');
+  const rows = buildConversationRecordView(record);
+  assert.equal(rows.some((row) => row.id === 'latest-branch-tool'), false);
+  assert.equal(rows.some((row) => row.id === 'old-branch-tool'), true);
+  assert.equal(record.observations.length, 2, 'branch filtering must never delete the stored ledger');
+});
+
 test('SSE parser preserves partial chunks', () => {
   const first = consumeSse('', 'data: {"message":{"id":"m1"', false);
   assert.equal(first.frames.length, 0);
@@ -83,6 +112,129 @@ test('SSE parser preserves partial chunks', () => {
 test('payload/list discovery tolerates wrappers', () => {
   assert.equal(findConversationPayload({ data: { value: payload } }), payload);
   assert.equal(extractConversationItems({ data: { items: [{ id: 'c1', title: 'One', update_time: 2 }] } })[0].title, 'One');
+});
+
+test('progressive text merge preserves deltas, snapshots, and overlap without truncation', () => {
+  assert.equal(mergeProgressiveText('alpha', 'alphabet'), 'alphabet');
+  assert.equal(mergeProgressiveText('alphabet', 'alpha'), 'alphabet');
+  assert.equal(mergeProgressiveText('thinking about the pro', 'problem now'), 'thinking about the problem now');
+  assert.equal(mergeProgressiveText('先分析', '问题，再继续'), '先分析问题，再继续');
+});
+
+test('DOM snapshot observations replace visible text instead of being appended as deltas', () => {
+  let rows = upsertLiveMessage([], {
+    id: 'dom-snapshot',
+    author: { role: 'assistant' },
+    content: { parts: ['snapshot one'] },
+  }, { textMode: 'snapshot' });
+  rows = upsertLiveMessage(rows, {
+    id: 'dom-snapshot',
+    author: { role: 'assistant' },
+    content: { parts: ['snapshot two'] },
+  }, { textMode: 'snapshot' });
+  assert.equal(rows[0].text, 'snapshot two');
+});
+
+test('thought content is classified only as reasoning and never as assistant answer text', () => {
+  const message = {
+    id: 'thought-only',
+    author: { role: 'assistant' },
+    content: { content_type: 'thought', text: '完整的思考内容' },
+    status: 'in_progress',
+  };
+  assert.equal(contentToText(message.content), '');
+  assert.equal(extractThought(message), '完整的思考内容');
+});
+
+test('message discovery coalesces repeated same-id reasoning updates inside one transport frame', () => {
+  const events = findMessageEvents({
+    conversation_id: 'reasoning-c',
+    updates: [
+      {
+        message: {
+          id: 'reasoning-1',
+          author: { role: 'assistant' },
+          content: { content_type: 'thought', text: '先分析' },
+          status: 'in_progress',
+        },
+      },
+      {
+        message: {
+          id: 'reasoning-1',
+          author: { role: 'assistant' },
+          content: { content_type: 'thought', text: '问题，再继续推理。' },
+          status: 'in_progress',
+        },
+      },
+    ],
+  });
+  assert.equal(events.length, 1);
+  assert.equal(extractThought(events[0].message), '先分析问题，再继续推理。');
+});
+
+test('same-id streamed tool arguments accumulate instead of replacing earlier fragments', () => {
+  let record = ingestConversationMessage(null, {
+    id: 'tool-call-stream',
+    author: { role: 'assistant' },
+    tool_calls: [{ id: 'call-1', function: { name: 'web.run', arguments: '{"query":"Slim' } }],
+    content: { parts: [] },
+  });
+  record = ingestConversationMessage(record, {
+    id: 'tool-call-stream',
+    author: { role: 'assistant' },
+    tool_calls: [{ id: 'call-1', function: { name: 'web.run', arguments: 'GPT","limit":3}' } }],
+    content: { parts: [] },
+  });
+  const [row] = buildConversationRecordView(record);
+  assert.equal(row.tool?.payload?.function?.arguments, '{"query":"SlimGPT","limit":3}');
+});
+
+test('conversation record keeps non-canonical tool observations across short canonical windows', () => {
+  const basePayload = {
+    id: 'record-c',
+    current_node: 'a1',
+    mapping: {
+      u1: {
+        id: 'u1', parent: null, children: ['a1'],
+        message: { id: 'u1', author: { role: 'user' }, content: { parts: ['question'] }, create_time: 1 },
+      },
+      a1: {
+        id: 'a1', parent: 'u1', children: [],
+        message: { id: 'a1', author: { role: 'assistant' }, content: { parts: ['first answer'] }, create_time: 2 },
+      },
+    },
+  };
+  let record = ingestConversationPayload(null, basePayload);
+  record = ingestConversationMessage(record, {
+    id: 'tool-live-1',
+    parent_id: 'a1',
+    author: { role: 'assistant' },
+    recipient: 'web.run',
+    content: { text: '{"query":"one"}' },
+    create_time: 3,
+  });
+  record = ingestConversationMessage(record, {
+    id: 'tool-live-result-1',
+    parent_id: 'tool-live-1',
+    author: { role: 'tool', name: 'web.run' },
+    content: { parts: ['{"ok":true}'] },
+    create_time: 4,
+  });
+  record = ingestConversationPayload(record, {
+    id: 'record-c',
+    current_node: 'a2',
+    metadata: { source: 'optimized-conversation' },
+    mapping: {
+      a2: {
+        id: 'a2', parent: null, children: [],
+        message: { id: 'a2', author: { role: 'assistant' }, content: { parts: ['latest answer'] }, create_time: 5 },
+      },
+    },
+  });
+  const rows = buildConversationRecordView(record);
+  assert.deepEqual(rows.map((row) => row.id), ['u1', 'a1', 'tool-live-1', 'tool-live-result-1', 'a2']);
+  assert.equal(rows[2].tool?.name, 'web.run');
+  assert.equal(rows[3].tool?.kind, 'tool-result');
 });
 
 test('partial conversation payloads extend cached history instead of replacing it', () => {

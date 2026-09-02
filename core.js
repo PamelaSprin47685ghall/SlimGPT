@@ -121,21 +121,30 @@ function parseSseBlock(block) {
   return { event, id, data: text, json: parseJson(text) };
 }
 
-export function findConversationPayload(value, depth = 0) {
-  if (!value || typeof value !== "object" || depth > 5) return null;
-  if (value.mapping && typeof value.mapping === "object" && value.current_node) return value;
-  if (
-    Array.isArray(value.messages) &&
-    value.current_node &&
-    (value.conversation_id || value.id) &&
-    value.messages.some(looksLikeMessage)
-  ) {
-    return optimizedConversationToCanonical(value);
-  }
-  for (const child of Object.values(value)) {
-    if (!child || typeof child !== "object") continue;
-    const found = findConversationPayload(child, depth + 1);
-    if (found) return found;
+export function findConversationPayload(root) {
+  if (!root || typeof root !== "object") return null;
+  const stack = [root];
+  const visited = new WeakSet();
+  let inspected = 0;
+  while (stack.length && inspected < 8_000) {
+    const value = stack.pop();
+    if (!value || typeof value !== "object" || visited.has(value)) continue;
+    visited.add(value);
+    inspected += 1;
+    if (value.mapping && typeof value.mapping === "object" && value.current_node) return value;
+    if (
+      Array.isArray(value.messages) &&
+      value.current_node &&
+      (value.conversation_id || value.id) &&
+      value.messages.some(looksLikeMessage)
+    ) {
+      return optimizedConversationToCanonical(value);
+    }
+    const children = Object.values(value);
+    for (let index = children.length - 1; index >= 0; index -= 1) {
+      const child = children[index];
+      if (child && typeof child === "object") stack.push(child);
+    }
   }
   return null;
 }
@@ -186,6 +195,187 @@ export function mergeConversationPayload(previous, incoming) {
   };
 }
 
+export function mergeProgressiveText(previousValue, incomingValue) {
+  const previous = typeof previousValue === "string" ? previousValue : "";
+  const incoming = typeof incomingValue === "string" ? incomingValue : "";
+  if (!incoming) return previous;
+  if (!previous || previous === incoming) return incoming;
+  if (incoming.startsWith(previous)) return incoming;
+  if (previous.startsWith(incoming)) return previous;
+  if (incoming.includes(previous)) return incoming;
+  if (previous.includes(incoming)) return previous;
+
+  const overlap = longestTextOverlap(previous, incoming);
+  if (overlap > 0) return `${previous}${incoming.slice(overlap)}`;
+
+  // Streaming reasoning/tool arguments are frequently delivered as deltas
+  // rather than cumulative snapshots. In the absence of an overlap, keeping
+  // both observations is safer than replacing already-observed text.
+  return `${previous}${incoming}`;
+}
+
+function longestTextOverlap(previous, incoming) {
+  const max = Math.min(previous.length, incoming.length, 4096);
+  for (let length = max; length > 0; length -= 1) {
+    if (previous.slice(-length) === incoming.slice(0, length)) return length;
+  }
+  return 0;
+}
+
+export function mergeObservedMessage(previous, incoming, options = {}) {
+  if (!previous || typeof previous !== "object") return cloneConversationMessage(incoming);
+  if (!incoming || typeof incoming !== "object") return cloneConversationMessage(previous);
+
+  const previousFinished = isFinishedConversationMessage(previous);
+  const incomingFinished = isFinishedConversationMessage(incoming);
+  const preserveFinishedLifecycle = previousFinished && !incomingFinished;
+
+  return {
+    ...previous,
+    ...incoming,
+    author: mergeObservedObject(previous.author, incoming.author),
+    content: options.textMode === "snapshot"
+      ? mergeSnapshotContent(previous.content, incoming.content)
+      : mergeObservedContent(previous.content, incoming.content),
+    metadata: mergeObservedMetadata(previous.metadata, incoming.metadata),
+    tool_calls: mergeObservedValue(previous.tool_calls, incoming.tool_calls, "tool_calls"),
+    status: preserveFinishedLifecycle ? previous.status : (incoming.status ?? previous.status),
+    end_turn: preserveFinishedLifecycle ? previous.end_turn : (incoming.end_turn ?? previous.end_turn),
+  };
+}
+
+function mergeSnapshotContent(previous, incoming) {
+  if (incoming == null) return cloneObservedValue(previous);
+  return cloneObservedValue(incoming);
+}
+
+function mergeObservedContent(previous, incoming) {
+  if (incoming == null) return cloneObservedValue(previous);
+  if (previous == null) return cloneObservedValue(incoming);
+  if (typeof previous === "string" || typeof incoming === "string") {
+    return mergeProgressiveText(String(previous || ""), String(incoming || ""));
+  }
+  if (typeof previous !== "object" || typeof incoming !== "object") return cloneObservedValue(incoming);
+
+  const output = { ...previous, ...incoming };
+  for (const key of new Set([...Object.keys(previous), ...Object.keys(incoming)])) {
+    if (!(key in incoming)) {
+      output[key] = cloneObservedValue(previous[key]);
+      continue;
+    }
+    if (!(key in previous)) {
+      output[key] = cloneObservedValue(incoming[key]);
+      continue;
+    }
+    output[key] = mergeObservedValue(previous[key], incoming[key], key);
+  }
+  return output;
+}
+
+function mergeObservedMetadata(previous, incoming) {
+  const output = mergeObservedObject(previous, incoming);
+  if (!output || typeof output !== "object") return output;
+  for (const key of [
+    "thought",
+    "reasoning",
+    "reasoning_content",
+    "initial_text",
+    "finished_text",
+  ]) {
+    if (typeof previous?.[key] === "string" || typeof incoming?.[key] === "string") {
+      output[key] = mergeProgressiveText(previous?.[key], incoming?.[key]);
+    }
+  }
+  return output;
+}
+
+function mergeObservedObject(previous, incoming) {
+  if (!previous || typeof previous !== "object" || Array.isArray(previous)) return cloneObservedValue(incoming ?? previous);
+  if (!incoming || typeof incoming !== "object" || Array.isArray(incoming)) return cloneObservedValue(incoming ?? previous);
+  const output = { ...previous };
+  for (const [key, value] of Object.entries(incoming)) {
+    output[key] = key in previous
+      ? mergeObservedValue(previous[key], value, key)
+      : cloneObservedValue(value);
+  }
+  return output;
+}
+
+function mergeObservedValue(previous, incoming, key = "") {
+  if (incoming == null || incoming === "") return cloneObservedValue(previous);
+  if (previous == null || previous === "") return cloneObservedValue(incoming);
+
+  if (typeof previous === "string" && typeof incoming === "string") {
+    if (/^(?:text|content|summary|thought|reasoning|reasoning_content|arguments|transcript|initial_text|finished_text|result)$/i.test(key)) {
+      return mergeProgressiveText(previous, incoming);
+    }
+    return incoming.length >= previous.length ? incoming : previous;
+  }
+
+  if (Array.isArray(previous) && Array.isArray(incoming)) {
+    return mergeObservedArray(previous, incoming, key);
+  }
+  if (
+    previous && incoming &&
+    typeof previous === "object" && typeof incoming === "object" &&
+    !Array.isArray(previous) && !Array.isArray(incoming)
+  ) {
+    return mergeObservedObject(previous, incoming);
+  }
+  return cloneObservedValue(incoming);
+}
+
+function mergeObservedArray(previous, incoming, key) {
+  if (!incoming.length) return previous.map(cloneObservedValue);
+  if (!previous.length) return incoming.map(cloneObservedValue);
+
+  if (previous.every((item) => typeof item === "string") && incoming.every((item) => typeof item === "string")) {
+    const length = Math.max(previous.length, incoming.length);
+    const output = [];
+    for (let index = 0; index < length; index += 1) {
+      if (index >= incoming.length) output.push(previous[index]);
+      else if (index >= previous.length) output.push(incoming[index]);
+      else output.push(mergeProgressiveText(previous[index], incoming[index]));
+    }
+    return output;
+  }
+
+  const stableKey = (item, index) => {
+    if (!item || typeof item !== "object") return `index:${index}`;
+    return String(
+      item.id ??
+      item.call_id ??
+      item.tool_call_id ??
+      item.message_id ??
+      item.content_type ??
+      item.type ??
+      `index:${index}`
+    );
+  };
+  const output = previous.map(cloneObservedValue);
+  const indexByKey = new Map(output.map((item, index) => [stableKey(item, index), index]));
+  for (let index = 0; index < incoming.length; index += 1) {
+    const item = incoming[index];
+    const itemKey = stableKey(item, index);
+    if (!indexByKey.has(itemKey)) {
+      indexByKey.set(itemKey, output.length);
+      output.push(cloneObservedValue(item));
+      continue;
+    }
+    const target = indexByKey.get(itemKey);
+    output[target] = mergeObservedValue(output[target], item, key);
+  }
+  return output;
+}
+
+function cloneObservedValue(value) {
+  if (Array.isArray(value)) return value.map(cloneObservedValue);
+  if (!value || typeof value !== "object") return value;
+  const output = {};
+  for (const [key, child] of Object.entries(value)) output[key] = cloneObservedValue(child);
+  return output;
+}
+
 function cloneConversationNode(node, fallbackId) {
   if (!node || typeof node !== "object") {
     return { id: fallbackId, parent: null, children: [] };
@@ -227,29 +417,7 @@ function cloneConversationMessage(message) {
 }
 
 function mergeConversationMessage(previous, incoming) {
-  if (!previous || typeof previous !== "object") return cloneConversationMessage(incoming);
-  if (!incoming || typeof incoming !== "object") return cloneConversationMessage(previous);
-
-  const previousFinished = isFinishedConversationMessage(previous);
-  const incomingFinished = isFinishedConversationMessage(incoming);
-  const preservePreviousBody = previousFinished && !incomingFinished;
-  return {
-    ...previous,
-    ...incoming,
-    author: {
-      ...(previous.author || {}),
-      ...(incoming.author || {}),
-    },
-    content: preservePreviousBody
-      ? previous.content
-      : (incoming.content ?? previous.content),
-    status: preservePreviousBody ? previous.status : (incoming.status ?? previous.status),
-    end_turn: preservePreviousBody ? previous.end_turn : (incoming.end_turn ?? previous.end_turn),
-    metadata: {
-      ...(previous.metadata || {}),
-      ...(incoming.metadata || {}),
-    },
-  };
+  return mergeObservedMessage(previous, incoming);
 }
 
 function isFinishedConversationMessage(message) {
@@ -329,18 +497,27 @@ function optimizedConversationToCanonical(value) {
   };
 }
 
-export function extractConversationItems(value, depth = 0) {
-  if (!value || typeof value !== "object" || depth > 4) return [];
-  if (Array.isArray(value.items)) {
-    const items = value.items.filter((item) => item && typeof item === "object" && item.id);
-    if (items.length && items.some((item) => "title" in item || "update_time" in item || "create_time" in item)) {
-      return items;
+export function extractConversationItems(root) {
+  if (!root || typeof root !== "object") return [];
+  const stack = [root];
+  const visited = new WeakSet();
+  let inspected = 0;
+  while (stack.length && inspected < 8_000) {
+    const value = stack.pop();
+    if (!value || typeof value !== "object" || visited.has(value)) continue;
+    visited.add(value);
+    inspected += 1;
+    if (Array.isArray(value.items)) {
+      const items = value.items.filter((item) => item && typeof item === "object" && item.id);
+      if (items.length && items.some((item) => "title" in item || "update_time" in item || "create_time" in item)) {
+        return items;
+      }
     }
-  }
-  for (const child of Object.values(value)) {
-    if (!child || typeof child !== "object") continue;
-    const items = extractConversationItems(child, depth + 1);
-    if (items.length) return items;
+    const children = Object.values(value);
+    for (let index = children.length - 1; index >= 0; index -= 1) {
+      const child = children[index];
+      if (child && typeof child === "object") stack.push(child);
+    }
   }
   return [];
 }
@@ -427,37 +604,54 @@ function formatDefaultModelTitle(slug) {
 
 export function findMessageEvents(value) {
   const output = [];
-  collectMessageEvents(value, 0, { conversationId: null, conflicted: false }, output);
+  collectMessageEvents(value, output);
   return dedupeMessageEvents(output);
 }
 
-function collectMessageEvents(value, depth, inheritedScope, output) {
-  if (!value || typeof value !== "object" || depth > 6) return;
-  const directConversationId = value.conversation_id || value.conversationId || null;
-  const scope = mergeConversationScope(inheritedScope, directConversationId);
+function collectMessageEvents(root, output) {
+  if (!root || typeof root !== "object") return;
+  const stack = [{ value: root, scope: { conversationId: null, conflicted: false } }];
+  const visited = new WeakSet();
+  let inspected = 0;
+  const MAX_INSPECTED_OBJECTS = 12_000;
 
-  if (looksLikeMessage(value.message)) {
-    const messageScope = mergeConversationScope(
-      scope,
-      value.message.conversation_id || value.message.conversationId || null,
-    );
-    output.push({
-      message: value.message,
-      conversationId: messageScope.conversationId,
-      conversationIdConflict: messageScope.conflicted,
-    });
-  }
-  if (looksLikeMessage(value) && (value.author || value.content)) {
-    output.push({
-      message: value,
-      conversationId: scope.conversationId,
-      conversationIdConflict: scope.conflicted,
-    });
-    return;
-  }
-  for (const child of Object.values(value)) {
-    if (!child || typeof child !== "object") continue;
-    collectMessageEvents(child, depth + 1, scope, output);
+  while (stack.length && inspected < MAX_INSPECTED_OBJECTS) {
+    const entry = stack.pop();
+    const value = entry?.value;
+    if (!value || typeof value !== "object") continue;
+    if (visited.has(value)) continue;
+    visited.add(value);
+    inspected += 1;
+
+    const directConversationId = value.conversation_id || value.conversationId || null;
+    const scope = mergeConversationScope(entry.scope, directConversationId);
+
+    if (looksLikeMessage(value.message)) {
+      const messageScope = mergeConversationScope(
+        scope,
+        value.message.conversation_id || value.message.conversationId || null,
+      );
+      output.push({
+        message: value.message,
+        conversationId: messageScope.conversationId,
+        conversationIdConflict: messageScope.conflicted,
+      });
+    }
+    if (looksLikeMessage(value) && (value.author || value.content)) {
+      output.push({
+        message: value,
+        conversationId: scope.conversationId,
+        conversationIdConflict: scope.conflicted,
+      });
+      continue;
+    }
+
+    const children = Object.values(value);
+    for (let index = children.length - 1; index >= 0; index -= 1) {
+      const child = children[index];
+      if (!child || typeof child !== "object") continue;
+      stack.push({ value: child, scope });
+    }
   }
 }
 
@@ -473,16 +667,31 @@ function mergeConversationScope(scope, candidate) {
 }
 
 function dedupeMessageEvents(events) {
-  const seen = new Set();
-  return events.filter(({ message, conversationId, conversationIdConflict }) => {
+  const orderedKeys = [];
+  const merged = new Map();
+  for (const event of events) {
+    const { message, conversationId, conversationIdConflict } = event;
     const id = message?.id;
-    if (!id) return false;
+    if (!id) continue;
     const scope = conversationIdConflict ? "conflict" : (conversationId || "unscoped");
     const key = `${scope}\u0000${id}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+    if (!merged.has(key)) {
+      orderedKeys.push(key);
+      merged.set(key, event);
+      continue;
+    }
+    const previous = merged.get(key);
+    merged.set(key, {
+      ...previous,
+      ...event,
+      message: mergeObservedMessage(previous.message, event.message),
+      conversationIdConflict: Boolean(previous.conversationIdConflict || event.conversationIdConflict),
+      conversationId: previous.conversationIdConflict || event.conversationIdConflict
+        ? null
+        : (event.conversationId || previous.conversationId || null),
+    });
+  }
+  return orderedKeys.map((key) => merged.get(key));
 }
 
 function looksLikeMessage(value) {
@@ -538,7 +747,12 @@ export function buildConversationView(payload, terminalId = null) {
   chain.reverse();
 
   return chain
-    .filter((node) => node?.message && !node.message.metadata?.is_visually_hidden_from_conversation)
+    .filter((node) => {
+      const message = node?.message;
+      if (!message) return false;
+      if (!message.metadata?.is_visually_hidden_from_conversation) return true;
+      return Boolean(getToolMessageInfo(message) || extractThought(message));
+    })
     .map((node) => messageNodeToView(node, mapping));
 }
 
@@ -856,6 +1070,11 @@ export function contentToText(content, metadata = {}) {
     return "";
   }
 
+  const contentType = String(content?.content_type || "").toLowerCase();
+  if (contentType === "thought" || contentType === "thoughts" || contentType === "reasoning_recap") {
+    return "";
+  }
+
   let text = "";
   if (content) {
     if (typeof content === "string") text = content;
@@ -1041,8 +1260,26 @@ function descendToLeaf(mapping, start) {
   return cursor;
 }
 
-export function upsertLiveMessage(messages, rawMessage) {
+export function upsertLiveMessage(messages, rawMessage, options = {}) {
   if (!rawMessage?.id) return messages;
+  const index = messages.findIndex((message) => message.id === rawMessage.id);
+  const previous = index >= 0 ? messages[index] : null;
+  const mergedRaw = previous?._rawMessage
+    ? mergeObservedMessage(previous._rawMessage, rawMessage, options)
+    : cloneConversationMessage(rawMessage);
+  const item = liveMessageToView(mergedRaw);
+  item._rawMessage = mergedRaw;
+  item.parentId = mergedRaw?.metadata?.parent_id || mergedRaw?.parent_id || previous?.parentId || null;
+  item.firstSeenAt = previous?.firstSeenAt || Date.now();
+  item.lastSeenAt = Date.now();
+
+  if (index === -1) return [...messages, item];
+  const next = messages.slice();
+  next[index] = mergeLiveView(previous, item, options);
+  return next;
+}
+
+function liveMessageToView(rawMessage) {
   const metadata = rawMessage.metadata || {};
   const isAsyncReasoning = isAsyncReasoningMessage(rawMessage);
   const thought = extractThought(rawMessage);
@@ -1085,43 +1322,262 @@ export function upsertLiveMessage(messages, rawMessage) {
     isThinking: (status === "in_progress" || status === "thinking") && !text && !tool && !hasNonTextExtras(rawMessage),
     live: true,
   };
+  return item;
+}
 
-  const index = messages.findIndex((message) => message.id === item.id);
-  if (index === -1) return [...messages, item];
-  const next = messages.slice();
-  const previous = next[index];
+function mergeLiveView(previous, item, options = {}) {
   // Lifecycle fields only move forward: a status-less capture (DOM observer)
   // or an early in_progress delta must never regress a finished message.
   const finished = (message) => message?.status === "finished_successfully" || message?.status === "finished" || message?.endTurn === true;
   const mergedStatus = item.status ?? previous.status ?? null;
   const mergedEndTurn = item.endTurn ?? previous.endTurn ?? null;
-  next[index] = {
+  const next = {
     ...previous,
     ...item,
     status: mergedStatus,
     endTurn: mergedEndTurn,
     error: item.error || previous.error || false,
     name: item.name || previous.name || null,
-    thought: item.thought || previous.thought || null,
+    thought: mergeProgressiveText(previous.thought, item.thought) || null,
     thinkingDuration: item.thinkingDuration || previous.thinkingDuration || null,
-    text: item.text || previous.text || "",
+    text: options.textMode === "snapshot" ? (item.text || previous.text || "") : mergeProgressiveText(previous.text, item.text),
     model: item.model || previous.model || null,
     reasoningEffort: item.reasoningEffort || previous.reasoningEffort || null,
     thinkingLevel: item.thinkingLevel || previous.thinkingLevel || null,
     metadata: Object.keys(item.metadata || {}).length ? item.metadata : (previous.metadata || {}),
-    tool: item.tool || previous.tool || null,
+    tool: mergeToolObservation(previous.tool, item.tool),
     isThinking: finished(previous) ? false : item.isThinking,
     unrecognized: item.unrecognized || previous.unrecognized || false,
   };
   if (finished(previous) && !finished({ status: mergedStatus, endTurn: mergedEndTurn })) {
     // Regressed (e.g. a stale in_progress capture): restore the finished state.
-    next[index] = {
-      ...next[index],
+    return {
+      ...next,
       status: previous.status,
       endTurn: previous.endTurn,
     };
   }
   return next;
+}
+
+function mergeToolObservation(previous, incoming) {
+  if (!previous) return incoming || null;
+  if (!incoming) return previous;
+  if (previous.kind !== incoming.kind || previous.name !== incoming.name) return incoming;
+  return {
+    ...previous,
+    ...incoming,
+    title: incoming.title || previous.title || null,
+    payload: mergeObservedValue(previous.payload, incoming.payload, "payload"),
+  };
+}
+
+export function createConversationRecord(previous = null) {
+  return {
+    payload: previous?.payload || null,
+    terminal: previous?.terminal || previous?.payload?.current_node || null,
+    observations: Array.isArray(previous?.observations) ? previous.observations : [],
+  };
+}
+
+export function ingestConversationPayload(record, incomingPayload) {
+  const previous = createConversationRecord(record);
+  const previousPayload = previous.payload;
+  const payload = previousPayload
+    ? mergeConversationPayload(previousPayload, incomingPayload)
+    : incomingPayload;
+  if (!payload) return previous;
+
+  const followedLatest = !previousPayload || !previous.terminal || previous.terminal === previousPayload.current_node;
+  const terminal = followedLatest
+    ? payload.current_node
+    : (payload.mapping?.[previous.terminal] ? previous.terminal : payload.current_node);
+  return {
+    payload,
+    terminal,
+    observations: previous.observations,
+  };
+}
+
+export function ingestConversationMessage(record, rawMessage, options = {}) {
+  const previous = createConversationRecord(record);
+  return {
+    ...previous,
+    observations: upsertLiveMessage(previous.observations, rawMessage, options),
+  };
+}
+
+export function hydrateConversationObservations(record, observations) {
+  let current = createConversationRecord(record);
+  if (!Array.isArray(observations)) return current;
+  for (const observation of observations) {
+    if (!observation?.id) continue;
+    const index = current.observations.findIndex((item) => item?.id === observation.id);
+    const next = current.observations.slice();
+    if (index === -1) next.push({ ...observation });
+    else next[index] = mergeHydratedObservation(observation, next[index]);
+    current = {
+      ...current,
+      observations: next,
+    };
+  }
+  return current;
+}
+
+function mergeHydratedObservation(persisted, current) {
+  if (!current) return { ...persisted };
+  const currentFinished = isFinishedViewMessage(current);
+  const persistedFinished = isFinishedViewMessage(persisted);
+  return {
+    ...persisted,
+    ...current,
+    text: current.observationMode === "snapshot"
+      ? (current.text || persisted.text || "")
+      : mergeProgressiveText(persisted.text, current.text),
+    thought: mergeProgressiveText(persisted.thought, current.thought) || null,
+    tool: mergeToolObservation(persisted.tool, current.tool),
+    metadata: mergeObservedMetadata(persisted.metadata, current.metadata),
+    status: currentFinished || !persistedFinished ? current.status : persisted.status,
+    endTurn: currentFinished || !persistedFinished ? current.endTurn : persisted.endTurn,
+    firstSeenAt: Math.min(
+      Number(persisted.firstSeenAt || Number.MAX_SAFE_INTEGER),
+      Number(current.firstSeenAt || Number.MAX_SAFE_INTEGER),
+    ),
+    lastSeenAt: Math.max(Number(persisted.lastSeenAt || 0), Number(current.lastSeenAt || 0)),
+  };
+}
+
+export function setConversationRecordTerminal(record, terminal) {
+  const previous = createConversationRecord(record);
+  if (!terminal || !previous.payload?.mapping?.[terminal]) return previous;
+  return { ...previous, terminal };
+}
+
+export function buildConversationRecordView(record) {
+  const current = createConversationRecord(record);
+  const canonical = current.payload
+    ? buildConversationView(current.payload, current.terminal || current.payload.current_node)
+    : [];
+  const followingLatest = !current.payload ||
+    !current.terminal ||
+    current.terminal === current.payload.current_node;
+  const observations = followingLatest
+    ? current.observations
+    : observationsForSelectedBranch(canonical, current.observations);
+  return mergeConversationViewObservations(canonical, observations);
+}
+
+function observationsForSelectedBranch(canonicalRows, observations) {
+  const canonicalIds = new Set();
+  for (const row of canonicalRows || []) {
+    if (row?.id) canonicalIds.add(row.id);
+    if (row?.nodeId) canonicalIds.add(row.nodeId);
+  }
+  const byId = new Map((observations || []).filter((item) => item?.id).map((item) => [item.id, item]));
+  const memo = new Map();
+
+  const isAnchored = (observation, visiting = new Set()) => {
+    if (!observation?.id) return false;
+    if (canonicalIds.has(observation.id) || canonicalIds.has(observation.nodeId)) return true;
+    if (memo.has(observation.id)) return memo.get(observation.id);
+    if (visiting.has(observation.id)) return false;
+    visiting.add(observation.id);
+    const parentId = observation.parentId;
+    const anchored = Boolean(
+      parentId && (
+        canonicalIds.has(parentId) ||
+        (byId.has(parentId) && isAnchored(byId.get(parentId), visiting))
+      )
+    );
+    visiting.delete(observation.id);
+    memo.set(observation.id, anchored);
+    return anchored;
+  };
+
+  return (observations || []).filter((observation) => isAnchored(observation));
+}
+
+export function mergeConversationViewObservations(canonicalRows, observations) {
+  const rows = Array.isArray(canonicalRows) ? canonicalRows.map((row) => ({ ...row })) : [];
+  const observed = Array.isArray(observations) ? observations.filter(Boolean) : [];
+  const rowIndexById = new Map();
+  const rebuildIndex = () => {
+    rowIndexById.clear();
+    rows.forEach((row, index) => {
+      if (row?.id) rowIndexById.set(row.id, index);
+      if (row?.nodeId) rowIndexById.set(row.nodeId, index);
+    });
+  };
+  rebuildIndex();
+
+  for (const observation of observed) {
+    const existingIndex = rowIndexById.get(observation.id);
+    if (existingIndex != null) {
+      rows[existingIndex] = mergeCanonicalAndObservedView(rows[existingIndex], observation);
+      rebuildIndex();
+      continue;
+    }
+
+    const nextRow = { ...observation, observationOnly: true };
+    const insertionIndex = observationInsertionIndex(rows, nextRow);
+    rows.splice(insertionIndex, 0, nextRow);
+    rebuildIndex();
+  }
+  return rows;
+}
+
+function mergeCanonicalAndObservedView(canonical, observation) {
+  const canonicalFinished = isFinishedViewMessage(canonical);
+  const observedFinished = isFinishedViewMessage(observation);
+  const preserveCanonicalLifecycle = canonicalFinished && !observedFinished;
+  return {
+    ...canonical,
+    ...observation,
+    nodeId: canonical.nodeId || observation.nodeId,
+    siblingIndex: canonical.siblingIndex ?? observation.siblingIndex,
+    siblingCount: canonical.siblingCount ?? observation.siblingCount,
+    siblingNodeIds: canonical.siblingNodeIds || observation.siblingNodeIds,
+    text: mergeProgressiveText(canonical.text, observation.text),
+    thought: mergeProgressiveText(canonical.thought, observation.thought) || null,
+    tool: mergeToolObservation(canonical.tool, observation.tool),
+    metadata: mergeObservedMetadata(canonical.metadata, observation.metadata),
+    status: preserveCanonicalLifecycle ? canonical.status : (observation.status ?? canonical.status),
+    endTurn: preserveCanonicalLifecycle ? canonical.endTurn : (observation.endTurn ?? canonical.endTurn),
+    error: canonical.error || observation.error || false,
+    live: preserveCanonicalLifecycle ? false : Boolean(observation.live),
+    isThinking: preserveCanonicalLifecycle ? false : Boolean(observation.isThinking),
+    unrecognized: Boolean(canonical.unrecognized || observation.unrecognized),
+  };
+}
+
+function isFinishedViewMessage(message) {
+  const status = String(message?.status || "");
+  return message?.endTurn === true || status === "finished_successfully" || status === "finished" || status === "failed";
+}
+
+function observationInsertionIndex(rows, observation) {
+  if (observation.parentId) {
+    let parentIndex = -1;
+    for (let index = 0; index < rows.length; index += 1) {
+      if (rows[index]?.id === observation.parentId || rows[index]?.nodeId === observation.parentId) parentIndex = index;
+    }
+    if (parentIndex >= 0) {
+      let index = parentIndex + 1;
+      while (index < rows.length && rows[index]?.observationOnly && rows[index]?.parentId === observation.parentId) index += 1;
+      return index;
+    }
+  }
+
+  const time = Number(observation.createTime || 0);
+  if (time > 0) {
+    let insertAfter = -1;
+    for (let index = 0; index < rows.length; index += 1) {
+      const rowTime = Number(rows[index]?.createTime || 0);
+      if (rowTime > 0 && rowTime <= time) insertAfter = index;
+    }
+    if (insertAfter >= 0) return insertAfter + 1;
+  }
+  return rows.length;
 }
 
 export function estimateMessageHeight(message) {

@@ -7,8 +7,18 @@
   import Composer from '../components/Composer.svelte';
   import { createTransport } from '../lib/transport.js';
   import { downloadConversationMarkdown } from '../lib/export.js';
-import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUserSettings, DEFAULT_SETTINGS, THINKING_LEVELS } from '../lib/storage.js';
+import {
+  loadConversationIndex,
+  loadObservationLedger,
+  saveConversationIndex,
+  saveObservationLedger,
+  loadUserSettings,
+  saveUserSettings,
+  DEFAULT_SETTINGS,
+  THINKING_LEVELS,
+} from '../lib/storage.js';
   import {
+    buildConversationRecordView,
     buildConversationView,
     contentToText,
     consumeSse,
@@ -22,20 +32,20 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     fingerprintCapture,
     getToolMessageInfo,
     groupConversationTurns,
-    mergeConversationPayload,
+    hydrateConversationObservations,
+    ingestConversationMessage,
+    ingestConversationPayload,
     parseJson,
     parseWebMobilePartialConversation,
     resolveConversationScope,
+    setConversationRecordTerminal,
     stepConversationBranch,
-    upsertLiveMessage,
   } from '../../core.js';
 
   const transport = createTransport();
   let status = $state({ bridgeReady: false, captureMode: null });
   let conversationMap = $state(new Map());
-  let payloads = $state(new Map());
-  let terminals = $state(new Map());
-  let liveMessages = $state(new Map());
+  let conversationRecords = $state(new Map());
   let pendingUser = $state(null);
   let currentConversationId = $state(null);
   let loadingConversationId = $state(null);
@@ -47,11 +57,14 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
   let sendInFlight = $state(false);
   let pendingCommandId = null;
   let pendingCommandConversationId = null;
-  let sidebarOpen = $state(false);
-  let overviewOpen = $state(false);
-  let overviewPointerIntent = null;
+  let compactLayout = $state(true);
+  let mobilePanel = $state('none');
+  let panelPointerIntent = null;
   let activeTurnIndex = $state(0);
   let saveTimer = null;
+  let persistMaxTimer = null;
+  let persistInFlight = false;
+  let persistQueued = false;
   let sendTimer = null;
   let navigationTimer = null;
   let userSettings = $state({ ...DEFAULT_SETTINGS });
@@ -59,7 +72,7 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
   let workStates = $state(new Map());
   let newChatWorkState = $state('unknown');
   const MAX_CAPTURE_BUFFER = 20 * 1024 * 1024;
-  const MAX_CACHED_PAYLOADS = 24;
+  const MAX_CACHED_CONVERSATIONS = 24;
   const sseBuffers = new Map();
   const xhrBuffers = new Map();
   const captureConversationIds = new Map();
@@ -68,7 +81,8 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
   const recentFingerprints = new Map();
 
   const conversations = $derived([...conversationMap.values()].sort((a, b) => (Number(b.update_time) || 0) - (Number(a.update_time) || 0)));
-  const currentPayload = $derived(currentConversationId ? payloads.get(currentConversationId) : null);
+  const currentRecord = $derived(currentConversationId ? conversationRecords.get(currentConversationId) || null : null);
+  const currentPayload = $derived(currentRecord?.payload || null);
   const currentHasRenderableContent = $derived(Boolean(
     currentConversationId && hasRenderableConversationContent(currentConversationId)
   ));
@@ -77,19 +91,11 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
   const messages = $derived.by(() => {
     const id = displayConversationId;
     if (!id) return [];
-    const payload = payloads.get(id) || null;
-    const live = liveMessages.get(id) || [];
-    const liveRows = live.filter(Boolean);
-    const liveById = new Map(liveRows.map((item) => [item.id, item]));
-    const liveIds = new Set(liveRows.map((item) => item.id));
-    let rows = payload
-      ? buildConversationView(payload, terminals.get(id)).filter((row) => !liveIds.has(row.id))
-      : [];
-    rows = rows.map((row) => liveById.has(row.id) ? { ...row, ...liveById.get(row.id) } : row);
+    const record = conversationRecords.get(id) || null;
+    let rows = record ? buildConversationRecordView(record) : [];
     if (pendingUser && pendingUser.conversationId === id) rows.push(pendingUser.message);
-    for (const item of liveRows) if (!liveById.has(item.id) || !rows.some((row) => row.id === item.id)) rows.push(item);
     // De-duplicate by id while keeping order; guard against overlapping graph
-    // and live captures of the same message.
+    // and independently observed versions of the same message.
     const seen = new Set();
     rows = rows.filter((row) => {
       const key = row?.id || row?.nodeId;
@@ -113,7 +119,7 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
   const conversationWorkLabel = $derived(workStateLabel(conversationWorkState));
   const conversationActivelyWorking = $derived(conversationWorkState === 'running' || conversationWorkState === 'starting');
   const conversationThinkingDepth = $derived.by(() => {
-    const payload = currentConversationId ? payloads.get(currentConversationId) : null;
+    const payload = currentConversationId ? conversationRecords.get(currentConversationId)?.payload || null : null;
     return payload ? conversationThinkingLevel(payload) : null;
   });
   const effectiveThinkingLevel = $derived(
@@ -123,7 +129,7 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
   // polling internals. Updated only when derived state actually changes.
   $effect(() => {
     if (typeof window === 'undefined') return;
-    const live = currentConversationId ? liveMessages.get(currentConversationId) || [] : [];
+    const live = currentConversationId ? conversationRecords.get(currentConversationId)?.observations || [] : [];
     const lastAssistant = [...live].reverse().find((message) => message?.role !== 'user' && message?.role !== 'tool');
     window.__SLIMGPT_DEBUG__ = {
       workState: conversationWorkState,
@@ -160,19 +166,42 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
 
   onMount(() => {
     let unsubscribe = transport.subscribe(handleTransportMessage);
+    const layoutQuery = matchMedia('(max-width: 960px), (pointer: coarse)');
+    const syncLayout = () => {
+      const touchCompact = navigator.maxTouchPoints > 0 && matchMedia('(pointer: coarse)').matches;
+      const nextCompact = window.innerWidth <= 960 || touchCompact;
+      if (nextCompact !== compactLayout) {
+        compactLayout = nextCompact;
+        mobilePanel = 'none';
+      }
+    };
+    layoutQuery.addEventListener?.('change', syncLayout);
+    window.addEventListener('resize', syncLayout);
+    window.visualViewport?.addEventListener('resize', syncLayout);
+    const flushWhenHidden = () => {
+      if (document.visibilityState === 'hidden') void flushPersist();
+    };
+    document.addEventListener('visibilitychange', flushWhenHidden);
+    syncLayout();
     transport.start();
     restoreIndex();
+    restoreObservationLedger();
     restoreSettings();
     return () => {
       unsubscribe?.();
       transport.stop();
       clearTimeout(saveTimer);
+      clearTimeout(persistMaxTimer);
       clearTimeout(sendTimer);
       clearTimeout(navigationTimer);
       sseBuffers.clear();
       xhrBuffers.clear();
       captureConversationIds.clear();
       conflictedCaptureIds.clear();
+      layoutQuery.removeEventListener?.('change', syncLayout);
+      window.removeEventListener('resize', syncLayout);
+      window.visualViewport?.removeEventListener('resize', syncLayout);
+      document.removeEventListener('visibilitychange', flushWhenHidden);
     };
   });
 
@@ -182,6 +211,22 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
       conversationMap = new Map(items.filter((item) => item?.id).map((item) => [item.id, normalizeConversationMeta(item)]));
     } catch {
       setComposerStatus('无法读取本地会话索引；当前聊天仍可正常使用', true);
+    }
+  }
+
+  async function restoreObservationLedger() {
+    try {
+      const entries = await loadObservationLedger();
+      if (!entries.length) return;
+      const next = new Map(conversationRecords);
+      for (const entry of entries) {
+        if (!entry?.id || !Array.isArray(entry.observations)) continue;
+        next.set(entry.id, hydrateConversationObservations(next.get(entry.id), entry.observations));
+      }
+      conversationRecords = next;
+    } catch {
+      // The server/canonical conversation remains authoritative if the local
+      // observation cache cannot be restored.
     }
   }
 
@@ -353,9 +398,12 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
       if (scope.conflicted || !scope.conversationId) continue;
       const id = scope.conversationId;
       maybeActivateCapturedConversation(id, capture);
-      const next = new Map(liveMessages);
-      next.set(id, upsertLiveMessage(next.get(id) || [], event.message));
-      liveMessages = next;
+      const next = new Map(conversationRecords);
+      next.set(id, ingestConversationMessage(next.get(id), event.message, {
+        textMode: capture.transport === 'dom' ? 'snapshot' : 'progressive',
+      }));
+      conversationRecords = next;
+      schedulePersist();
       updateConversationPreviewFromMessage(id, event.message);
       if (id === currentConversationId) {
         if (hasRenderableConversationContent(id) && (loadingConversationId === id || navigationTimedOutId === id)) {
@@ -428,33 +476,24 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
   }
 
   function acceptConversationPayload(id, payload) {
-    const nextPayloads = new Map(payloads);
-    const nextTerminals = new Map(terminals);
-    const nextLive = new Map(liveMessages);
+    const nextRecords = new Map(conversationRecords);
+    const record = ingestConversationPayload(nextRecords.get(id), payload);
+    const mergedPayload = record.payload;
+    nextRecords.set(id, record);
 
-    const previousPayload = nextPayloads.get(id) || null;
-    const mergedPayload = previousPayload ? mergeConversationPayload(previousPayload, payload) : payload;
-    nextPayloads.set(id, mergedPayload);
-    nextTerminals.set(id, mergedPayload.current_node);
-    nextLive.set(id, retainLiveMessagesBeyondPayload(nextLive.get(id) || [], mergedPayload));
-
-    // Evict oldest cached conversation trees if exceeding limit.
-    while (nextPayloads.size > MAX_CACHED_PAYLOADS) {
+    // Bound memory by whole conversations, never by a sliding message window.
+    while (nextRecords.size > MAX_CACHED_CONVERSATIONS) {
       let evictedId = null;
-      for (const candidateId of nextPayloads.keys()) {
+      for (const candidateId of nextRecords.keys()) {
         if (candidateId === id || candidateId === currentConversationId) continue;
         evictedId = candidateId;
         break;
       }
       if (!evictedId) break;
-      nextPayloads.delete(evictedId);
-      nextTerminals.delete(evictedId);
-      nextLive.delete(evictedId);
+      nextRecords.delete(evictedId);
     }
 
-    payloads = nextPayloads;
-    terminals = nextTerminals;
-    liveMessages = nextLive;
+    conversationRecords = nextRecords;
     const next = new Map(conversationMap);
     const previous = next.get(id) || {};
     const details = conversationDetailsFromPayload(mergedPayload, previous);
@@ -478,24 +517,6 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     if (loadingConversationId === id) finishConversationLoading();
     reconcilePendingAgainstPayload(id, mergedPayload);
     schedulePersist();
-  }
-
-  function retainLiveMessagesBeyondPayload(live, payload) {
-    if (!Array.isArray(live) || !live.length || !payload?.mapping) return live || [];
-    const canonicalByMessageId = new Map();
-    for (const node of Object.values(payload.mapping)) {
-      const message = node?.message;
-      if (message?.id) canonicalByMessageId.set(message.id, message);
-    }
-    return live.filter((item) => {
-      const canonical = canonicalByMessageId.get(item?.id);
-      if (!canonical) return true;
-      const canonicalText = contentToText(canonical.content, canonical.metadata || {});
-      const canonicalFinished = canonical.end_turn === true ||
-        ['finished_successfully', 'finished', 'failed'].includes(String(canonical.status || ''));
-      if (canonicalFinished) return false;
-      return String(item?.text || '').length > String(canonicalText || '').length;
-    });
   }
 
   function handlePageLocation(url) {
@@ -525,16 +546,14 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
       setComposerStatus('当前消息仍在提交，请等待确认后再切换对话', true);
       return;
     }
-    if (!id || (id === currentConversationId && payloads.has(id))) {
-      sidebarOpen = false;
-      overviewOpen = false;
+    if (!id || (id === currentConversationId && conversationRecords.get(id)?.payload)) {
+      closeMobilePanels();
       return;
     }
     setCurrentConversation(id);
     thinkingLevelOverride = null;
     startConversationLoading(id);
-    sidebarOpen = false;
-    overviewOpen = false;
+    closeMobilePanels();
     if (transport.supportsLiveChat) {
       const route = conversationMap.get(id)?.route === 'uc' ? 'uc' : 'c';
       transport.send({ type: 'navigate-conversation', conversationId: id, route });
@@ -552,8 +571,7 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     newChatWorkState = 'unknown';
     finishConversationLoading();
     pendingUser = null;
-    sidebarOpen = false;
-    overviewOpen = false;
+    closeMobilePanels();
     if (transport.supportsLiveChat) {
       transport.send({ type: 'new-chat', thinkingLevel: userSettings.thinkingLevel });
     }
@@ -620,9 +638,11 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
 
   function hasRenderableConversationContent(id) {
     if (!id) return false;
-    if (payloads.has(id)) return true;
-    const live = liveMessages.get(id) || [];
-    return live.some((message) => String(message?.text || '').trim());
+    const record = conversationRecords.get(id);
+    if (record?.payload) return true;
+    return (record?.observations || []).some((message) =>
+      String(message?.text || message?.thought || '').trim() || message?.tool
+    );
   }
 
   function exportMarkdown() {
@@ -649,7 +669,7 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
       setComposerStatus('ChatGPT 页面桥尚未就绪', true);
       return;
     }
-    if (currentPayload && currentConversationId && terminals.get(currentConversationId) !== currentPayload.current_node) {
+    if (currentPayload && currentConversationId && currentRecord?.terminal !== currentPayload.current_node) {
       setComposerStatus('当前正在只读查看其他分支；请切回最新分支，或在官方界面继续该分支', true);
       return;
     }
@@ -790,8 +810,9 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
   function stepBranch(nodeId, delta) {
     if (!currentPayload || !currentConversationId) return;
     const terminal = stepConversationBranch(currentPayload, nodeId, delta);
-    terminals = new Map(terminals).set(currentConversationId, terminal);
-    liveMessages = new Map(liveMessages).set(currentConversationId, []);
+    const next = new Map(conversationRecords);
+    next.set(currentConversationId, setConversationRecordTerminal(next.get(currentConversationId), terminal));
+    conversationRecords = next;
     if (terminal !== currentPayload.current_node) setComposerStatus('正在只读查看其他分支；发送前请切回最新分支');
     else setComposerStatus('已回到最新分支');
   }
@@ -803,13 +824,37 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
 
   function schedulePersist() {
     clearTimeout(saveTimer);
-    saveTimer = setTimeout(async () => {
-      try {
-        await saveConversationIndex(conversations);
-      } catch {
-        setComposerStatus('无法保存本地会话索引；当前聊天不受影响', true);
+    saveTimer = setTimeout(() => void flushPersist(), 500);
+    if (!persistMaxTimer) persistMaxTimer = setTimeout(() => void flushPersist(), 3_000);
+  }
+
+  async function flushPersist() {
+    clearTimeout(saveTimer);
+    clearTimeout(persistMaxTimer);
+    saveTimer = null;
+    persistMaxTimer = null;
+    if (persistInFlight) {
+      persistQueued = true;
+      return;
+    }
+
+    persistInFlight = true;
+    const indexSnapshot = [...conversations];
+    const recordsSnapshot = new Map(conversationRecords);
+    try {
+      await Promise.all([
+        saveConversationIndex(indexSnapshot),
+        saveObservationLedger(recordsSnapshot),
+      ]);
+    } catch {
+      setComposerStatus('无法保存本地会话缓存；当前聊天不受影响', true);
+    } finally {
+      persistInFlight = false;
+      if (persistQueued) {
+        persistQueued = false;
+        schedulePersist();
       }
-    }, 500);
+    }
   }
 
   function normalizeConversationMeta(item, previous = {}) {
@@ -869,22 +914,23 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
 
   function selectOverviewMessage(index) {
     activeTurnIndex = Math.max(0, Math.min(turns.length - 1, Number(index) || 0));
-    overviewOpen = false;
+    closeMobilePanels();
   }
 
   function toggleSidebar() {
-    sidebarOpen = !sidebarOpen;
-    if (sidebarOpen) overviewOpen = false;
+    if (!compactLayout) return;
+    mobilePanel = mobilePanel === 'sidebar' ? 'none' : 'sidebar';
   }
 
   function toggleOverview() {
-    overviewOpen = !overviewOpen;
-    if (overviewOpen) sidebarOpen = false;
+    if (!compactLayout) return;
+    mobilePanel = mobilePanel === 'overview' ? 'none' : 'overview';
   }
 
-  function beginOverviewPointer(event) {
-    if (event.isPrimary === false) return;
-    overviewPointerIntent = {
+  function beginPanelPointer(event, panel) {
+    if (!event.isTrusted || event.isPrimary === false) return;
+    panelPointerIntent = {
+      panel,
       pointerId: event.pointerId,
       x: event.clientX,
       y: event.clientY,
@@ -892,40 +938,52 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     };
   }
 
-  function finishOverviewPointer(event) {
-    const intent = overviewPointerIntent;
-    overviewPointerIntent = null;
-    if (!intent || intent.pointerId !== event.pointerId) return;
+  function finishPanelPointer(event, panel) {
+    const intent = panelPointerIntent;
+    panelPointerIntent = null;
+    if (!event.isTrusted || !intent || intent.pointerId !== event.pointerId || intent.panel !== panel) return;
     const moved = Math.hypot(event.clientX - intent.x, event.clientY - intent.y);
     const elapsed = performance.now() - intent.startedAt;
     if (moved > 10 || elapsed > 900) return;
     event.preventDefault();
     event.stopPropagation();
-    toggleOverview();
+    if (panel === 'overview') toggleOverview();
+    else if (panel === 'sidebar') toggleSidebar();
   }
 
-  function cancelOverviewPointer() {
-    overviewPointerIntent = null;
+  function cancelPanelPointer() {
+    panelPointerIntent = null;
   }
 
-  function handleOverviewClick(event) {
+  function handlePanelClick(event, panel) {
     // Pointer activation is handled on pointerup so a swipe/drag ending over
     // the navbar cannot synthesize an accidental drawer-open click. Preserve
     // trusted keyboard activation (Enter/Space), but ignore scripted clicks.
     event.preventDefault();
-    if (event.isTrusted && event.detail === 0) toggleOverview();
+    if (!(event.isTrusted && event.detail === 0)) return;
+    if (panel === 'overview') toggleOverview();
+    else if (panel === 'sidebar') toggleSidebar();
   }
 
   function closeMobilePanels() {
-    sidebarOpen = false;
-    overviewOpen = false;
+    mobilePanel = 'none';
+    panelPointerIntent = null;
   }
 </script>
 
-<Page class="slimgpt-page">
+<Page class={`slimgpt-page ${compactLayout ? 'compact-layout' : 'desktop-layout'}`}>
   <Navbar class="mobile-navbar">
     <NavLeft>
-      <Button small onClick={toggleSidebar}>☰</Button>
+      <button
+        type="button"
+        class="button button-small mobile-sidebar-button"
+        aria-expanded={mobilePanel === 'sidebar'}
+        aria-controls="slimgpt-mobile-sidebar"
+        onpointerdown={(event) => beginPanelPointer(event, 'sidebar')}
+        onpointerup={(event) => finishPanelPointer(event, 'sidebar')}
+        onpointercancel={cancelPanelPointer}
+        onclick={(event) => handlePanelClick(event, 'sidebar')}
+      >☰</button>
     </NavLeft>
     <div class="mobile-title">
       <span>{currentMeta?.title || 'SlimGPT'}</span>
@@ -942,18 +1000,23 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
       <button
         type="button"
         class="button button-small mobile-overview-button"
-        aria-expanded={overviewOpen}
+        aria-expanded={mobilePanel === 'overview'}
         aria-controls="slimgpt-mobile-overview"
-        onpointerdown={beginOverviewPointer}
-        onpointerup={finishOverviewPointer}
-        onpointercancel={cancelOverviewPointer}
-        onclick={handleOverviewClick}
+        onpointerdown={(event) => beginPanelPointer(event, 'overview')}
+        onpointerup={(event) => finishPanelPointer(event, 'overview')}
+        onpointercancel={cancelPanelPointer}
+        onclick={(event) => handlePanelClick(event, 'overview')}
       >概览</button>
     </NavRight>
   </Navbar>
 
   <div class="app-shell">
-    <div class:open={sidebarOpen} class="sidebar-host">
+    <div
+      id="slimgpt-mobile-sidebar"
+      class:open={compactLayout && mobilePanel === 'sidebar'}
+      class="sidebar-host"
+      hidden={compactLayout && mobilePanel !== 'sidebar'}
+    >
       <ConversationSidebar
         {conversations}
         currentId={currentConversationId}
@@ -1029,7 +1092,12 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
       />
     </main>
 
-    <div id="slimgpt-mobile-overview" class:open={overviewOpen} class="overview-host">
+    <div
+      id="slimgpt-mobile-overview"
+      class:open={compactLayout && mobilePanel === 'overview'}
+      class="overview-host"
+      hidden={compactLayout && mobilePanel !== 'overview'}
+    >
       <MessageOverview
         {turns}
         activeIndex={activeTurnIndex}
@@ -1037,7 +1105,7 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
       />
     </div>
 
-    {#if sidebarOpen || overviewOpen}
+    {#if compactLayout && mobilePanel !== 'none'}
       <button class="sidebar-scrim" aria-label="关闭侧栏" onclick={closeMobilePanels}></button>
     {/if}
   </div>

@@ -10,7 +10,11 @@ test('all browser packages use the same permission-light takeover architecture',
     const manifest = JSON.parse(await readFile(path, 'utf8'));
     assert.equal(manifest.version, packageJson.version, `${path} version must match package.json`);
     assert.equal(manifest.background, undefined, `${path} must not have a background transport`);
-    assert.equal(manifest.permissions, undefined, `${path} must not request extension permissions`);
+    assert.deepEqual(
+      manifest.permissions,
+      ['storage'],
+      `${path} may only request local extension storage for the conversation observation ledger`,
+    );
     assert.deepEqual(manifest.host_permissions, ['https://chatgpt.com/*']);
     assert.ok(
       manifest.content_scripts.some((script) => script.js?.includes('isolated-bridge.js')),
