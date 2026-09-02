@@ -121,7 +121,7 @@ function parseSseBlock(block) {
   return { event, id, data: text, json: parseJson(text) };
 }
 
-export function findConversationPayload(root) {
+export function findConversationPayload(root, options = {}) {
   if (!root || typeof root !== "object") return null;
   const stack = [root];
   const visited = new WeakSet();
@@ -134,11 +134,11 @@ export function findConversationPayload(root) {
     if (value.mapping && typeof value.mapping === "object" && value.current_node) return value;
     if (
       Array.isArray(value.messages) &&
-      value.current_node &&
-      (value.conversation_id || value.id) &&
+      (value.current_node || value.page_info) &&
+      (value.conversation_id || value.id || options.conversationId) &&
       value.messages.some(looksLikeMessage)
     ) {
-      return optimizedConversationToCanonical(value);
+      return optimizedConversationToCanonical(value, options);
     }
     const children = Object.values(value);
     for (let index = children.length - 1; index >= 0; index -= 1) {
@@ -183,6 +183,10 @@ export function mergeConversationPayload(previous, incoming) {
   }
 
   const currentNode = selectMergedConversationCurrentNode(previous, incoming, mapping);
+  const messageOrder = uniqueStrings([
+    ...(Array.isArray(previous.message_order) ? previous.message_order : []),
+    ...(Array.isArray(incoming.message_order) ? incoming.message_order : []),
+  ]);
   return {
     ...previous,
     ...incoming,
@@ -192,6 +196,7 @@ export function mergeConversationPayload(previous, incoming) {
     },
     mapping,
     current_node: currentNode,
+    ...(messageOrder.length ? { message_order: messageOrder } : {}),
   };
 }
 
@@ -457,9 +462,9 @@ function isConversationAncestor(mapping, ancestorId, descendantId) {
   return false;
 }
 
-function optimizedConversationToCanonical(value) {
+function optimizedConversationToCanonical(value, options = {}) {
   const mapping = {};
-  let previousId = null;
+  const messageOrder = [];
 
   for (const message of value.messages) {
     if (!looksLikeMessage(message)) continue;
@@ -467,14 +472,14 @@ function optimizedConversationToCanonical(value) {
     const requestedParent = message.metadata?.parent_id || message.parent_id || null;
     const parent = requestedParent && requestedParent !== id
       ? String(requestedParent)
-      : previousId;
+      : null;
     mapping[id] = {
       id,
       parent,
       children: [],
       message,
     };
-    previousId = id;
+    messageOrder.push(id);
   }
 
   for (const node of Object.values(mapping)) {
@@ -485,14 +490,16 @@ function optimizedConversationToCanonical(value) {
     else if (!node.parent) node.parent = null;
   }
 
-  const { messages, conversation_id: conversationId, ...rest } = value;
-  const currentNode = mapping[value.current_node] ? value.current_node : previousId;
+  const { messages, conversation_id: declaredConversationId, ...rest } = value;
+  const conversationId = declaredConversationId || value.id || options.conversationId || null;
+  const currentNode = mapping[value.current_node] ? value.current_node : null;
   return {
     ...rest,
     id: value.id || conversationId,
     conversation_id: conversationId || value.id,
     mapping,
     current_node: currentNode,
+    message_order: messageOrder,
     metadata: {
       ...(rest.metadata || {}),
       source: rest.metadata?.source || "optimized-conversation",
@@ -611,6 +618,83 @@ export function findMessageEvents(value) {
   return dedupeMessageEvents(output);
 }
 
+const CONVERSATION_LIFECYCLE_EVENT_TYPES = new Set([
+  "conversation-update",
+  "conversation_update",
+  "main-stream-complete",
+  "main_stream_complete",
+  "input-message",
+  "input_message",
+  "add-conversation-item",
+  "add_conversation_item",
+  "add-turn-message",
+  "add_turn_message",
+  "replace-turn-message",
+  "replace_turn_message",
+  "convert-turn-to-paragen",
+  "convert_turn_to_paragen",
+  "resolve-paragen",
+  "resolve_paragen",
+  "discard-items",
+  "discard_items",
+]);
+
+// New chats begin life under an official client-only WEB:* thread id.  The
+// server announces the durable conversation id in protocol lifecycle events
+// before every visible message necessarily carries that id.  Keep this
+// extraction deliberately narrow: arbitrary tool payloads may contain other
+// conversation ids and must never steal ownership of the active turn.
+export function findConversationLifecycleEvents(root) {
+  if (!root || typeof root !== "object") return [];
+  const output = [];
+  const stack = [{ value: root, context: {} }];
+  const visited = new WeakSet();
+  let inspected = 0;
+
+  while (stack.length && inspected < 12_000) {
+    const entry = stack.pop();
+    const value = entry?.value;
+    if (!value || typeof value !== "object" || visited.has(value)) continue;
+    visited.add(value);
+    inspected += 1;
+
+    const context = mergeMessageEventContext(entry.context, value);
+    const rawType = firstNonEmptyString(value.type, value.event) || "";
+    const normalizedType = rawType.toLowerCase();
+    const conversationId = firstNonEmptyString(value.conversation_id, value.conversationId) || null;
+    if (
+      conversationId &&
+      !isProvisionalConversationId(conversationId) &&
+      CONVERSATION_LIFECYCLE_EVENT_TYPES.has(normalizedType)
+    ) {
+      output.push({
+        ...context,
+        type: rawType,
+        conversationId,
+      });
+    }
+
+    for (const child of Object.values(value)) {
+      if (!child || typeof child !== "object") continue;
+      stack.push({ value: child, context });
+    }
+  }
+
+  const seen = new Set();
+  return output.filter((event) => {
+    const key = [
+      event.conversationId,
+      String(event.type || "").toLowerCase(),
+      event.turnId || "",
+      event.responseId || "",
+      event.itemId || "",
+    ].join("\u0000");
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 function collectMessageEvents(root, output) {
   if (!root || typeof root !== "object") return;
   const stack = [{
@@ -725,6 +809,7 @@ function mergeMessageEventContext(previous, value) {
 function mergeConversationScope(scope, candidate) {
   if (scope.conflicted || typeof candidate !== "string" || !candidate.trim()) return scope;
   const conversationId = candidate.trim();
+  if (isProvisionalConversationId(conversationId)) return scope;
   if (scope.conversationId && scope.conversationId !== conversationId) {
     return { conversationId: null, conflicted: true };
   }
@@ -784,7 +869,7 @@ function looksLikeMessage(value) {
 
 export function conversationIdFromPayload(payload, fallbackUrl = "") {
   const direct = payload?.conversation_id || payload?.conversationId || payload?.id;
-  if (typeof direct === "string" && direct) return direct;
+  if (typeof direct === "string" && direct && !isProvisionalConversationId(direct)) return direct;
   return conversationIdFromUrl(fallbackUrl);
 }
 
@@ -793,6 +878,7 @@ export function resolveConversationScope(...candidates) {
   for (const candidate of candidates) {
     if (typeof candidate !== "string" || !candidate.trim()) continue;
     const normalized = candidate.trim();
+    if (isProvisionalConversationId(normalized)) continue;
     if (conversationId && conversationId !== normalized) {
       return { conversationId: null, conflicted: true };
     }
@@ -806,13 +892,21 @@ export function conversationIdFromUrl(url) {
   try {
     const parsed = new URL(url, "https://chatgpt.com/");
     const routeMatch = parsed.pathname.match(/\/(?:c|uc)\/([^/?#]+)/);
-    if (routeMatch) return routeMatch[1];
-    const apiMatch = parsed.pathname.match(/^\/backend-api\/(?:f\/)?conversations?\/([^/?#]+)\/?$/);
-    if (apiMatch && !["prepare", "resume", "runtime"].includes(apiMatch[1])) return apiMatch[1];
+    if (routeMatch && !isProvisionalConversationId(routeMatch[1])) return routeMatch[1];
+    const apiMatch = parsed.pathname.match(/^\/backend-api\/(?:f\/)?conversations?\/([^/?#]+)(?:\/messages)?\/?$/);
+    if (
+      apiMatch &&
+      !["prepare", "resume", "runtime", "messages"].includes(apiMatch[1]) &&
+      !isProvisionalConversationId(apiMatch[1])
+    ) return apiMatch[1];
   } catch {
     // Ignore malformed URLs from transient capture records.
   }
   return null;
+}
+
+export function isProvisionalConversationId(value) {
+  return typeof value === "string" && /^WEB:/i.test(value.trim());
 }
 
 export function buildConversationView(payload, terminalId = null) {
@@ -838,6 +932,35 @@ export function buildConversationView(payload, terminalId = null) {
       return Boolean(getToolMessageInfo(message) || extractThought(message));
     })
     .map((node) => messageNodeToView(node, mapping));
+}
+
+function buildCanonicalConversationView(payload, terminalId = null) {
+  if (!payload?.mapping || typeof payload.mapping !== "object") return [];
+  const targetId = terminalId || payload.current_node;
+  if (
+    !Array.isArray(payload.message_order) ||
+    !payload.message_order.length ||
+    (targetId && (!payload.message_order.includes(targetId) || targetId !== payload.current_node))
+  ) {
+    return buildConversationView(payload, targetId);
+  }
+  const rows = [];
+  for (let index = 0; index < payload.message_order.length; index += 1) {
+    const id = payload.message_order[index];
+    const node = payload.mapping[id];
+    const message = node?.message;
+    if (!message) continue;
+    if (
+      message.metadata?.is_visually_hidden_from_conversation &&
+      !getToolMessageInfo(message) &&
+      !extractThought(message)
+    ) continue;
+    rows.push({
+      ...messageNodeToView(node, payload.mapping),
+      canonicalOrdinal: index,
+    });
+  }
+  return rows;
 }
 
 export function groupConversationTurns(messages) {
@@ -1126,16 +1249,35 @@ function normalizedObservationIdentity(message, context = {}) {
 
 function observationIdentitiesCompatible(left, right) {
   if (!left || !right) return true;
-  for (const key of ["responseId", "itemId", "outputIndex", "callId", "toolCallId", "phase", "itemKind"]) {
+  for (const key of ["responseId", "itemId", "outputIndex", "callId", "toolCallId", "phase"]) {
     const leftValue = left[key];
     const rightValue = right[key];
     if (leftValue != null && rightValue != null && leftValue !== rightValue) return false;
+  }
+  if (
+    left.itemKind != null &&
+    right.itemKind != null &&
+    left.itemKind !== right.itemKind &&
+    !isGenericObservationKind(left) &&
+    !isGenericObservationKind(right)
+  ) {
+    return false;
   }
   if (left.callIds?.length && right.callIds?.length) {
     const overlap = left.callIds.some((value) => right.callIds.includes(value));
     if (!overlap && (left.callId || left.toolCallId) && (right.callId || right.toolCallId)) return false;
   }
   return true;
+}
+
+function isGenericObservationKind(identity) {
+  return Boolean(
+    identity &&
+    !identity.contentType &&
+    identity.itemKind &&
+    identity.role &&
+    identity.itemKind === identity.role
+  );
 }
 
 function observationSubjectsMatch(left, right) {
@@ -1855,12 +1997,57 @@ export function createConversationRecord(previous = null) {
     payload: previous?.payload || null,
     terminal: previous?.terminal || previous?.payload?.current_node || null,
     canonicalComplete: Boolean(previous?.canonicalComplete),
+    canonicalSyncId: previous?.canonicalSyncId || null,
+    canonicalSyncPayload: previous?.canonicalSyncPayload || null,
     observations: Array.isArray(previous?.observations) ? previous.observations : [],
   };
 }
 
 export function ingestConversationPayload(record, incomingPayload, options = {}) {
   const previous = createConversationRecord(record);
+  const canonicalSyncId = typeof options.canonicalSyncId === "string" && options.canonicalSyncId
+    ? options.canonicalSyncId
+    : null;
+  if (canonicalSyncId) {
+    const startsNewSync = previous.canonicalSyncId !== canonicalSyncId || options.canonicalPageIndex === 0;
+    const stagedBase = startsNewSync ? null : previous.canonicalSyncPayload;
+    const stagedPayload = stagedBase
+      ? mergeConversationPayload(stagedBase, incomingPayload)
+      : incomingPayload;
+    if (!stagedPayload) return previous;
+    if (options.canonicalComplete !== true) {
+      return {
+        ...previous,
+        canonicalSyncId,
+        canonicalSyncPayload: stagedPayload,
+      };
+    }
+
+    const previousPayload = previous.payload;
+    const canRetainDescendants = Boolean(
+      previousPayload?.mapping &&
+      previousPayload.current_node &&
+      stagedPayload?.current_node &&
+      !stagedPayload.mapping?.[previousPayload.current_node] &&
+      isConversationAncestor(previousPayload.mapping, stagedPayload.current_node, previousPayload.current_node)
+    );
+    const payload = canRetainDescendants
+      ? mergeConversationPayload(stagedPayload, previousPayload)
+      : stagedPayload;
+    const followedLatest = !previousPayload || !previous.terminal || previous.terminal === previousPayload.current_node;
+    const terminal = followedLatest
+      ? payload.current_node
+      : (payload.mapping?.[previous.terminal] ? previous.terminal : payload.current_node);
+    return {
+      payload,
+      terminal,
+      canonicalComplete: true,
+      canonicalSyncId: null,
+      canonicalSyncPayload: null,
+      observations: previous.observations,
+    };
+  }
+
   const explicitCompleteness = Object.prototype.hasOwnProperty.call(options, "canonicalComplete");
   const previousPayload = previous.payload;
   const payload = previousPayload
@@ -1877,6 +2064,8 @@ export function ingestConversationPayload(record, incomingPayload, options = {})
     terminal,
     canonicalComplete: previous.canonicalComplete ||
       (explicitCompleteness ? options.canonicalComplete === true : true),
+    canonicalSyncId: previous.canonicalSyncId,
+    canonicalSyncPayload: previous.canonicalSyncPayload,
     observations: previous.observations,
   };
 }
@@ -1965,7 +2154,7 @@ export function buildConversationRecordView(record) {
 export function buildConversationRecordTurns(record, pendingUserMessage = null) {
   const current = createConversationRecord(record);
   const allPayloadRows = current.payload
-    ? buildConversationView(current.payload, current.terminal || current.payload.current_node)
+    ? buildCanonicalConversationView(current.payload, current.terminal || current.payload.current_node)
     : [];
   const canonical = current.canonicalComplete ? allPayloadRows : [];
   const followingLatest = !current.payload ||
@@ -1994,22 +2183,56 @@ export function buildConversationRecordTurns(record, pendingUserMessage = null) 
   const itemTurn = new Map();
   const responseTurn = new Map();
   const callTurn = new Map();
-  let currentTurn = null;
-
+  // Canonical ChatGPT history is an ordered item stream. Real persisted
+  // pages routinely contain hundreds of reasoning/tool/system items for a
+  // handful of visible user turns, and many legitimate items have no parent
+  // or belong to parallel parent chains. Establish user turns first, then
+  // bind every canonical output by semantic turn identity/proven item chain.
   for (const row of canonicalRows) {
     if (isInternalConversationContext(row)) continue;
     if (isVisibleConversationUser(row)) {
-      currentTurn = createTurnForUser(row, "canonical");
-      turns.push(currentTurn);
-      indexTurn(currentTurn, row, turnByUserId, turnBySemanticId, itemTurn);
-      indexProtocolTurn(currentTurn, row, responseTurn, callTurn);
-      continue;
+      const turn = createTurnForUser(row, "canonical");
+      turns.push(turn);
+      indexTurn(turn, row, turnByUserId, turnBySemanticId, itemTurn);
+      indexProtocolTurn(turn, row, responseTurn, callTurn);
     }
-    if (row?.role === "user") continue;
-    if (!currentTurn) continue;
-    appendTurnReply(currentTurn, row);
-    indexTurnItem(currentTurn, row, itemTurn);
-    indexProtocolTurn(currentTurn, row, responseTurn, callTurn);
+  }
+  const canonicalByMessageId = uniqueObservationByMessageId(canonicalRows);
+  const canonicalUnassigned = new Map();
+  for (const row of canonicalRows) {
+    if (isInternalConversationContext(row) || row?.role === "user") continue;
+    let target = null;
+    let conflicted = false;
+    const semanticResolution = resolveTurnFromSemanticIdentity(row, turnBySemanticId);
+    target = semanticResolution.turn;
+    conflicted = semanticResolution.conflicted;
+    if (!target && !conflicted) {
+      const protocolResolution = resolveTurnFromProtocolIdentity(row, itemTurn, responseTurn, callTurn);
+      target = protocolResolution.turn;
+      conflicted = protocolResolution.conflicted;
+    }
+    if (!target && !conflicted) {
+      target = resolveObservationTurnFromParents(row, canonicalByMessageId, itemTurn);
+    }
+    if (!target) {
+      const key = unresolvedObservationGroupKey(row, canonicalByMessageId, { ignoreIdentity: conflicted });
+      target = canonicalUnassigned.get(key) || null;
+      if (!target) {
+        target = {
+          id: `turn-canonical-unassigned-${key}`,
+          turnKey: `canonical-unassigned:${key}`,
+          user: null,
+          replies: [],
+          source: "canonical-unassigned",
+        };
+        canonicalUnassigned.set(key, target);
+        turns.push(target);
+      }
+    }
+    appendTurnReply(target, row);
+    indexTurnItem(target, row, itemTurn);
+    indexSemanticTurnAliases(target, row, turnBySemanticId);
+    indexProtocolTurn(target, row, responseTurn, callTurn);
   }
 
   if (pendingUserMessage) {
@@ -2304,6 +2527,9 @@ function compareTurnReplyOrder(left, right, leftIndex, rightIndex) {
   const leftSequence = finiteNumber(left?.sequenceNumber);
   const rightSequence = finiteNumber(right?.sequenceNumber);
   if (leftSequence != null && rightSequence != null && leftSequence !== rightSequence) return leftSequence - rightSequence;
+  const leftCanonical = finiteNumber(left?.canonicalOrdinal);
+  const rightCanonical = finiteNumber(right?.canonicalOrdinal);
+  if (leftCanonical != null && rightCanonical != null && leftCanonical !== rightCanonical) return leftCanonical - rightCanonical;
   const leftOrdinal = finiteNumber(left?.observationOrdinal);
   const rightOrdinal = finiteNumber(right?.observationOrdinal);
   if (leftOrdinal != null && rightOrdinal != null && leftOrdinal !== rightOrdinal) return leftOrdinal - rightOrdinal;
@@ -2600,6 +2826,32 @@ function mergeCanonicalAndObservedView(canonical, observation) {
     ...canonical,
     ...observation,
     nodeId: canonical.nodeId || observation.nodeId,
+    parentId: canonical.parentId || observation.parentId || null,
+    itemId: observation.itemId || canonical.itemId || null,
+    turnId: observation.turnId || canonical.turnId || null,
+    turnAliases: uniqueStrings([
+      ...(canonical.turnAliases || []),
+      ...(observation.turnAliases || []),
+    ]),
+    turnExchangeId: observation.turnExchangeId || canonical.turnExchangeId || null,
+    workingTurnId: observation.workingTurnId || canonical.workingTurnId || null,
+    turnRequestId: observation.turnRequestId || canonical.turnRequestId || null,
+    turnTraceId: observation.turnTraceId || canonical.turnTraceId || null,
+    turnUserMessageId: observation.turnUserMessageId || canonical.turnUserMessageId || null,
+    turnParentMessageId: observation.turnParentMessageId || canonical.turnParentMessageId || null,
+    responseId: observation.responseId || canonical.responseId || null,
+    sequenceNumber: observation.sequenceNumber ?? canonical.sequenceNumber ?? null,
+    outputIndex: observation.outputIndex ?? canonical.outputIndex ?? null,
+    callId: observation.callId || canonical.callId || null,
+    toolCallId: observation.toolCallId || canonical.toolCallId || null,
+    callIds: uniqueStrings([
+      ...(canonical.callIds || []),
+      ...(observation.callIds || []),
+    ]),
+    phase: observation.phase || canonical.phase || null,
+    channel: observation.channel || canonical.channel || null,
+    eventType: observation.eventType || canonical.eventType || null,
+    canonicalOrdinal: canonical.canonicalOrdinal ?? observation.canonicalOrdinal ?? null,
     siblingIndex: canonical.siblingIndex ?? observation.siblingIndex,
     siblingCount: canonical.siblingCount ?? observation.siblingCount,
     siblingNodeIds: canonical.siblingNodeIds || observation.siblingNodeIds,

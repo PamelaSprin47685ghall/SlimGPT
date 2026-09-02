@@ -356,3 +356,43 @@ export function extensionStorageArea(
   if (!/^(?:chrome|moz)-extension:$/.test(protocol)) return null;
   return chromeApi?.storage?.local || browserApi?.storage?.local || null;
 }
+
+export function subscribeStorageChanges(
+  listener,
+  protocol = globalThis.location?.protocol || '',
+  chromeApi = globalThis.chrome,
+  browserApi = globalThis.browser,
+  windowApi = globalThis.window,
+) {
+  if (typeof listener !== 'function') return () => {};
+
+  if (/^(?:chrome|moz)-extension:$/.test(protocol)) {
+    const changed = chromeApi?.storage?.onChanged || browserApi?.storage?.onChanged;
+    if (!changed?.addListener) return () => {};
+    const onChanged = (changes, areaName) => {
+      if (areaName && areaName !== 'local') return;
+      const update = {};
+      if (changes?.conversationIndex) update.conversationIndex = changes.conversationIndex.newValue;
+      if (changes?.observationLedger) update.observationLedger = changes.observationLedger.newValue;
+      if (changes?.userSettings) update.userSettings = changes.userSettings.newValue;
+      if (Object.keys(update).length) listener(update);
+    };
+    changed.addListener(onChanged);
+    return () => changed.removeListener?.(onChanged);
+  }
+
+  if (!windowApi?.addEventListener) return () => {};
+  const onStorage = (event) => {
+    const update = {};
+    try {
+      if (event.key === INDEX_KEY) update.conversationIndex = JSON.parse(event.newValue || '[]');
+      else if (event.key === OBSERVATION_LEDGER_KEY) update.observationLedger = JSON.parse(event.newValue || '[]');
+      else if (event.key === SETTINGS_KEY) update.userSettings = JSON.parse(event.newValue || '{}');
+    } catch {
+      return;
+    }
+    if (Object.keys(update).length) listener(update);
+  };
+  windowApi.addEventListener('storage', onStorage);
+  return () => windowApi.removeEventListener?.('storage', onStorage);
+}

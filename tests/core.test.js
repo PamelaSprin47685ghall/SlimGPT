@@ -12,6 +12,7 @@ import {
   extractModelsList,
   extractThought,
   findConversationPayload,
+  findConversationLifecycleEvents,
   findMessageEvents,
   getThinkingLevel,
   getToolMessageInfo,
@@ -25,10 +26,59 @@ import {
   mergeProgressiveText,
   parseWebMobilePartialConversation,
   resolveConversationScope,
+  isProvisionalConversationId,
   setConversationRecordTerminal,
   stepConversationBranch,
   upsertLiveMessage,
 } from '../core.js';
+
+test('conversation lifecycle events expose stable server ids without treating WEB client ids as ownership', () => {
+  const events = findConversationLifecycleEvents({
+    type: 'wrapper',
+    payload: [
+      {
+        type: 'conversation_update',
+        conversation_id: 'WEB:client-only',
+        turn_exchange_id: 'turn-a',
+      },
+      {
+        type: 'conversation_update',
+        conversation_id: 'server-conversation',
+        turn_exchange_id: 'turn-a',
+      },
+      {
+        type: 'main_stream_complete',
+        conversation_id: 'server-conversation',
+        turn_exchange_id: 'turn-a',
+      },
+      {
+        type: 'tool_update',
+        conversation_id: 'unrelated-tool-conversation',
+      },
+    ],
+  });
+
+  assert.deepEqual(events.map((event) => [event.type, event.conversationId, event.turnId]), [
+    ['main_stream_complete', 'server-conversation', 'turn-a'],
+    ['conversation_update', 'server-conversation', 'turn-a'],
+  ]);
+});
+
+test('message event scope ignores official WEB client ids when a stable server id appears below them', () => {
+  const [event] = findMessageEvents({
+    conversation_id: 'WEB:client-only',
+    payload: {
+      conversation_id: 'server-conversation',
+      message: {
+        id: 'assistant-1',
+        author: { role: 'assistant' },
+        content: { parts: ['stable'] },
+      },
+    },
+  });
+  assert.equal(event.conversationIdConflict, false);
+  assert.equal(event.conversationId, 'server-conversation');
+});
 
 const payload = {
   id: 'conv-1',
@@ -577,6 +627,32 @@ test('legacy observation merge also refuses to collapse distinct same-id protoco
   assert.deepEqual(rows.map((row) => row.phase), ['reasoning', 'final']);
 });
 
+test('generic canonical assistant rows merge with concrete text snapshots of the same message id', () => {
+  let record = ingestConversationPayload(null, {
+    id: 'generic-snapshot',
+    current_node: 'a1',
+    mapping: {
+      u1: {
+        id: 'u1', parent: null, children: ['a1'],
+        message: { id: 'u1', author: { role: 'user' }, content: { parts: ['question'] } },
+      },
+      a1: {
+        id: 'a1', parent: 'u1', children: [],
+        message: { id: 'a1', author: { role: 'assistant' }, content: { parts: ['answer'] } },
+      },
+    },
+  });
+  record = ingestConversationMessage(record, {
+    id: 'a1',
+    author: { role: 'assistant' },
+    content: { content_type: 'text', parts: ['answer'] },
+  }, { textMode: 'snapshot' });
+
+  const turns = buildConversationRecordTurns(record);
+  assert.equal(turns.length, 1);
+  assert.deepEqual(turns[0].replies.map((row) => row.id), ['a1']);
+});
+
 test('conflicting semantic aliases fail closed instead of falling back to a misleading parent', () => {
   let record = ingestConversationPayload(null, {
     id: 'semantic-conflict', current_node: 'a2',
@@ -801,6 +877,132 @@ test('conversation scope resolution fails closed when identity signals disagree'
     conversationId: null,
     conflicted: false,
   });
+});
+
+test('WEB optimistic conversation ids never conflict with the real server conversation id', () => {
+  assert.equal(isProvisionalConversationId('WEB:edbf28b7-2cfd-4c92-93b9-159366f631d7'), true);
+  assert.deepEqual(
+    resolveConversationScope('WEB:temporary-client-id', '6a981f4a-0bc0-83eb-b61c-b6692d63b50c'),
+    { conversationId: '6a981f4a-0bc0-83eb-b61c-b6692d63b50c', conflicted: false },
+  );
+  assert.equal(conversationIdFromUrl('https://chatgpt.com/c/WEB:temporary-client-id'), null);
+});
+
+test('official older /messages pages are canonical even without current_node or conversation_id', () => {
+  const page = findConversationPayload({
+    messages: [
+      {
+        id: 'old-user',
+        author: { role: 'user' },
+        content: { content_type: 'text', parts: ['old question'] },
+        metadata: { turn_exchange_id: 'turn-old', working_turn_id: 'turn-old' },
+      },
+      {
+        id: 'old-thought',
+        author: { role: 'assistant' },
+        content: { content_type: 'thoughts', thoughts: [{ content: 'old reasoning' }] },
+        metadata: { turn_exchange_id: 'turn-old', working_turn_id: 'turn-old' },
+      },
+    ],
+    page_info: {
+      start_cursor: 'old-user',
+      end_cursor: 'old-thought',
+      has_previous_page: true,
+      has_next_page: true,
+    },
+  }, { conversationId: 'real-conversation' });
+
+  assert.equal(page.conversation_id, 'real-conversation');
+  assert.equal(page.current_node, null);
+  assert.deepEqual(page.message_order, ['old-user', 'old-thought']);
+  assert.equal(page.mapping['old-thought'].parent, null);
+});
+
+test('real ChatGPT canonical item stream keeps null-parent thoughts tools and final in one semantic turn', () => {
+  const turn = 'turn-real-shape';
+  const record = ingestConversationPayload(null, findConversationPayload({
+    conversation_id: 'real-shape',
+    current_node: 'final',
+    messages: [
+      {
+        id: 'user',
+        author: { role: 'user' },
+        content: { content_type: 'text', parts: ['question'] },
+        metadata: { turn_exchange_id: turn, working_turn_id: turn },
+      },
+      {
+        id: 'thought',
+        author: { role: 'assistant' },
+        content: { content_type: 'thoughts', thoughts: [{ content: 'reasoning survives' }] },
+        metadata: { turn_exchange_id: turn, working_turn_id: turn },
+      },
+      {
+        id: 'call',
+        author: { role: 'assistant' },
+        recipient: 'api_tool.call_tool',
+        content: { content_type: 'code', text: '{"name":"web.run"}' },
+        metadata: { turn_exchange_id: turn, working_turn_id: turn },
+      },
+      {
+        id: 'result',
+        author: { role: 'tool', name: 'api_tool.call_tool' },
+        content: { content_type: 'code', text: '{"ok":true}' },
+        metadata: { turn_exchange_id: turn, working_turn_id: turn },
+      },
+      {
+        id: 'final',
+        author: { role: 'assistant' },
+        content: { content_type: 'text', parts: ['final answer'] },
+        metadata: { turn_exchange_id: turn, working_turn_id: turn },
+        status: 'finished_successfully',
+        end_turn: true,
+      },
+    ],
+    page_info: { has_previous_page: false, has_next_page: false },
+  }), { canonicalComplete: true });
+
+  const turns = buildConversationRecordTurns(record);
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0].user.id, 'user');
+  assert.deepEqual(turns[0].replies.map((row) => row.id), ['thought', 'call', 'result', 'final']);
+  assert.ok(turns[0].replies.find((row) => row.id === 'thought')?.thought?.includes('reasoning survives'));
+  assert.equal(turns[0].replies.find((row) => row.id === 'call')?.tool?.kind, 'tool-call');
+  assert.equal(turns[0].replies.find((row) => row.id === 'result')?.tool?.kind, 'tool-result');
+});
+
+test('canonical sync pages stage transactionally and replace the previous complete item order only when complete', () => {
+  let record = ingestConversationPayload(null, findConversationPayload({
+    conversation_id: 'sync-stage',
+    current_node: 'old-a',
+    messages: [
+      { id: 'old-u', author: { role: 'user' }, content: { parts: ['old'] } },
+      { id: 'old-a', author: { role: 'assistant' }, content: { parts: ['old answer'] }, metadata: { parent_id: 'old-u' } },
+    ],
+  }), { canonicalComplete: true });
+
+  const firstPage = findConversationPayload({
+    messages: [{ id: 'new-u', author: { role: 'user' }, content: { parts: ['new'] } }],
+    page_info: { has_previous_page: false, has_next_page: true },
+  }, { conversationId: 'sync-stage' });
+  record = ingestConversationPayload(record, firstPage, {
+    canonicalSyncId: 'sync-2',
+    canonicalPageIndex: 0,
+    canonicalComplete: false,
+  });
+  assert.deepEqual(record.payload.message_order, ['old-u', 'old-a'], 'an incomplete refresh must keep the previous authoritative history visible');
+
+  const lastPage = findConversationPayload({
+    conversation_id: 'sync-stage',
+    current_node: 'new-a',
+    messages: [{ id: 'new-a', author: { role: 'assistant' }, content: { parts: ['new answer'] }, metadata: { parent_id: 'new-u' } }],
+    page_info: { has_previous_page: true, has_next_page: false },
+  });
+  record = ingestConversationPayload(record, lastPage, {
+    canonicalSyncId: 'sync-2',
+    canonicalPageIndex: 1,
+    canonicalComplete: true,
+  });
+  assert.deepEqual(record.payload.message_order, ['new-u', 'new-a']);
 });
 
 test('conversation id parser supports UI and API URLs', () => {

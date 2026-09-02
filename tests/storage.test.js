@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { compactObservationLedger, extensionStorageArea } from '../src/lib/storage.js';
+import { compactObservationLedger, extensionStorageArea, subscribeStorageChanges } from '../src/lib/storage.js';
 import {
   buildConversationRecordTurns,
   buildConversationRecordView,
@@ -108,6 +108,39 @@ test('extension storage backend works for Chrome and Firefox extension origins w
     extensionStorageArea('https:', { storage: { local: chromeStorage } }, { storage: { local: browserStorage } }),
     null,
   );
+});
+
+test('extension storage changes are delivered event-first and unsubscribe cleanly', () => {
+  const listeners = new Set();
+  const chromeApi = {
+    storage: {
+      onChanged: {
+        addListener(listener) { listeners.add(listener); },
+        removeListener(listener) { listeners.delete(listener); },
+      },
+    },
+  };
+  const received = [];
+  const unsubscribe = subscribeStorageChanges(
+    (update) => received.push(update),
+    'chrome-extension:',
+    chromeApi,
+    undefined,
+    undefined,
+  );
+
+  assert.equal(listeners.size, 1);
+  [...listeners][0]({
+    conversationIndex: { oldValue: [], newValue: [{ id: 'c1' }] },
+    observationLedger: { oldValue: [], newValue: [{ id: 'c1', observations: [{ id: 'm1' }] }] },
+  }, 'local');
+  assert.deepEqual(received, [{
+    conversationIndex: [{ id: 'c1' }],
+    observationLedger: [{ id: 'c1', observations: [{ id: 'm1' }] }],
+  }]);
+
+  unsubscribe();
+  assert.equal(listeners.size, 0);
 });
 
 test('persisted observation ledger round-trips full reasoning/tools across a short canonical reload', () => {

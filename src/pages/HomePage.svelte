@@ -14,6 +14,7 @@ import {
   saveObservationLedger,
   loadUserSettings,
   saveUserSettings,
+  subscribeStorageChanges,
   DEFAULT_SETTINGS,
   THINKING_LEVELS,
 } from '../lib/storage.js';
@@ -28,6 +29,7 @@ import {
     conversationThinkingLevel,
     decodeCaptureBody,
     extractConversationItems,
+    findConversationLifecycleEvents,
     findConversationPayload,
     findMessageEvents,
     fingerprintCapture,
@@ -79,7 +81,7 @@ import {
   const captureConversationIds = new Map();
   const conflictedCaptureIds = new Set();
   const draftsByConversation = new Map();
-  const recentFingerprints = new Map();
+  const recentFingerprints = new Set();
 
   const conversations = $derived([...conversationMap.values()].sort((a, b) => (Number(b.update_time) || 0) - (Number(a.update_time) || 0)));
   const currentRecord = $derived(currentConversationId ? conversationRecords.get(currentConversationId) || null : null);
@@ -159,6 +161,7 @@ import {
 
   onMount(() => {
     let unsubscribe = transport.subscribe(handleTransportMessage);
+    let unsubscribeStorage = subscribeStorageChanges(handleStorageChange);
     const layoutQuery = matchMedia('(max-width: 960px), (pointer: coarse)');
     const syncLayout = () => {
       const touchCompact = navigator.maxTouchPoints > 0 && matchMedia('(pointer: coarse)').matches;
@@ -182,6 +185,7 @@ import {
     restoreSettings();
     return () => {
       unsubscribe?.();
+      unsubscribeStorage?.();
       transport.stop();
       clearTimeout(saveTimer);
       clearTimeout(persistMaxTimer);
@@ -201,7 +205,7 @@ import {
   async function restoreIndex() {
     try {
       const items = await loadConversationIndex();
-      conversationMap = new Map(items.filter((item) => item?.id).map((item) => [item.id, normalizeConversationMeta(item)]));
+      mergeConversationIndex(items);
     } catch {
       setComposerStatus('无法读取本地会话索引；当前聊天仍可正常使用', true);
     }
@@ -210,13 +214,7 @@ import {
   async function restoreObservationLedger() {
     try {
       const entries = await loadObservationLedger();
-      if (!entries.length) return;
-      const next = new Map(conversationRecords);
-      for (const entry of entries) {
-        if (!entry?.id || !Array.isArray(entry.observations)) continue;
-        next.set(entry.id, hydrateConversationObservations(next.get(entry.id), entry.observations));
-      }
-      conversationRecords = next;
+      mergeObservationLedger(entries);
     } catch {
       // The server/canonical conversation remains authoritative if the local
       // observation cache cannot be restored.
@@ -229,6 +227,41 @@ import {
     } catch {
       userSettings = { ...DEFAULT_SETTINGS };
     }
+  }
+
+  function handleStorageChange(update) {
+    if (!update || typeof update !== 'object') return;
+    if (Array.isArray(update.conversationIndex)) mergeConversationIndex(update.conversationIndex);
+    if (Array.isArray(update.observationLedger)) mergeObservationLedger(update.observationLedger);
+    if (update.userSettings && typeof update.userSettings === 'object') {
+      userSettings = { ...DEFAULT_SETTINGS, ...userSettings, ...update.userSettings };
+    }
+  }
+
+  function mergeConversationIndex(items) {
+    if (!Array.isArray(items) || !items.length) return;
+    const next = new Map(conversationMap);
+    for (const item of items) {
+      if (!item?.id) continue;
+      const previous = next.get(String(item.id)) || {};
+      const incoming = normalizeConversationMeta(item, previous);
+      const incomingTime = Number(incoming.update_time) || 0;
+      const previousTime = Number(previous.update_time) || 0;
+      next.set(incoming.id, incomingTime >= previousTime
+        ? normalizeConversationMeta({ ...previous, ...incoming }, previous)
+        : normalizeConversationMeta({ ...incoming, ...previous }, incoming));
+    }
+    conversationMap = next;
+  }
+
+  function mergeObservationLedger(entries) {
+    if (!Array.isArray(entries) || !entries.length) return;
+    const next = new Map(conversationRecords);
+    for (const entry of entries) {
+      if (!entry?.id || !Array.isArray(entry.observations)) continue;
+      next.set(entry.id, hydrateConversationObservations(next.get(entry.id), entry.observations));
+    }
+    conversationRecords = next;
   }
 
   async function handleThinkingLevelChange(thinkingLevel) {
@@ -260,11 +293,18 @@ import {
         message.conversationId ? null : conversationIdFromUrl(message.url || ''),
       );
       if (!conflicted && ['running', 'stopped', 'unknown'].includes(message.state)) {
+        if (conversationId && message.state === 'running') {
+          bindLifecycleConversation(conversationId, message, { conversationRequest: false });
+        }
         setConversationWorkState(conversationId, message.state);
       }
     }
+    else if (message.type === 'page-conversation-bound') {
+      const { conversationId, conflicted } = resolveConversationScope(message.conversationId);
+      if (!conflicted && conversationId) bindLifecycleConversation(conversationId, message, { conversationRequest: true });
+    }
     else if (message.type === 'page-location') handlePageLocation(message.url);
-    else if (message.type === 'canonical-capture') handleCapture(message);
+    else if (message.type === 'page-capture' || message.type === 'canonical-capture') handleCapture(message);
     else if (message.type === 'composer-result') handleComposerResult(message);
     else if (message.type === 'capture-warning') setComposerStatus(`页面启动过快，${message.dropped || 1} 个早期同步事件未能保留；可刷新页面重新同步`, true);
     else if (message.type === 'command-error') {
@@ -280,11 +320,11 @@ import {
 
     if (capture.transport !== 'sse' && capture.phase !== 'chunk') {
       const fingerprint = fingerprintCapture(capture, text);
-      const now = Date.now();
-      if (recentFingerprints.has(fingerprint) && now - recentFingerprints.get(fingerprint) < 2500) return;
-      recentFingerprints.set(fingerprint, now);
-      if (recentFingerprints.size > 160) {
-        for (const [key, seenAt] of recentFingerprints) if (now - seenAt > 5000) recentFingerprints.delete(key);
+      if (recentFingerprints.has(fingerprint)) return;
+      recentFingerprints.add(fingerprint);
+      if (recentFingerprints.size > 256) {
+        const oldest = recentFingerprints.values().next().value;
+        recentFingerprints.delete(oldest);
       }
     }
 
@@ -360,7 +400,15 @@ import {
   }
 
   function processStructured(value, capture) {
-    const conversation = findConversationPayload(value);
+    for (const lifecycle of findConversationLifecycleEvents(value)) {
+      const scope = resolveCapturedConversation(capture, lifecycle.conversationId);
+      if (scope.conflicted || !scope.conversationId) continue;
+      bindLifecycleConversation(scope.conversationId, lifecycle, capture);
+    }
+
+    const conversation = findConversationPayload(value, {
+      conversationId: capture.conversationId || conversationIdFromUrl(capture.url || ''),
+    });
     if (conversation) {
       const scope = resolveCapturedConversation(capture, conversationIdFromPayload(conversation));
       if (!scope.conflicted && scope.conversationId) {
@@ -423,6 +471,44 @@ import {
       if (id === currentConversationId) {
         reconcilePending(id, event.message);
       }
+    }
+  }
+
+  function bindLifecycleConversation(id, lifecycle = {}, capture = {}) {
+    if (!id) return;
+    const turnAliases = [...new Set([
+      ...(lifecycle.turnAliases || []),
+      lifecycle.turnId,
+      lifecycle.turnExchangeId,
+      lifecycle.workingTurnId,
+      lifecycle.turnRequestId,
+      lifecycle.turnTraceId,
+      ...(capture.turnAliases || []),
+      capture.turnId,
+      capture.transportTurnId,
+    ].filter(Boolean))];
+    const pendingAliases = [...new Set([
+      ...(pendingUser?.turnAliases || []),
+      pendingUser?.turnId,
+      pendingUser?.transportTurnId,
+      pendingUser?.message?.turnId,
+      ...(pendingUser?.message?.turnAliases || []),
+      pendingUser?.message?.transportTurnId,
+    ].filter(Boolean))];
+    const correlated = capture.conversationRequest === true ||
+      (turnAliases.length > 0 && pendingAliases.some((alias) => turnAliases.includes(alias)));
+
+    const identityCapture = {
+      ...capture,
+      turnId: lifecycle.turnId || capture.turnId || null,
+      turnAliases,
+      transportTurnId: capture.transportTurnId || null,
+      turnUserMessageId: capture.turnUserMessageId || null,
+      turnParentMessageId: capture.turnParentMessageId || null,
+    };
+    bindPendingTurnIdentity(id, identityCapture);
+    if (pendingUser?.conversationId === null && currentConversationId === null && correlated) {
+      bindPendingConversation(id);
     }
   }
 
@@ -513,6 +599,8 @@ import {
     const nextRecords = new Map(conversationRecords);
     const record = ingestConversationPayload(nextRecords.get(id), payload, {
       canonicalComplete: capture.canonicalComplete === true,
+      canonicalSyncId: capture.canonicalSyncId || null,
+      canonicalPageIndex: capture.canonicalPageIndex ?? null,
     });
     const mergedPayload = record.payload;
     nextRecords.set(id, record);
@@ -530,6 +618,10 @@ import {
     }
 
     conversationRecords = nextRecords;
+    if (!mergedPayload) {
+      schedulePersist();
+      return;
+    }
     const next = new Map(conversationMap);
     const previous = next.get(id) || {};
     const details = conversationDetailsFromPayload(mergedPayload, previous);
@@ -640,6 +732,16 @@ import {
     }
     if (currentConversationId === null) {
       setCurrentConversation(id, { migrateDraft: true });
+    }
+    if (transport.supportsLiveChat) {
+      const rawPageUrl = String(status.pageUrl || '');
+      let provisionalRoute = false;
+      try {
+        provisionalRoute = /\/(?:c|uc)\/WEB:/i.test(decodeURIComponent(new URL(rawPageUrl).pathname));
+      } catch {}
+      if (provisionalRoute || !conversationIdFromUrl(rawPageUrl)) {
+        transport.send({ type: 'adopt-conversation-id', conversationId: id });
+      }
     }
     if (newChatWorkState !== 'unknown') {
       setConversationWorkState(id, newChatWorkState);

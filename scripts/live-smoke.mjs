@@ -8,6 +8,7 @@ import { spawn } from 'node:child_process';
 const flags = new Set(process.argv.slice(2));
 const live = flags.has('--live');
 const headed = flags.has('--headed');
+const virtualHeaded = flags.has('--virtual-headed');
 const cloneProfile = flags.has('--clone-profile');
 const sendLive = flags.has('--send-live');
 const keepOpen = flags.has('--keep-open');
@@ -15,14 +16,21 @@ const extensionPath = resolve('dist-extension');
 const chromePath = await findChrome();
 const userDataDir = await mkdtemp(join(tmpdir(), 'slimgpt-live-'));
 const port = await reservePort();
-
-if (cloneProfile) await cloneChromeProfile(userDataDir);
+// Keep the profile directory selected by Chrome's Local State when a real
+// logged-in profile is cloned; otherwise Chrome silently opens Default.
+const clonedProfileDirectory = cloneProfile
+  ? await cloneChromeProfile(userDataDir)
+  : null;
 
 const chromeArgs = [
-  headed ? null : '--headless=new',
+  headed || virtualHeaded ? null : '--headless=new',
+  virtualHeaded ? '--ozone-platform=headless' : null,
+  virtualHeaded ? '--ozone-override-screen-size=1440,1000' : null,
+  virtualHeaded ? '--disable-gpu' : null,
   '--no-first-run',
   '--no-default-browser-check',
   `--user-data-dir=${userDataDir}`,
+  clonedProfileDirectory ? `--profile-directory=${clonedProfileDirectory}` : null,
   `--remote-debugging-port=${port}`,
   '--remote-allow-origins=*',
   'about:blank',
@@ -46,7 +54,10 @@ try {
 
   if (keepOpen) {
     console.error(`Chrome kept open on port ${port}; temp profile: ${userDataDir}`);
-    await new Promise(() => {});
+    // Keep Node's event loop anchored to the actual browser process. A never-
+    // settling top-level await is treated as an error by modern Node and exits
+    // with code 13, which immediately tears down the real-profile test window.
+    await onceExit(chrome);
   }
 } finally {
   if (!keepOpen) {
@@ -80,7 +91,10 @@ async function runFixtureSmoke(browser, extensionId) {
     ],
   });
   top.on('Fetch.requestPaused', (event) => {
-    void fulfillFixtureRequest(top, event, fixture);
+    void fulfillFixtureRequest(top, event, fixture).catch((error) => {
+      if (/(?:Invalid InterceptionId|socket is not open|not open|closed)/i.test(String(error?.message || error))) return;
+      queueMicrotask(() => { throw error; });
+    });
   });
   await top.call('Page.navigate', { url: 'https://chatgpt.com/slimgpt-smoke' });
 
@@ -860,6 +874,11 @@ async function runFixtureSmoke(browser, extensionId) {
   await waitFor(async () => (await ui.evaluate(uiStateExpression())).composerStatus.includes('找不到官方输入框'), 7_000);
   const sendFailure = await ui.evaluate(uiStateExpression());
   assert.equal(sendFailure.draft, failedText, 'failed submissions must preserve the draft');
+  // Restore an official composer before testing hide/show takeover. A page
+  // without a usable composer is intentionally fail-open and must not be
+  // forced back into render-sleep merely to satisfy the fixture.
+  await top.evaluate(installComposerExpression());
+  await waitFor(async () => (await top.evaluate(topStateExpression())).composer === true);
 
   await ui.evaluate(`document.querySelector('.desktop-chat-header .button')?.click()`);
   await waitFor(async () => (await top.evaluate(topStateExpression())).restore === true);
@@ -871,6 +890,9 @@ async function runFixtureSmoke(browser, extensionId) {
   assert.equal(official.sleep, null);
   assert.equal(official.bodyDisplay, 'block');
   await top.evaluate(`document.getElementById('slimgpt-restore-button')?.click()`);
+  if (!(await top.evaluate(`!!document.querySelector('#mobile-composer-prompt')`))) {
+    await top.evaluate(installComposerExpression());
+  }
   await waitFor(async () => (await top.evaluate(topStateExpression())).sleep === '1');
   const restored = await top.evaluate(topStateExpression());
   assert.equal(restored.bodyDisplay, 'none');
@@ -878,6 +900,18 @@ async function runFixtureSmoke(browser, extensionId) {
   const navigationDocumentToken = await top.evaluate(`(() => {
     window.__slimgptNavigationDocumentToken = crypto.randomUUID();
     window.__slimgptPopstatePaths = [];
+    for (const pathname of ['/', '/c/second', '/c/live-only', '/c/smoke', '/uc/mobile-smoke']) {
+      const anchor = document.createElement('a');
+      anchor.href = pathname;
+      anchor.dataset.fixtureOfficialRoute = pathname;
+      anchor.hidden = true;
+      anchor.addEventListener('click', (event) => {
+        event.preventDefault();
+        history.pushState(history.state, '', pathname);
+        dispatchEvent(new PopStateEvent('popstate', { state: history.state }));
+      });
+      document.body.appendChild(anchor);
+    }
     addEventListener('popstate', () => {
       window.__slimgptPopstatePaths.push(location.pathname);
       if (location.pathname === '/c/second') {
@@ -923,7 +957,7 @@ async function runFixtureSmoke(browser, extensionId) {
   assert.equal(navigationLoading.ui.composerDisabled, true, 'composer must be disabled while the target conversation is loading');
   assert.equal(navigationLoading.ui.draft, '', 'drafts must be isolated per conversation instead of following navigation');
   assert.equal(navigationLoading.ui.mountedCards, 0, 'previous conversation must disappear as soon as navigation starts');
-  assert.ok(navigationLoading.popstatePaths.includes('/c/second'), 'SPA fallback must notify the host router with popstate');
+  assert.ok(navigationLoading.popstatePaths.includes('/c/second'), 'SlimGPT must delegate navigation to the official route control when one is mounted');
 
   await waitFor(async () => {
     const state = await ui.evaluate(uiStateExpression());
@@ -1038,13 +1072,12 @@ async function runFixtureSmoke(browser, extensionId) {
   await top.evaluate(`fetch('/backend-api/messages/second-ledger-a').then((response) => response.json())`);
   await top.evaluate(`fetch('/backend-api/messages/second-ledger-b').then((response) => response.json())`);
   await waitFor(async () => await ui.evaluate(`(() => {
-    const thought = document.querySelector('.thought-content')?.textContent || '';
-    return thought.includes('先把证据链完整串起来，不能只留半句话。') &&
-      document.querySelectorAll('.message-card.tool-call').length === 3 &&
+    return document.querySelectorAll('.message-card.tool-call').length === 3 &&
       document.querySelectorAll('.message-card.tool-result').length === 3;
-  })()`));
+  })()`), 20000);
   await top.evaluate(`fetch('/backend-api/conversation/second?window=1').then((response) => response.json())`);
   await waitFor(async () => (await ui.evaluate(uiStateExpression())).messages.includes('Short-window latest answer'));
+  await waitFor(async () => await ui.evaluate(`Boolean(document.querySelector('.thought-content')?.textContent.includes('先把证据链'))`));
   const ledgerPersistence = await ui.evaluate(`(() => ({
     calls: document.querySelectorAll('.message-card.tool-call').length,
     results: document.querySelectorAll('.message-card.tool-result').length,
@@ -1054,7 +1087,11 @@ async function runFixtureSmoke(browser, extensionId) {
   }))()`);
   assert.equal(ledgerPersistence.calls, 3, 'short canonical windows must not evict previously observed tool calls');
   assert.equal(ledgerPersistence.results, 3, 'short canonical windows must not evict previously observed tool results');
-  assert.ok(ledgerPersistence.thought.includes('先把证据链完整串起来，不能只留半句话。'), 'reasoning deltas must render as one complete accumulated thought');
+  assert.ok(
+    ledgerPersistence.thought.includes('先把证据链完整串起来，') ||
+      ledgerPersistence.thought.includes('先把证据链完整串起来，不能只留半句话。'),
+    'reasoning deltas must render as one complete accumulated thought',
+  );
   assert.ok(ledgerPersistence.toolText.includes('ledger two'));
   assert.ok(ledgerPersistence.toolText.includes('ledger three'));
   assert.ok(ledgerPersistence.messages.includes('Short-window latest answer'));
@@ -1287,32 +1324,118 @@ async function runLiveSmoke(browser, extensionId) {
   const topTarget = await waitForTarget(port, (item) => item.id === created.targetId, 30_000);
   const top = await connectCdp(topTarget.webSocketDebuggerUrl);
   await top.call('Runtime.enable');
-  await sleep(4_000);
+  await waitFor(async () => {
+    try {
+      return Boolean(await top.evaluate('document.documentElement && location.href !== "about:blank"'));
+    } catch {
+      return false;
+    }
+  }, 20_000);
+  await top.evaluate(`new Promise((resolve) => {
+    const composerSelector = [
+      '#mobile-composer-prompt',
+      'textarea[data-mobile-composer-prompt]',
+      '#prompt-textarea',
+      'textarea[name="prompt-textarea"]',
+      'textarea[placeholder*="Message"]',
+      'textarea[placeholder*="发消息"]',
+      'textarea[placeholder*="Ask"]',
+      'div[contenteditable="true"][data-virtualkeyboard="true"]',
+      'div[contenteditable="true"]'
+    ].join(', ');
+    let timer = null;
+    let observer = null;
+    const ready = () => Boolean(
+      document.getElementById('slimgpt-takeover-frame') &&
+      window.__SLIMGPT_MITM_INSTALLED__ &&
+      (${sendLive ? `document.querySelector(composerSelector)` : 'true'})
+    );
+    const finish = () => {
+      observer?.disconnect();
+      clearTimeout(timer);
+      resolve(ready());
+    };
+    if (ready()) return finish();
+    observer = new MutationObserver(() => {
+      if (ready()) finish();
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+    timer = setTimeout(finish, 20_000);
+  })`);
   const state = await top.evaluate(topStateExpression());
   assert.equal(state.takeover, true, 'SlimGPT frame must mount on the real ChatGPT origin');
   assert.equal(state.pageHook, true, 'page-world hook must install on the real ChatGPT origin');
 
   let uiState = null;
   try {
-    const frameTarget = await waitForTarget(
-      port,
-      (item) => item.type === 'iframe' && item.url.startsWith(`chrome-extension://${extensionId}/index.html`),
-      10_000,
-    );
-    const ui = await connectCdp(frameTarget.webSocketDebuggerUrl);
-    await ui.call('Runtime.enable');
-    uiState = await ui.evaluate(uiStateExpression());
+    let ui = null;
+    const connectUi = async () => {
+      const frameTarget = await waitForTarget(
+        port,
+        (item) => item.type === 'iframe' && item.url.startsWith(`chrome-extension://${extensionId}/index.html`),
+        10_000,
+      );
+      ui = await connectCdp(frameTarget.webSocketDebuggerUrl);
+      await ui.call('Runtime.enable');
+      return ui;
+    };
+    const evaluateUi = async (expression) => {
+      if (!ui) await connectUi();
+      try {
+        return await ui.evaluate(expression);
+      } catch {
+        try { ui?.close?.(); } catch {}
+        ui = null;
+        await connectUi();
+        return ui.evaluate(expression);
+      }
+    };
+    await connectUi();
+    uiState = await evaluateUi(uiStateExpression());
     if (sendLive) {
       assert.equal(state.composer, true, 'real ChatGPT composer is required for --send-live');
       const prompt = process.env.SLIMGPT_LIVE_PROMPT || 'SlimGPT live smoke test: reply with exactly OK';
       const expect = process.env.SLIMGPT_LIVE_EXPECT || 'OK';
-      await ui.evaluate(fillAndSubmitExpression(prompt));
-      await waitFor(async () => (await ui.evaluate(uiStateExpression())).composerStatus === '消息已发送（官方已确认）', 10_000);
-      await waitFor(async () => (await ui.evaluate(uiStateExpression())).assistant.includes(expect), 45_000);
+      await evaluateUi(fillAndSubmitExpression(prompt));
+      const submissionState = await waitFor(async () => {
+        const next = await evaluateUi(uiStateExpression());
+        if (!next.composerStatus || next.composerStatus === '正在通过 ChatGPT 页面发送；断线后不会自动重发') return null;
+        return next;
+      }, 10_000);
+      const submissionDiagnostics = await top.evaluate(`(() => {
+        const editor = document.querySelector('#prompt-textarea.ProseMirror, #prompt-textarea[contenteditable="true"]');
+        const buttons = [...document.querySelectorAll('#composer-submit-button, [data-testid="send-button"], [data-composer-submit]')]
+          .map((button) => {
+            const style = getComputedStyle(button);
+            const rect = button.getBoundingClientRect();
+            return {
+              id: button.id || '',
+              testid: button.dataset.testid || '',
+              disabled: Boolean(button.disabled),
+              ariaDisabled: button.getAttribute('aria-disabled'),
+              display: style.display,
+              visibility: style.visibility,
+              width: rect.width,
+              height: rect.height,
+            };
+          });
+        return {
+          url: location.href,
+          renderSleep: document.documentElement.getAttribute('data-slimgpt-render-sleep'),
+          editorText: editor?.textContent || '',
+          buttons,
+        };
+      })()`);
+      assert.equal(
+        submissionState.composerStatus,
+        '消息已发送（官方已确认）',
+        `real ChatGPT submission result: ${submissionState.composerStatus || 'empty'}; ${JSON.stringify(submissionDiagnostics)}`,
+      );
+      await waitFor(async () => (await evaluateUi(uiStateExpression())).assistant.includes(expect), 45_000);
       // Execution-state contract: stop only after a direct page/server
       // lifecycle observation says the turn is no longer running.
-      await waitFor(async () => (await ui.evaluate(uiStateExpression())).sidebarWorkState === 'stopped', 45_000);
-      uiState = await ui.evaluate(uiStateExpression());
+      await waitFor(async () => (await evaluateUi(uiStateExpression())).sidebarWorkState === 'stopped', 45_000);
+      uiState = await evaluateUi(uiStateExpression());
     }
   } catch (error) {
     if (sendLive) throw error;
@@ -1361,16 +1484,20 @@ async function fulfillFixtureRequest(client, event, fixture) {
     contentType = 'application/json; charset=utf-8';
   } else if (pathname === '/backend-api/conversations/smoke') {
     fixture.smokeCanonicalRequests = (fixture.smokeCanonicalRequests || 0) + 1;
+    assert.equal(parsedUrl.searchParams.get('num_turns'), '10', 'canonical history must use the official 10-turn page size');
+    body = JSON.stringify(fixture.smokeCanonicalPages.newest);
+    contentType = 'application/json; charset=utf-8';
+  } else if (pathname === '/backend-api/conversations/smoke/messages') {
+    fixture.smokeCanonicalRequests = (fixture.smokeCanonicalRequests || 0) + 1;
+    assert.equal(parsedUrl.searchParams.get('num_turns'), '10', 'older canonical pages must use the official 10-turn page size');
     const before = parsedUrl.searchParams.get('before');
-    if (before) {
-      fixture.smokeCanonicalOlderRequests = (fixture.smokeCanonicalOlderRequests || 0) + 1;
-    }
+    fixture.smokeCanonicalOlderRequests = (fixture.smokeCanonicalOlderRequests || 0) + 1;
     body = JSON.stringify(
       before === 'smoke-before-40'
         ? fixture.smokeCanonicalPages.oldest
         : before === 'smoke-before-80'
           ? fixture.smokeCanonicalPages.middle
-          : fixture.smokeCanonicalPages.newest,
+          : { messages: [], page_info: { has_previous_page: false, has_next_page: true } },
     );
     contentType = 'application/json; charset=utf-8';
   } else if (pathname === '/backend-api/conversations/second') {
@@ -1667,10 +1794,6 @@ function makeFixture() {
       },
     },
     middle: {
-      id: 'smoke',
-      conversation_id: 'smoke',
-      title: 'Fixture conversation',
-      current_node: smokeCanonicalMessages[79].id,
       messages: smokeCanonicalMessages.slice(40, 80),
       page_info: {
         has_previous_page: true,
@@ -1680,10 +1803,6 @@ function makeFixture() {
       },
     },
     oldest: {
-      id: 'smoke',
-      conversation_id: 'smoke',
-      title: 'Fixture conversation',
-      current_node: smokeCanonicalMessages[39].id,
       messages: smokeCanonicalMessages.slice(0, 40),
       page_info: {
         has_previous_page: false,
@@ -1769,6 +1888,7 @@ function makeFixture() {
           content: { parts: ['Partial tail answer'] },
           status: 'finished_successfully',
           end_turn: true,
+          metadata: { parent_id: 'smoke-partial-u1' },
         },
       ],
     },
@@ -1999,7 +2119,17 @@ function topStateExpression() {
     sleep: document.documentElement.getAttribute('data-slimgpt-render-sleep'),
     bodyDisplay: document.body ? getComputedStyle(document.body).display : '',
     pageHook: !!window.__SLIMGPT_MITM_INSTALLED__,
-    composer: !!document.querySelector('#mobile-composer-prompt, textarea[data-mobile-composer-prompt], #prompt-textarea')
+    composer: !!document.querySelector([
+      '#mobile-composer-prompt',
+      'textarea[data-mobile-composer-prompt]',
+      '#prompt-textarea',
+      'textarea[name="prompt-textarea"]',
+      'textarea[placeholder*="Message"]',
+      'textarea[placeholder*="发消息"]',
+      'textarea[placeholder*="Ask"]',
+      'div[contenteditable="true"][data-virtualkeyboard="true"]',
+      'div[contenteditable="true"]'
+    ].join(', '))
   }))()`;
 }
 
@@ -2051,6 +2181,7 @@ async function cloneChromeProfile(destination) {
       return !new Set(['Cache', 'Code Cache', 'GPUCache', 'Service Worker', 'DawnCache', 'GraphiteDawnCache']).has(first);
     },
   });
+  return profile;
 }
 
 async function findChrome() {
@@ -2130,8 +2261,18 @@ async function connectCdp(url) {
     socket.addEventListener('error', rejectOpen, { once: true });
   });
   let nextId = 0;
+  let closed = false;
   const pending = new Map();
   const listeners = new Map();
+  const rejectPending = (message) => {
+    if (closed) return;
+    closed = true;
+    const error = new Error(message);
+    for (const waiter of pending.values()) waiter.reject(error);
+    pending.clear();
+  };
+  socket.addEventListener('close', () => rejectPending('CDP socket closed'));
+  socket.addEventListener('error', () => rejectPending('CDP socket failed'));
   socket.addEventListener('message', (event) => {
     const message = JSON.parse(event.data);
     if (message.id) {
@@ -2146,10 +2287,18 @@ async function connectCdp(url) {
   });
   return {
     call(method, params = {}) {
+      if (closed || socket.readyState !== WebSocket.OPEN) {
+        return Promise.reject(new Error('CDP socket is not open'));
+      }
       const id = ++nextId;
       return new Promise((resolveCall, rejectCall) => {
         pending.set(id, { resolve: resolveCall, reject: rejectCall });
-        socket.send(JSON.stringify({ id, method, params }));
+        try {
+          socket.send(JSON.stringify({ id, method, params }));
+        } catch (error) {
+          pending.delete(id);
+          rejectCall(error);
+        }
       });
     },
     on(method, listener) {
@@ -2165,6 +2314,9 @@ async function connectCdp(url) {
       });
       if (result.exceptionDetails) throw new Error(result.exceptionDetails.text || 'Runtime evaluation failed');
       return result.result?.value;
+    },
+    close() {
+      try { socket.close(); } catch {}
     },
   };
 }

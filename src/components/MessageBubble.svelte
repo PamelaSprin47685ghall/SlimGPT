@@ -9,7 +9,8 @@
   } = $props();
 
   let copied = $state(false);
-  let thoughtOpen = $state(false);
+  let userToggled = $state(false);
+  let thoughtManualState = $state(false);
   let copyTimer = null;
 
   const hasText = $derived(Boolean(String(message?.text || '').trim()));
@@ -19,12 +20,12 @@
   const isError = $derived(Boolean(message?.error || message?.status === 'failed'));
   const unrecognized = $derived(Boolean(!hasText && !hasThought && !message?.tool && !isThinking && !isError && message?.unrecognized));
 
-  // Auto-expand thought if it's currently generating and has no text yet
-  $effect(() => {
-    if (isThinking && hasThought && !hasText) {
-      thoughtOpen = true;
-    }
-  });
+  const thoughtOpen = $derived(userToggled ? thoughtManualState : (!hasText || isThinking));
+
+  function toggleThought() {
+    thoughtManualState = !thoughtOpen;
+    userToggled = true;
+  }
 
   onDestroy(() => {
     clearTimeout(copyTimer);
@@ -192,7 +193,7 @@
           <button
             type="button"
             class="thought-header"
-            onclick={() => thoughtOpen = !thoughtOpen}
+            onclick={toggleThought}
             aria-expanded={thoughtOpen}
           >
             <span class="thought-icon">💭</span>

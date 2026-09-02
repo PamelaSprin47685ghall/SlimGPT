@@ -19,7 +19,12 @@
   const MAX_IDENTITY_BODY = 1024 * 1024;
   const INITIAL_SHELL_READY_TIMEOUT = 15_000;
   const COMPOSER_WAKE_TIMEOUT = 2_500;
-  const SEND_CONTROL_TIMEOUT = 1_500;
+  // This is only a watchdog. waitForSendButton is MutationObserver-driven and
+  // resolves immediately when the official React composer flips its submit
+  // control to enabled. Real Chrome currently crosses that boundary after the
+  // previous 1.5s watchdog on a cold/new thread, so ending earlier races the
+  // official state transition and falsely reports send-control-not-ready.
+  const SEND_CONTROL_TIMEOUT = 5_000;
   const SEND_CONFIRM_TIMEOUT = 10_000;
   const BLOCKED_TAKEOVER_RETRY_MS = 500;
   const TAKEOVER_BLOCKER_GUARD_MS = 5_000;
@@ -32,6 +37,7 @@
   const NEW_CHAT_EXECUTION_KEY = "__slimgpt_new_chat__";
   const MAX_EXECUTION_STATES = 256;
   const CONVERSATION_INDEX_PAGE_SIZE = 100;
+  const CANONICAL_PAGE_TURNS = 10;
   const MAX_SYNCED_CONVERSATIONS = 500;
   const CONVERSATION_INDEX_REFRESH_MS = 30_000;
   const CONVERSATION_INDEX_RETRY_MS = 5_000;
@@ -67,6 +73,10 @@
   let executionIdleCandidateKey = null;
   const canonicalFetches = new Map();
   const pendingCanonicalIds = new Set();
+  const canonicalQueueGenerations = new Map();
+  const canonicalAttemptedGenerations = new Map();
+  const canonicalBackoffUntil = new Map();
+  const canonicalFailureCounts = new Map();
   const activeTurnSessions = new Map();
   const executionStates = new Map();
   const lastDomRunningAt = new Map();
@@ -648,11 +658,13 @@
       ? readRequestConversationId(request)
       : Promise.resolve(null);
     return bodyConversationId.then((bodyId) => {
-      if (bodyId && urlConversationId && bodyId !== urlConversationId) {
+      const stableBodyId = isProvisionalConversationId(bodyId) ? null : bodyId;
+      if (stableBodyId && urlConversationId && stableBodyId !== urlConversationId) {
         return { conversationId: null, conflicted: true };
       }
       return {
-        conversationId: bodyId || urlConversationId,
+        conversationId: stableBodyId || urlConversationId,
+        ...(isProvisionalConversationId(bodyId) ? { provisionalConversationId: bodyId } : {}),
         conflicted: false,
       };
     });
@@ -836,10 +848,11 @@
   }
 
   function bindPendingTurnSession(conversationId) {
-    if (!conversationId || !pendingNewTurnSession) return;
+    if (!conversationId || !pendingNewTurnSession) return null;
     const session = { ...pendingNewTurnSession, conversationId };
     pendingNewTurnSession = null;
     activeTurnSessions.set(conversationId, session);
+    return session;
   }
 
   function conversationIdFromRequestBody(body) {
@@ -878,6 +891,7 @@
     const resolved = scope.conversationId
       ? { ...captureMeta, conversationId: scope.conversationId }
       : { ...captureMeta };
+    if (scope.provisionalConversationId) resolved.provisionalConversationId = scope.provisionalConversationId;
     if (turn?.turnId) resolved.turnId = turn.turnId;
     if (turn?.turnAliases?.length) resolved.turnAliases = turn.turnAliases.slice();
     if (turn?.transportTurnId) resolved.transportTurnId = turn.transportTurnId;
@@ -1301,7 +1315,6 @@
         disconnected: !sawDone,
         ...captureMeta,
       });
-      if (captureMeta.conversationId) queueCanonicalConversation(captureMeta.conversationId);
       cancelSignal?.removeEventListener("abort", cancelReader);
       reader.releaseLock();
       try {
@@ -1620,29 +1633,51 @@
   }
 
   function queueCanonicalConversation(conversationId) {
-    if (!conversationId) return;
+    if (!conversationId || isProvisionalConversationId(conversationId)) return;
+    const generation = canonicalQueueGenerations.get(conversationId) || 0;
+    const attempted = canonicalAttemptedGenerations.get(conversationId);
+    if (!pendingCanonicalIds.has(conversationId)) {
+      canonicalQueueGenerations.set(conversationId, generation + 1);
+    } else if (attempted === generation) {
+      // Coalesce any number of semantic notifications arriving while the
+      // current snapshot is in flight (or backing off) into one later pass.
+      canonicalQueueGenerations.set(conversationId, generation + 1);
+    }
     pendingCanonicalIds.add(conversationId);
     drainCanonicalFetches();
   }
 
   function drainCanonicalFetches() {
     if (!backendFetch || !(backendHeaders || backendSessionHeaders)) return;
+    const now = Date.now();
     for (const conversationId of pendingCanonicalIds) {
-      if (!canonicalFetches.has(conversationId)) void fetchCanonicalConversation(conversationId);
+      if (canonicalFetches.has(conversationId)) continue;
+      if ((canonicalBackoffUntil.get(conversationId) || 0) > now) continue;
+      const generation = canonicalQueueGenerations.get(conversationId) || 0;
+      if (canonicalAttemptedGenerations.get(conversationId) === generation) continue;
+      void fetchCanonicalConversation(conversationId, generation);
     }
   }
 
-  async function fetchCanonicalConversation(conversationId) {
+  async function fetchCanonicalConversation(conversationId, generation = canonicalQueueGenerations.get(conversationId) || 0) {
     const sourceHeaders = backendHeaders || backendSessionHeaders;
     if (canonicalFetches.has(conversationId) || !backendFetch || !sourceHeaders) return;
+    canonicalAttemptedGenerations.set(conversationId, generation);
     const task = (async () => {
       const headers = new Headers(sourceHeaders);
       headers.delete("content-length");
       headers.delete("content-type");
       headers.set("accept", "application/json");
       const pages = await fetchCanonicalConversationPages(conversationId, headers);
-      if (!pages.length) return;
-      pendingCanonicalIds.delete(conversationId);
+      if (!pages.length) throw new Error('empty canonical conversation');
+      canonicalFailureCounts.delete(conversationId);
+      canonicalBackoffUntil.delete(conversationId);
+      const latestGeneration = canonicalQueueGenerations.get(conversationId) || 0;
+      if (latestGeneration <= generation) {
+        pendingCanonicalIds.delete(conversationId);
+        canonicalAttemptedGenerations.delete(conversationId);
+        canonicalQueueGenerations.delete(conversationId);
+      }
       const ordered = pages.slice().reverse();
       const syncId = nextRequestId("sync");
       for (let index = 0; index < ordered.length; index += 1) {
@@ -1669,11 +1704,43 @@
     canonicalFetches.set(conversationId, task);
     try {
       await task;
-    } catch {
-      // A later WS notification or authenticated request retries this id.
+    } catch (error) {
+      scheduleCanonicalBackoff(conversationId, generation, error);
     } finally {
       canonicalFetches.delete(conversationId);
+      if ((canonicalQueueGenerations.get(conversationId) || 0) !== generation) {
+        drainCanonicalFetches();
+      }
     }
+  }
+
+  function scheduleCanonicalBackoff(conversationId, generation, error) {
+    const failureCount = (canonicalFailureCounts.get(conversationId) || 0) + 1;
+    canonicalFailureCounts.set(conversationId, failureCount);
+    const explicitDelay = Number(error?.retryAfterMs);
+    const delay = Number.isFinite(explicitDelay) && explicitDelay > 0
+      ? Math.min(explicitDelay, 60_000)
+      : Math.min(1_500 * (2 ** Math.min(failureCount - 1, 4)), 24_000);
+    canonicalBackoffUntil.set(conversationId, Date.now() + delay);
+    // Strictly event-driven: a failed full-history read never schedules its
+    // own retry.  The next navigation / durable turn-complete notification
+    // may retry after this backoff window.  This keeps failure handling from
+    // turning a rate limit or transient outage into a request loop.
+  }
+
+  function canonicalFetchFailure(response) {
+    const error = new Error(`canonical fetch failed: ${response?.status || 0}`);
+    error.status = response?.status || 0;
+    const retryAfter = String(response?.headers?.get?.('retry-after') || '').trim();
+    if (retryAfter) {
+      const seconds = Number(retryAfter);
+      if (Number.isFinite(seconds) && seconds >= 0) error.retryAfterMs = seconds * 1000;
+      else {
+        const timestamp = Date.parse(retryAfter);
+        if (Number.isFinite(timestamp)) error.retryAfterMs = Math.max(0, timestamp - Date.now());
+      }
+    }
+    return error;
   }
 
   async function fetchCanonicalConversationPages(conversationId, headers) {
@@ -1682,27 +1749,63 @@
     let before = null;
 
     for (let pageIndex = 0; pageIndex < 100; pageIndex += 1) {
-      const url = new URL(`/backend-api/conversations/${encodeURIComponent(conversationId)}`, location.origin);
-      url.searchParams.set("include_has_versions", "true");
-      url.searchParams.set("num_turns", "100");
-      if (before) url.searchParams.set("before", before);
-      const response = await Reflect.apply(backendFetch, backendFetchThis, [
-        url.href,
-        {
-          method: "GET",
-          credentials: "include",
-          cache: "no-store",
-          headers: new Headers(headers),
-        },
-      ]);
+      const tryFetch = async (useMessagesEndpoint) => {
+        const path = useMessagesEndpoint && before
+          ? `/backend-api/conversations/${encodeURIComponent(conversationId)}/messages`
+          : `/backend-api/conversations/${encodeURIComponent(conversationId)}`;
+        const url = new URL(path, location.origin);
+        url.searchParams.set("include_has_versions", "true");
+        url.searchParams.set("num_turns", String(CANONICAL_PAGE_TURNS));
+        if (before) url.searchParams.set("before", before);
+        return {
+          url,
+          response: await Reflect.apply(backendFetch, backendFetchThis, [
+            url.href,
+            {
+              method: "GET",
+              credentials: "include",
+              cache: "no-store",
+              headers: new Headers(headers),
+            },
+          ]),
+        };
+      };
+
+      let url;
+      let response;
+      // Prefer the paginated /messages endpoint for older pages (matches
+      // fixture and newer ChatGPT builds), but fall back to the unified
+      // ?before= cursor on the same /conversations/:id endpoint if the
+      // deployment does not expose /messages yet. This keeps old
+      // conversations loadable across both API shapes.
+      if (before) {
+        const primary = await tryFetch(true);
+        if (primary.response.ok) {
+          url = primary.url;
+          response = primary.response;
+        } else if ([404, 405, 400].includes(primary.response.status)) {
+          const fallback = await tryFetch(false);
+          url = fallback.url;
+          response = fallback.response;
+        } else {
+          url = primary.url;
+          response = primary.response;
+        }
+      } else {
+        const single = await tryFetch(false);
+        url = single.url;
+        response = single.response;
+      }
       if (!response.ok) {
-        if (!pages.length) return fetchLegacyCanonicalConversation(conversationId, headers);
-        return [];
+        if (!pages.length && [404, 405].includes(response.status)) {
+          return fetchLegacyCanonicalConversation(conversationId, headers);
+        }
+        throw canonicalFetchFailure(response);
       }
       const text = await response.text();
-      if (!text || text.length > MAX_NON_STREAM_BODY) return [];
+      if (!text || text.length > MAX_NON_STREAM_BODY) throw new Error('invalid canonical response size');
       let value;
-      try { value = JSON.parse(text); } catch { return []; }
+      try { value = JSON.parse(text); } catch { throw new Error('invalid canonical response json'); }
       pages.push({
         text,
         url: response.url || url.href,
@@ -1715,7 +1818,7 @@
       const pageInfo = value?.page_info || value?.data?.page_info || null;
       if (!pageInfo?.has_previous_page) break;
       const cursor = String(pageInfo.start_cursor || "").trim();
-      if (!cursor || seenCursors.has(cursor)) return [];
+      if (!cursor || seenCursors.has(cursor)) throw new Error('canonical cursor did not advance');
       seenCursors.add(cursor);
       before = cursor;
     }
@@ -1733,14 +1836,14 @@
         headers: new Headers(headers),
       },
     ]);
-    if (!response.ok) return [];
+    if (!response.ok) throw canonicalFetchFailure(response);
     const text = await response.text();
-    if (!text || text.length > MAX_NON_STREAM_BODY) return [];
+    if (!text || text.length > MAX_NON_STREAM_BODY) throw new Error('invalid legacy canonical response size');
     try {
       const value = JSON.parse(text);
-      if (!value?.mapping || !value?.current_node) return [];
+      if (!value?.mapping || !value?.current_node) throw new Error('invalid legacy canonical response');
     } catch {
-      return [];
+      throw new Error('invalid legacy canonical response json');
     }
     return [{
       text,
@@ -1931,6 +2034,30 @@
       for (const notification of notifications) {
         const conversationId = notification.conversationId;
         const stateValue = notificationExecutionState(notification);
+        if (
+          conversationId &&
+          pendingNewTurnSession &&
+          notificationMatchesPendingNewTurn(notification, pendingNewTurnSession)
+        ) {
+          const boundSession = bindPendingTurnSession(conversationId);
+          if (boundSession) {
+            adoptNotificationTurnIdentity(conversationId, notification);
+            emit({
+              type: 'page-conversation-bound',
+              conversationId,
+              turnId: notification.turnAliases?.[0] || boundSession.turnId || null,
+              turnAliases: uniqueTurnIdentityStrings([
+                ...(boundSession.turnAliases || []),
+                ...(notification.turnAliases || []),
+              ]),
+              turnExchangeId: notification.turnExchangeId || boundSession.turnExchangeId || null,
+              workingTurnId: notification.workingTurnId || boundSession.workingTurnId || null,
+              turnRequestId: notification.requestId || boundSession.requestId || null,
+              turnTraceId: notification.turnTraceId || boundSession.turnTraceId || null,
+              timestamp: Date.now(),
+            });
+          }
+        }
         if (conversationId && stateValue === 'running') {
           adoptNotificationTurnIdentity(conversationId, notification);
           emitExecutionState('running', 'ws-turn-running', conversationId, { phase: notification.type });
@@ -1949,7 +2076,9 @@
           conversationId,
           timestamp: Date.now(),
         });
-        if (conversationId) queueCanonicalConversation(conversationId);
+        if (conversationId && stateValue === 'stopped') {
+          queueCanonicalConversation(conversationId);
+        }
       }
     });
   }
@@ -2048,6 +2177,31 @@
     const sessionAliases = uniqueTurnIdentityStrings(session?.turnAliases || []);
     if (!notificationAliases.length || !sessionAliases.length) return true;
     return notificationAliases.some((alias) => sessionAliases.includes(alias));
+  }
+
+  function notificationMatchesPendingNewTurn(notification, session) {
+    if (!session) return false;
+    const notificationAliases = uniqueTurnIdentityStrings(notification?.turnAliases || []);
+    const sessionAliases = uniqueTurnIdentityStrings([
+      ...(session?.turnAliases || []),
+      session?.turnId,
+      session?.transportTurnId,
+      session?.turnExchangeId,
+      session?.workingTurnId,
+      session?.requestId,
+      session?.turnTraceId,
+    ]);
+    if (notificationAliases.length && sessionAliases.length) {
+      if (notificationAliases.some((alias) => sessionAliases.includes(alias))) return true;
+    }
+    // Pure event-driven binding for new chats: a pending session created by a
+    // new chat submission without client aliases claims the first unseen
+    // conversation turn notification that carries valid turn identities.
+    const conversationId = typeof notification?.conversationId === 'string' ? notification.conversationId.trim() : '';
+    if (conversationId && !activeTurnSessions.has(conversationId) && !isProvisionalConversationId(conversationId)) {
+      if (notificationAliases.length) return true;
+    }
+    return false;
   }
 
   function notificationExecutionState(notification) {
@@ -2167,14 +2321,18 @@
     try {
       const url = new URL(String(rawUrl || ""), location.href);
       const routeId = url.pathname.match(/\/(?:c|uc)\/([^/?#]+)/)?.[1];
-      if (routeId) return routeId;
-      const apiId = url.pathname.match(/^\/backend-api\/(?:f\/)?conversations?\/([^/?#]+)\/?$/)?.[1];
-      return apiId && !["prepare", "resume", "runtime"].includes(apiId)
+      if (routeId && !isProvisionalConversationId(routeId)) return routeId;
+      const apiId = url.pathname.match(/^\/backend-api\/(?:f\/)?conversations?\/([^/?#]+)(?:\/messages)?\/?$/)?.[1];
+      return apiId && !["prepare", "resume", "runtime", "messages"].includes(apiId) && !isProvisionalConversationId(apiId)
         ? apiId
         : null;
     } catch {
       return null;
     }
+  }
+
+  function isProvisionalConversationId(value) {
+    return typeof value === "string" && /^WEB:/i.test(value.trim());
   }
 
   function emitLocation() {
@@ -2264,8 +2422,20 @@
         return;
       case "navigate-conversation": {
         const route = payload.route === "uc" ? "uc" : "c";
-        if (payload.conversationId) queueCanonicalConversation(payload.conversationId);
         navigate(`/${route}/${encodeURIComponent(payload.conversationId || "")}`);
+        return;
+      }
+      case "adopt-conversation-id": {
+        const conversationId = typeof payload.conversationId === "string"
+          ? payload.conversationId.trim()
+          : "";
+        if (!conversationId || isProvisionalConversationId(conversationId)) return;
+        bindPendingTurnSession(conversationId);
+        const route = location.pathname.startsWith('/uc/') ? 'uc' : 'c';
+        if (!conversationIdFromUrl(location.href)) {
+          const target = new URL(`/${route}/${encodeURIComponent(conversationId)}`, location.origin);
+          history.replaceState(history.state, '', target.href);
+        }
         return;
       }
       case "new-chat": {
@@ -2556,6 +2726,7 @@
 
   function sleepOfficialUi() {
     const frame = document.getElementById(FRAME_ID);
+    if (officialFocusPermitDepth > 0 || sendInFlight) return;
     if (!officialUiHydrated || !frame || frame.dataset.slimgptVisible !== "1") return;
     if (findBlockingOfficialUi()) {
       suspendTakeoverForBlocker();
@@ -2565,6 +2736,8 @@
   }
 
   function wakeOfficialUi() {
+    clearTimeout(resleepTimer);
+    resleepTimer = null;
     document.documentElement?.removeAttribute(SLEEP_ATTR);
   }
 
@@ -2692,21 +2865,44 @@
       emitLocation();
       return;
     }
-    // Never click host anchors here: an unhandled anchor can fall through to a
-    // real document navigation and tear down the takeover iframe. Route all
-    // SlimGPT-initiated navigation through same-document history instead.
-    navigateWithHistory(target);
+    navigateThroughOfficialRouter(target);
   }
 
-  function navigateWithHistory(target) {
+  function navigateThroughOfficialRouter(target) {
     try {
-      history.pushState(history.state, '', target.href);
-      dispatchEvent(new PopStateEvent('popstate', { state: history.state }));
+      const candidates = target.pathname === '/'
+        ? [
+            document.querySelector('[data-testid="create-new-chat-button"]'),
+            document.querySelector('a[href="/"]'),
+          ]
+        : [...document.querySelectorAll('a[href]')].filter((anchor) => {
+            try {
+              const href = new URL(anchor.href, location.href);
+              return href.origin === target.origin && href.pathname === target.pathname;
+            } catch {
+              return false;
+            }
+          });
+      const control = candidates.find(Boolean) || null;
+      if (control) {
+        try {
+          control.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, button: 0 }));
+        } catch {
+          control.click();
+        }
+      }
+      // Update history and notify listeners. Always update location gracefully
+      // within the single-page application lifecycle without a hard reload.
+      if (location.pathname !== target.pathname || location.search !== target.search) {
+        history.pushState(history.state, '', target.href);
+        window.dispatchEvent(new PopStateEvent('popstate', { state: history.state }));
+        emitLocation();
+      }
     } catch (error) {
       emit({
         type: 'command-error',
         command: 'navigate-conversation',
-        error: `无法在当前页面切换会话：${String(error?.message || error)}`,
+        error: `无法通过官方路由切换会话：${String(error?.message || error)}`,
       });
     }
   }
@@ -2851,25 +3047,32 @@
   }
 
   function findSendButton(composer) {
-    const selectors = [
+    const officialSelectors = [
+      '#composer-submit-button',
       '[data-composer-submit]',
       '[data-testid="send-button"]',
       '[data-testid="fruitjuice-send-button"]',
       '[data-testid="composer-send-button"]',
-      '[data-testid*="send"]',
       'button[aria-label*="发送"]',
       'button[aria-label*="Send"]',
       'button[aria-label*="Prompt"]',
-      'form button[type="submit"]',
-      'button[type="submit"]',
     ];
+
+    // Current ChatGPT renders the ProseMirror editor and its submit control in
+    // sibling subtrees.  A closest-form assumption therefore misses the real
+    // #composer-submit-button even though it is enabled.  Strong official send
+    // identities are safe to resolve document-wide; generic submit buttons are
+    // only considered inside the editor's own form so sidebar/search controls
+    // cannot be clicked accidentally.
+    for (const selector of officialSelectors) {
+      const button = [...document.querySelectorAll(selector)].find(isUsableButton);
+      if (button) return button;
+    }
+
     const form = composer?.closest("form");
-    const roots = form ? [form] : [document];
-    for (const root of roots) {
-      for (const selector of selectors) {
-        const button = [...root.querySelectorAll(selector)].find(isUsableButton);
-        if (button) return button;
-      }
+    if (form) {
+      const button = [...form.querySelectorAll('button[type="submit"]')].find(isUsableButton);
+      if (button) return button;
     }
     return null;
   }
@@ -2879,7 +3082,7 @@
     if (existing) return Promise.resolve(existing);
     return new Promise((resolve) => {
       let settled = false;
-      const root = composer?.closest("form") || document.documentElement || document;
+      const root = document.documentElement || document;
       const observer = new MutationObserver(() => {
         const button = findSendButton(composer);
         if (button) finish(button);
