@@ -56,6 +56,21 @@ html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; backg
 .status-pill { padding: 4px 8px; border: 1px solid var(--slim-line); border-radius: 999px; color: var(--slim-muted); font-size: 10.5px; }
 .status-pill.online { color: var(--f7-theme-color); border-color: color-mix(in srgb, var(--f7-theme-color) 55%, var(--slim-line)); }
 .status-pill.error { color: #cf6258; border-color: #8c413b; }
+
+.conversation-work-state { display: flex; align-items: center; gap: 8px; margin: 10px 16px 0; padding: 7px 10px; border: 1px solid var(--slim-line); border-radius: 10px; font-size: 11px; color: var(--slim-muted); }
+.conversation-work-state .work-dot { width: 8px; height: 8px; border-radius: 999px; background: #4caf7d; flex: none; }
+.conversation-work-state .work-dot.working { background: #e0a63c; animation: slimgpt-work-pulse 1.1s ease-in-out infinite; }
+@keyframes slimgpt-work-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .35; }
+}
+
+.work-indicator { position: absolute; left: 12px; bottom: 12px; display: flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px; background: color-mix(in srgb, #e0a63c 14%, var(--slim-panel, #16181d)); border: 1px solid color-mix(in srgb, #e0a63c 45%, transparent); color: #e8c98a; font-size: 11.5px; z-index: 20; }
+.work-indicator-spinner { width: 11px; height: 11px; border-radius: 999px; border: 2px solid color-mix(in srgb, #e0a63c 30%, transparent); border-top-color: #e0a63c; animation: slimgpt-work-spin .9s linear infinite; flex: none; }
+@keyframes slimgpt-work-spin { to { transform: rotate(360deg); } }
+
+.unrecognized-notice { display: grid; gap: 4px; padding: 10px 12px; border: 1px dashed color-mix(in srgb, var(--slim-muted, #8a8f98) 40%, transparent); border-radius: 10px; font-size: 12px; color: var(--slim-muted, #8a8f98); }
+.unrecognized-notice strong { color: var(--slim-text, #e8eaed); font-size: 12px; }
 .sidebar-actions { display: grid; gap: 6px; margin-bottom: 7px; }
 .new-chat { margin-bottom: 8px; }
 .platform-note { display: grid; gap: 3px; padding: 9px 10px; margin-bottom: 8px; border: 1px solid var(--slim-line); border-radius: 10px; background: var(--slim-soft); font-size: 11px; }
@@ -136,6 +151,11 @@ html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; backg
 /* Chat pane */
 .chat-pane { display: grid; grid-template-rows: 58px minmax(0, 1fr) auto; min-width: 0; min-height: 0; background: var(--slim-bg); }
 .desktop-chat-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 0 20px; border-bottom: 1px solid var(--slim-line); }
+.header-actions { display: flex; align-items: center; gap: 10px; flex: none; }
+.header-work-state { display: inline-flex; align-items: center; gap: 6px; color: var(--slim-muted); font-size: 11px; }
+.header-work-state[data-state="working"] { color: #e8c98a; }
+.header-work-state .work-dot { width: 7px; height: 7px; border-radius: 999px; background: #4caf7d; }
+.header-work-state .work-dot.working { background: #e0a63c; animation: slimgpt-work-pulse 1.1s ease-in-out infinite; }
 .header-title-group { display: grid; min-width: 0; }
 .header-title-group strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13.5px; }
 .header-title-group span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--slim-muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 9px; }
@@ -612,7 +632,10 @@ html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; backg
 @media (max-width: 960px) {
   .slimgpt-page .page-content { padding-top: var(--f7-navbar-height, 48px) !important; }
   .mobile-navbar { display: block; position: absolute; top: 0; left: 0; width: 100%; z-index: 5000; }
-  .mobile-title { max-width: 50vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13.5px; font-weight: 650; }
+  .mobile-title { display: inline-flex; align-items: center; gap: 7px; max-width: 50vw; overflow: hidden; white-space: nowrap; font-size: 13.5px; font-weight: 650; }
+  .mobile-title > span:first-child { overflow: hidden; text-overflow: ellipsis; }
+  .mobile-work-state { width: 7px; height: 7px; border-radius: 999px; background: #4caf7d; flex: none; }
+  .mobile-work-state.working { background: #e0a63c; animation: slimgpt-work-pulse 1.1s ease-in-out infinite; }
   .app-shell { display: block; height: 100%; position: relative; overflow: hidden; }
   .sidebar-host {
     position: absolute;

@@ -689,7 +689,7 @@ async function runFixtureSmoke(browser, extensionId) {
   await waitFor(async () => (await top.evaluate(`window.__slimgptSubmitted || ''`)) === submittedText);
   await waitFor(async () => (await ui.evaluate(uiStateExpression())).draft === '');
   const sendSuccess = await ui.evaluate(uiStateExpression());
-  assert.equal(sendSuccess.composerStatus, '消息已提交');
+  assert.equal(sendSuccess.composerStatus, '消息已发送（官方已确认）', 'composer success requires the page-world send confirmation, not just the click');
 
   await top.evaluate(`(() => {
     window.__slimgptContinueClicks = 0;
@@ -704,7 +704,43 @@ async function runFixtureSmoke(browser, extensionId) {
   })()`);
   await waitFor(async () => (await top.evaluate('window.__slimgptContinueClicks || 0')) === 1, 4_000);
 
+  // send-unconfirmed contract: a silent composer (button click swallowed) must
+  // be reported as unconfirmed instead of success. The original fixture
+  // composer is removed first so the silent one is the only composer found.
   await top.evaluate(`document.getElementById('fixture-composer')?.remove()`);
+  await top.evaluate(`(() => {
+    const form = document.createElement('form');
+    form.id = 'fixture-composer-silent';
+    form.style.cssText = 'position:fixed;left:20px;top:20px;width:500px;height:120px;display:block';
+    const textarea = document.createElement('textarea');
+    textarea.id = 'mobile-composer-prompt-silent';
+    textarea.setAttribute('data-mobile-composer-prompt', '');
+    textarea.style.cssText = 'display:block;width:400px;height:60px';
+    const button = document.createElement('button');
+    button.type = 'submit';
+    button.setAttribute('data-composer-submit', '');
+    button.style.cssText = 'display:block;width:100px;height:40px';
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      // A dropped click: nothing happens, composer keeps its text.
+    });
+    form.append(textarea, button);
+    document.body.appendChild(form);
+    return true;
+  })()`);
+  const unconfirmedText = 'Unconfirmed send must not report success';
+  await ui.evaluate(fillAndSubmitExpression(unconfirmedText));
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).composerStatus.includes('未确认'), 12_000);
+  const unconfirmedSend = await ui.evaluate(uiStateExpression());
+  assert.equal(unconfirmedSend.draft, unconfirmedText, 'unconfirmed sends must keep the draft');
+  await top.evaluate(`document.getElementById('fixture-composer-silent')?.remove()`);
+  await ui.evaluate(`(() => {
+    const textarea = document.querySelector('.composer-shell textarea');
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+    setter.call(textarea, '');
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+
   const failedText = 'Draft that must survive';
   await ui.evaluate(fillAndSubmitExpression(failedText));
   await waitFor(async () => (await ui.evaluate(uiStateExpression())).composerStatus.includes('找不到官方输入框'), 7_000);
@@ -762,7 +798,7 @@ async function runFixtureSmoke(browser, extensionId) {
   assert.equal(navigationLoading.top.sleep, '1', 'official UI must remain render-slept behind the stable takeover frame');
   assert.equal(navigationLoading.ui.loading, true, 'right pane must show a loading state before target payload arrives');
   assert.equal(navigationLoading.ui.composerDisabled, true, 'composer must be disabled while the target conversation is loading');
-  assert.ok(navigationLoading.ui.mountedCards > 0, 'previous question+answer turn should remain mounted behind the loading overlay');
+  assert.equal(navigationLoading.ui.mountedCards, 0, 'previous conversation must disappear as soon as navigation starts');
   assert.ok(navigationLoading.popstatePaths.includes('/c/second'), 'SPA fallback must notify the host router with popstate');
 
   await waitFor(async () => {
@@ -771,6 +807,13 @@ async function runFixtureSmoke(browser, extensionId) {
   });
   assert.equal(await ui.evaluate(`!!document.querySelector('.conversation-loading')`), false, 'loading state must disappear after payload arrives');
   assert.equal(await top.evaluate('window.__slimgptNavigationDocumentToken'), navigationDocumentToken, 'payload load must not replace the host document');
+
+  // Cross-conversation bleed regression: after navigating smoke → second, the
+  // smoke conversation messages must not leak into the second conversation's
+  // right pane.
+  const bleedCheck = await ui.evaluate(uiStateExpression());
+  assert.equal(bleedCheck.messages.includes('Fixture answer'), false, 'smoke conversation content must not bleed into the second conversation');
+  assert.equal(bleedCheck.messages.includes('Fixture user message 1'), false, 'smoke conversation question must not bleed across conversations');
 
   const toolRendering = await ui.evaluate(`(() => {
     const text = (selector) => {
@@ -818,6 +861,8 @@ async function runFixtureSmoke(browser, extensionId) {
     const state = await ui.evaluate(uiStateExpression());
     return state.messages.includes('Live-only answer') && !state.loading;
   });
+  // The live-only conversation carries no finished assistant payload; its
+  // work-state indicator must not be stuck at "working" here.
   const liveOnlyNavigation = await ui.evaluate(`(() => ({
     loading: !!document.querySelector('.conversation-loading'),
     messages: document.querySelector('.message-stage')?.innerText?.replace(/\\s+/g, ' ').trim() || '',
@@ -826,6 +871,29 @@ async function runFixtureSmoke(browser, extensionId) {
   assert.equal(liveOnlyNavigation.loading, false, 'visible live/stream content must dismiss the loading overlay without a full conversation payload');
   assert.ok(liveOnlyNavigation.messages.includes('Live-only answer'));
   assert.equal(liveOnlyNavigation.composerStatus.includes('加载超时'), false);
+
+  // Unrecognized content contract: a live message with a future/unknown
+  // content type and no text must surface as explicit unrecognized content,
+  // never as a perpetual "thinking" spinner. This rides the real fetch
+  // capture pipeline (message events with structured content), matching how
+  // ChatGPT actually delivers non-text messages.
+  await top.evaluate(`history.replaceState(history.state, '', '/c/live-only');
+    fetch('/backend-api/messages/unknown-content').then((response) => response.json()).catch(() => {});`);
+  await waitFor(async () => {
+    const state = await ui.evaluate(uiStateExpression());
+    return state.messages.includes('官方消息（非文本内容）');
+  });
+  assert.equal(
+    await ui.evaluate(`!!document.querySelector('.message-card .unrecognized-notice')`),
+    true,
+    'unknown content types must show the explicit unrecognized notice',
+  );
+  assert.equal(
+    await ui.evaluate(`!!document.querySelector('.message-card .unrecognized-notice .thinking-spinner')`),
+    false,
+    'unrecognized content must not render the thinking spinner',
+  );
+  await top.evaluate(`history.replaceState(history.state, '', '/c/live-only')`);
 
   await top.evaluate(`(() => {
     const article = document.createElement('article');
@@ -857,12 +925,23 @@ async function runFixtureSmoke(browser, extensionId) {
   const conversationNavigation = await top.evaluate('location.href');
   assert.equal(await top.evaluate('window.__slimgptNavigationDocumentToken'), navigationDocumentToken, 'cached conversation switches must also stay in-document');
 
+  const resumed = new Promise((resolve) => {
+    fixture.onResumeRequest = (count) => {
+      if (count >= 2) resolve(count);
+    };
+  });
   const officialResumeBody = await top.evaluate(`fetch('/backend-api/f/conversation/resume', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ conversation_id: 'smoke', offset: 0 }),
   }).then((response) => response.text())`);
   assert.equal(officialResumeBody, 'data: [DONE]\n\n', 'takeover must stop the official resume parser after cloning its stream');
+  const resumeReconnectCount = await Promise.race([
+    resumed,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('resume reconnect timeout')), 10_000)),
+  ]);
+  delete fixture.onResumeRequest;
+  assert.equal(resumeReconnectCount, 2, 'an interrupted resume stream must reconnect exactly once before [DONE]');
   await waitFor(async () => (await ui.evaluate(uiStateExpression())).messages.includes('Diverted resume answer'));
 
   await ui.evaluate(`document.querySelector('.new-chat')?.click()`);
@@ -931,9 +1010,13 @@ async function runLiveSmoke(browser, extensionId) {
     if (sendLive) {
       assert.equal(state.composer, true, 'real ChatGPT composer is required for --send-live');
       const prompt = process.env.SLIMGPT_LIVE_PROMPT || 'SlimGPT live smoke test: reply with exactly OK';
+      const expect = process.env.SLIMGPT_LIVE_EXPECT || 'OK';
       await ui.evaluate(fillAndSubmitExpression(prompt));
-      await waitFor(async () => (await ui.evaluate(uiStateExpression())).composerStatus === '消息已提交', 10_000);
-      await waitFor(async () => (await ui.evaluate(uiStateExpression())).assistant.includes('OK'), 45_000);
+      await waitFor(async () => (await ui.evaluate(uiStateExpression())).composerStatus === '消息已发送（官方已确认）', 10_000);
+      await waitFor(async () => (await ui.evaluate(uiStateExpression())).assistant.includes(expect), 45_000);
+      // Event-driven contract: once the final stream event (finished status /
+      // end_turn) is captured, the work indicator must flip back to idle.
+      await waitFor(async () => (await ui.evaluate(uiStateExpression())).sidebarWorkState === 'idle', 45_000);
       uiState = await ui.evaluate(uiStateExpression());
     }
   } catch (error) {
@@ -961,7 +1044,11 @@ async function fulfillFixtureRequest(client, event, fixture) {
     body = fixture.document;
     contentType = 'text/html; charset=utf-8';
   } else if (url.includes('/backend-api/f/conversation/resume')) {
-    body = fixture.resume;
+    fixture.resumeRequests = (fixture.resumeRequests || 0) + 1;
+    body = fixture.resumeRequests === 1
+      ? fixture.resume.replace(/\ndata: \[DONE\]\n\n$/, '')
+      : fixture.resume;
+    fixture.onResumeRequest?.(fixture.resumeRequests);
     contentType = 'text/event-stream; charset=utf-8';
   } else if (url.includes('/backend-api/conversations')) {
     body = JSON.stringify(fixture.list);
@@ -969,10 +1056,13 @@ async function fulfillFixtureRequest(client, event, fixture) {
   } else if (url.includes('/backend-api/conversation/second')) {
     body = JSON.stringify(fixture.secondConversation);
     contentType = 'application/json; charset=utf-8';
-  } else if (url.includes('/backend-api/messages/live-only')) {
-    body = JSON.stringify(fixture.liveOnlyEvent);
-    contentType = 'application/json; charset=utf-8';
-  } else if (url.includes('/backend-api/conversation/smoke')) {
+    } else if (url.includes('/backend-api/messages/live-only')) {
+      body = JSON.stringify(fixture.liveOnlyEvent);
+      contentType = 'application/json; charset=utf-8';
+    } else if (url.includes('/backend-api/messages/unknown-content')) {
+      body = JSON.stringify(fixture.unknownContentEvent);
+      contentType = 'application/json; charset=utf-8';
+    } else if (url.includes('/backend-api/conversation/smoke')) {
     body = JSON.stringify(fixture.conversation);
     contentType = 'application/json; charset=utf-8';
   } else if (url.includes('/unauth-mweb/conversation/updates')) {
@@ -1118,6 +1208,17 @@ function makeFixture() {
         create_time: 5,
       },
     },
+    unknownContentEvent: {
+      conversation_id: 'live-only',
+      message: {
+        id: 'unknown-content-a1',
+        author: { role: 'assistant' },
+        content: { content_type: 'unknown_future_type', parts: [''] },
+        status: 'in_progress',
+        end_turn: false,
+        create_time: 6,
+      },
+    },
     resume: `data: ${JSON.stringify({
       conversation_id: 'smoke',
       message: {
@@ -1144,6 +1245,7 @@ function installComposerExpression() {
     const textarea = document.createElement('textarea');
     textarea.id = 'mobile-composer-prompt';
     textarea.setAttribute('data-mobile-composer-prompt', '');
+    textarea.__reactProps$fixture = {};
     textarea.style.cssText = 'display:block;width:400px;height:60px';
     const button = document.createElement('button');
     button.type = 'submit';
@@ -1158,6 +1260,13 @@ function installComposerExpression() {
     button.addEventListener('click', (event) => {
       event.preventDefault();
       window.__slimgptSubmitted = textarea.value;
+      const message = document.createElement('div');
+      message.setAttribute('data-message-id', 'fixture-submitted-user');
+      const content = document.createElement('div');
+      content.setAttribute('data-message-author-role', 'user');
+      content.textContent = textarea.value;
+      message.appendChild(content);
+      document.body.appendChild(message);
       textarea.value = '';
     });
     form.addEventListener('submit', (event) => event.preventDefault());
@@ -1212,7 +1321,11 @@ function uiStateExpression() {
     activeOverview: document.querySelector('.overview-item.active .overview-number')?.textContent?.trim() || '',
     modelLabel: document.querySelector('.conversation-item.active .conversation-model')?.textContent?.trim() || '',
     historyPreview: document.querySelector('.conversation-item.active .conversation-preview')?.textContent?.trim() || '',
-    conversations: document.querySelectorAll('.conversation-item').length
+    conversations: document.querySelectorAll('.conversation-item').length,
+    workIndicator: document.querySelector('.work-indicator')?.textContent?.replace(/\\s+/g, ' ').trim() || '',
+    sidebarWorkState: document.querySelector('.conversation-work-state')?.dataset?.state || '',
+    sidebarWorkLabel: document.querySelector('.conversation-work-state')?.textContent?.replace(/\\s+/g, ' ').trim() || '',
+    thinkingActiveLevel: document.querySelector('.thinking-segmented [aria-checked="true"]')?.getAttribute('data-thinking-level') || ''
   }))()`;
 }
 

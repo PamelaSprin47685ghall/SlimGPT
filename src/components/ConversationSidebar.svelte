@@ -7,11 +7,14 @@
     statusLabel = '未连接',
     statusState = 'offline',
     captures = 0,
+    workState = 'idle',
     onShowOfficial = () => {},
     onExportMarkdown = () => {},
     onNewChat = () => {},
     onSelect = () => {},
   } = $props();
+
+  const workLabel = $derived(workState === 'working' ? '对话进行中' : '对话已停止');
 
   let query = $state('');
   let filtered = $derived.by(() => {
@@ -49,6 +52,11 @@
     <span class:online={statusState === 'online'} class:error={statusState === 'error'} class="status-pill">
       {statusLabel}
     </span>
+  </div>
+
+  <div class="conversation-work-state" data-state={workState} role="status">
+    <span class="work-dot" class:working={workState === 'working'} aria-hidden="true"></span>
+    <span>{workLabel}</span>
   </div>
 
   <div class="sidebar-actions">

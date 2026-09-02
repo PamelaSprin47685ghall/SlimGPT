@@ -14,9 +14,10 @@
 
   const hasText = $derived(Boolean(String(message?.text || '').trim()));
   const hasThought = $derived(Boolean(String(message?.thought || '').trim()));
-  const isThinking = $derived(Boolean(message?.isThinking || (!hasText && !message?.tool && (message?.status === 'in_progress' || message?.live))));
+  const isThinking = $derived(Boolean(message?.isThinking));
   const isStreaming = $derived(Boolean(message?.live && message?.status !== 'finished_successfully' && message?.status !== 'finished'));
   const isError = $derived(Boolean(message?.error || message?.status === 'failed'));
+  const unrecognized = $derived(Boolean(!hasText && !hasThought && !message?.tool && !isThinking && !isError && message?.unrecognized));
 
   // Auto-expand thought if it's currently generating and has no text yet
   $effect(() => {
@@ -205,10 +206,20 @@
         <ToolPayloadBlock tool={message.tool} />
       {:else if hasText}
         <IncrementalMarkdown source={message.text} streaming={isStreaming} />
+      {:else if hasThought && isStreaming && !message?.endTurn}
+        <div class="thinking-indicator" role="status" aria-live="polite">
+          <span class="thinking-spinner" aria-hidden="true"></span>
+          <span>思考中…</span>
+        </div>
       {:else if isThinking}
         <div class="thinking-indicator" role="status" aria-live="polite">
           <span class="thinking-spinner" aria-hidden="true"></span>
           <span>ChatGPT 正在思考与生成…</span>
+        </div>
+      {:else if unrecognized}
+        <div class="unrecognized-notice">
+          <strong>官方消息（非文本内容）</strong>
+          <span>这条消息包含 SlimGPT 尚未识别的内容类型，已原样保留。可点击「暂时显示官方界面」查看完整内容。</span>
         </div>
       {:else if isError}
         <div class="error-notice">⚠️ 消息生成失败或被官方界面中断</div>

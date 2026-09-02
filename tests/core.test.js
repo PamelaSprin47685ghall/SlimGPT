@@ -4,6 +4,7 @@ import {
   buildConversationView,
   consumeSse,
   conversationIdFromUrl,
+  conversationThinkingLevel,
   extractConversationItems,
   extractModelsList,
   extractThought,
@@ -11,6 +12,7 @@ import {
   getThinkingLevel,
   getToolMessageInfo,
   groupConversationTurns,
+  hasNonTextExtras,
   messageNodeToView,
   parseWebMobilePartialConversation,
   stepConversationBranch,
@@ -84,6 +86,7 @@ test('conversation id parser supports UI and API URLs', () => {
   assert.equal(conversationIdFromUrl('https://chatgpt.com/c/abc-123'), 'abc-123');
   assert.equal(conversationIdFromUrl('https://chatgpt.com/uc/anon-123'), 'anon-123');
   assert.equal(conversationIdFromUrl('https://chatgpt.com/backend-api/conversation/xyz'), 'xyz');
+  assert.equal(conversationIdFromUrl('https://chatgpt.com/backend-api/conversations/xyz'), 'xyz');
 });
 
 test('web-mobile partial HTML becomes a canonical conversation graph', () => {
@@ -181,6 +184,26 @@ test('messageNodeToView handles empty messages and identifies thinking state', (
   assert.equal(view.error, false);
 });
 
+test('status-less DOM echoes cannot regress a finished live message', () => {
+  const finished = upsertLiveMessage([], {
+    id: 'stream-finished',
+    author: { role: 'assistant' },
+    content: { parts: ['Complete answer'] },
+    status: 'finished_successfully',
+    end_turn: true,
+  });
+  const echoed = upsertLiveMessage(finished, {
+    id: 'stream-finished',
+    author: { role: 'assistant' },
+    content: { parts: ['Complete answer'] },
+    status: null,
+    end_turn: null,
+  });
+  assert.equal(echoed[0].status, 'finished_successfully');
+  assert.equal(echoed[0].endTurn, true);
+  assert.equal(echoed[0].isThinking, false);
+});
+
 test('upsertLiveMessage preserves reasoning thoughts and model metadata during streaming', () => {
   const initial = upsertLiveMessage([], {
     id: 'stream-1',
@@ -229,6 +252,110 @@ test('extractModelsList extracts and normalizes models from ChatGPT /backend-api
   assert.equal(models[0].isReasoning, true);
   assert.equal(models[1].slug, 'gpt-5.6-pro');
   assert.equal(models[1].isReasoning, true);
+});
+
+test('hasNonTextExtras recognizes non-text message payloads instead of showing thinking', () => {
+  assert.equal(hasNonTextExtras({ content: { content_type: 'text', parts: ['plain'] } }), false);
+  assert.equal(hasNonTextExtras({ content: { content_type: 'text', parts: [''] } }), false);
+  assert.equal(hasNonTextExtras({ content: { content_type: 'text', parts: [] } }), false, 'a plain empty text message stays an empty message, not extras');
+  assert.equal(hasNonTextExtras({ content: { content_type: 'multimodal_text', parts: [{ asset_pointer: 'file-service://abc', content_type: 'image_asset_pointer' }] } }), true);
+  assert.equal(hasNonTextExtras({ content: { content_type: 'audio_transcript', parts: [{ transcript: 'hi' }] } }), false, 'transcript-only parts already render through partToText');
+  assert.equal(hasNonTextExtras({ content: { content_type: 'real_time_user_audio_video_asset_pointer', parts: [{ asset_pointer: 'video://x' }] } }), true);
+  assert.equal(hasNonTextExtras({ content: { content_type: 'system_error', name: 'system_error', text: 'boom' } }), false, 'error content carries text and is surfaced as an error, not extras');
+  assert.equal(hasNonTextExtras({ content: { content_type: 'execution_output', text: '...' } }), false);
+  assert.equal(hasNonTextExtras({ content: { files: [{ name: 'a.pdf' }] } }), true);
+  assert.equal(hasNonTextExtras({ content: null }), false);
+});
+
+test('messageNodeToView keeps non-text live messages visible instead of a perpetual thinking spinner', () => {
+  const view = messageNodeToView({
+    id: 'n1',
+    message: {
+      id: 'm1',
+      author: { role: 'assistant' },
+      content: { content_type: 'multimodal_text', parts: [{ asset_pointer: 'file-service://img' }] },
+      status: 'finished_successfully',
+    },
+  }, { n1: { id: 'n1', message: null } });
+  assert.equal(view.isThinking, false, 'attachment messages must not be labeled as thinking');
+  assert.ok(view.text.includes('file-service://img'), 'attachment pointer becomes a readable label');
+
+  const emptyLive = upsertLiveMessage([], {
+    id: 'm2',
+    author: { role: 'assistant' },
+    content: { content_type: 'text', parts: [''] },
+    status: 'in_progress',
+  });
+  assert.equal(emptyLive[0].isThinking, true, 'genuinely empty in-progress stream still shows thinking');
+
+  const unknownLive = upsertLiveMessage([], {
+    id: 'm3',
+    author: { role: 'assistant' },
+    content: { content_type: 'unknown_future_type', parts: [''] },
+    status: 'in_progress',
+  });
+  assert.equal(unknownLive[0].isThinking, false, 'unrecognized non-text content must not show a thinking spinner');
+  assert.ok(unknownLive[0].text.length > 0 || unknownLive[0].unrecognized, 'unrecognized content stays visible with an explicit placeholder');
+});
+
+test('optimized conversation responses become canonical graphs with thinking effort', () => {
+  const optimized = {
+    conversation_id: 'optimized-1',
+    title: 'Optimized',
+    current_node: 'a1',
+    messages: [
+      {
+        id: 'hidden',
+        author: { role: 'system' },
+        content: { content_type: 'text', parts: ['hidden setup'] },
+        status: 'finished_successfully',
+        metadata: { is_visually_hidden_from_conversation: true },
+      },
+      {
+        id: 'u1',
+        author: { role: 'user' },
+        content: { content_type: 'text', parts: ['question'] },
+        status: 'finished_successfully',
+        metadata: { parent_id: 'hidden', thinking_effort: 'max' },
+      },
+      {
+        id: 'a1',
+        author: { role: 'assistant' },
+        content: { content_type: 'text', parts: ['answer'] },
+        status: 'finished_successfully',
+        end_turn: true,
+        metadata: { parent_id: 'u1', thinking_effort: 'max' },
+      },
+    ],
+  };
+
+  const canonical = findConversationPayload(optimized);
+  assert.equal(canonical.id, 'optimized-1');
+  assert.equal(canonical.mapping.a1.parent, 'u1');
+  assert.deepEqual(buildConversationView(canonical).map((message) => message.text), ['question', 'answer']);
+  assert.equal(conversationThinkingLevel(canonical)?.level, 5);
+});
+
+test('conversationThinkingLevel derives the level from the conversation graph metadata', () => {
+  const payload = {
+    current_node: 'a1',
+    mapping: {
+      u1: { id: 'u1', parent: null, children: ['a1'], message: { id: 'mu', author: { role: 'user' }, content: { parts: ['q'] } } },
+      a1: {
+        id: 'a1',
+        parent: 'u1',
+        children: [],
+        message: {
+          id: 'ma',
+          author: { role: 'assistant' },
+          content: { parts: ['answer'] },
+          metadata: { model_slug: 'gpt-5.6', reasoning_effort: 'xhigh' },
+        },
+      },
+    },
+  };
+  assert.equal(conversationThinkingLevel(payload)?.level, 4);
+  assert.equal(conversationThinkingLevel({ mapping: {} }), null);
 });
 
 test('getThinkingLevel resolves 5-level thinking slider from instant to pro', () => {

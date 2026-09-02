@@ -19,16 +19,34 @@
   const INITIAL_SHELL_READY_TIMEOUT = 15_000;
   const COMPOSER_WAKE_TIMEOUT = 2_500;
   const SEND_CONTROL_TIMEOUT = 1_500;
+  const SEND_CONFIRM_TIMEOUT = 10_000;
   const BLOCKED_TAKEOVER_RETRY_MS = 500;
   const TAKEOVER_BLOCKER_GUARD_MS = 5_000;
   const COMPLETE_RESPONSE_RECLICK_MS = 1_250;
+  const RESUME_PATH = "/backend-api/f/conversation/resume";
+  const RECONNECT_STORM_WINDOW_MS = 15_000;
+  const RECONNECT_STORM_LIMIT = 6;
   let requestCounter = 0;
   let resleepTimer = null;
   let sendInFlight = false;
   let takeoverActive = false;
+  let officialUiHydrated = false;
+  let renderSleepRequested = false;
   let officialFocusPermitDepth = 0;
   let lastContinueControl = null;
   let lastContinueClickAt = 0;
+  let pendingSendConfirmation = null;
+  let backendFetch = null;
+  let backendFetchThis = null;
+  let backendHeaders = null;
+  let thinkingSync = Promise.resolve();
+  let resumeGeneration = 0;
+  let resumeSession = null;
+  let conversationSocketGeneration = 0;
+  let conversationSocketState = null;
+  let observedLocationHref = location.href;
+  const canonicalFetches = new Map();
+  const pendingCanonicalIds = new Set();
   const observedFetchResponses = new WeakSet();
   const XHR_RESPONSE_OBSERVED = Symbol("slimgpt-xhr-response-observed");
   const WEBSOCKET_OBSERVED = Symbol("slimgpt-websocket-observed");
@@ -67,10 +85,25 @@
   installDomMessageObserver();
   installBlockerObserver();
   scheduleInitialTakeover();
-  emit({ type: "page-hook-ready", timestamp: Date.now(), url: location.href });
 
   let observedFetch = null;
   installFetchObserver();
+  emit({ type: "page-hook-ready", timestamp: Date.now(), url: location.href });
+
+  const resumeDisconnectedTransports = () => {
+    reconnectResumeIfNeeded();
+    reconnectConversationSocketIfNeeded();
+  };
+  addEventListener("focus", resumeDisconnectedTransports);
+  addEventListener("online", resumeDisconnectedTransports);
+  addEventListener("load", maybeMarkOfficialUiHydrated, { once: true });
+  addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") resumeDisconnectedTransports();
+  });
+  addEventListener("pagehide", () => {
+    resetResumeSession();
+    resetConversationSocket();
+  }, { once: true });
 
   function installFetchObserver() {
     const initialFetch = window.fetch;
@@ -214,8 +247,8 @@
   function installDomMessageObserver() {
     let observer = null;
     let scanTimer = null;
-    let currentConversationId = null;
     const seenText = new Map();
+    const messageOwners = new Map();
     const MAX_SEEN_MESSAGES = 120;
 
     const schedule = () => {
@@ -225,13 +258,10 @@
 
     const scan = () => {
       scanTimer = null;
+      maybeMarkOfficialUiHydrated();
       const match = location.pathname.match(/\/(?:c|uc)\/([^/?#]+)/);
-      const conversationId = match?.[1] || null;
-      if (!conversationId) return;
-      if (conversationId !== currentConversationId) {
-        currentConversationId = conversationId;
-        seenText.clear();
-      }
+      const pageConversationId = match?.[1] || null;
+      if (!pageConversationId) return;
 
       const nodes = document.querySelectorAll('[data-message-author-role]');
       for (let i = Math.max(0, nodes.length - 15); i < nodes.length; i += 1) {
@@ -241,12 +271,15 @@
         const messageRoot = roleNode.closest('[data-message-id]') || roleNode.querySelector?.('[data-message-id]');
         const messageId = messageRoot?.getAttribute?.('data-message-id') || roleNode.getAttribute('data-message-id');
         if (!messageId) continue;
+        const conversationId = messageOwners.get(messageId) || pageConversationId;
+        if (!messageOwners.has(messageId)) messageOwners.set(messageId, conversationId);
         const text = String(roleNode.textContent || '').replace(/\u00a0/g, ' ').trim();
         if (!text || seenText.get(messageId) === text) continue;
         seenText.set(messageId, text);
         if (seenText.size > MAX_SEEN_MESSAGES) {
           const oldest = seenText.keys().next().value;
           seenText.delete(oldest);
+          messageOwners.delete(oldest);
         }
         emit({
           type: "page-capture",
@@ -262,8 +295,11 @@
               id: messageId,
               author: { role },
               content: { content_type: "text", parts: [text] },
-              status: role === 'assistant' ? "in_progress" : null,
-              end_turn: false,
+              // The DOM never knows the stream lifecycle: claiming
+              // in_progress here regresses already-finished messages. The
+              // UI merge preserves richer state from real stream events.
+              status: null,
+              end_turn: null,
             },
           }),
         });
@@ -295,9 +331,26 @@
   }
 
   function wrapFetch(upstreamFetch) {
-    return async function slimgptObservedFetch(input) {
-      const response = await Reflect.apply(upstreamFetch, this, arguments);
-      const url = response.url || (typeof input === "string" ? input : input?.url);
+    return async function slimgptObservedFetch(input, init) {
+      const fetchThis = this;
+      const request = observedRequest(input, init);
+      if (request) observeBackendRequest(request, upstreamFetch, fetchThis);
+      const resumeSnapshot = request && isResumeRequest(request)
+        ? snapshotRequest(request, upstreamFetch, fetchThis)
+        : null;
+      const submission = request && isConversationSubmission(request);
+
+      let response;
+      try {
+        response = await Reflect.apply(upstreamFetch, fetchThis, arguments);
+      } catch (error) {
+        if (submission) settleSendConfirmation(false, "request-failed");
+        throw error;
+      }
+      if (submission) settleSendConfirmation(response.ok, response.ok ? "request-accepted" : `http-${response.status}`);
+      queueMicrotask(maybeMarkOfficialUiHydrated);
+
+      const url = response.url || request?.url || (typeof input === "string" ? input : input?.url);
       if (!interesting(url)) return response;
       if (observedFetchResponses.has(response)) return response;
       observedFetchResponses.add(response);
@@ -311,6 +364,11 @@
         return response;
       }
 
+      const divertOfficialStream = shouldDivertOfficialConversationStream(response, url, mimeType);
+      const divertResume = Boolean(resumeSnapshot && divertOfficialStream);
+      let resumeGenerationForCapture = null;
+      if (divertResume) resumeGenerationForCapture = adoptResumeRequest(resumeSnapshot);
+
       if (mimeType.includes("text/vnd.openai.web-mobile-partial+html") && clone.body) {
         void captureWebMobileStream(clone.body, {
           requestId,
@@ -319,12 +377,20 @@
           mimeType,
         });
       } else if (mimeType.includes("text/event-stream") && clone.body) {
-        void captureReadableStream(clone.body, {
+        const streamMeta = {
           requestId,
           url,
           status: response.status,
           mimeType,
-        });
+        };
+        if (divertResume) {
+          streamMeta.resume = true;
+          streamMeta.cancelSignal = resumeSession?.generation === resumeGenerationForCapture
+            ? resumeSession.controller?.signal
+            : null;
+          streamMeta.onClose = (result) => handleResumeStreamClose(resumeGenerationForCapture, result);
+        }
+        void captureReadableStream(clone.body, streamMeta);
       } else {
         const declaredLength = Number(response.headers.get("content-length") || 0);
         if (!declaredLength || declaredLength <= MAX_NON_STREAM_BODY) {
@@ -337,14 +403,100 @@
         }
       }
 
-      if (shouldDivertOfficialResume(response, url, mimeType)) {
-        return completeOfficialResume(response);
-      }
-      return response;
+      return divertOfficialStream ? completeOfficialStream(response) : response;
     };
   }
 
-  function shouldDivertOfficialResume(response, rawUrl, mimeType) {
+  function observedRequest(input, init) {
+    try {
+      const source = input instanceof Request ? input.clone() : input;
+      return new Request(source, init);
+    } catch {
+      return null;
+    }
+  }
+
+  function requestUrl(request) {
+    try {
+      return new URL(request.url, location.href);
+    } catch {
+      return null;
+    }
+  }
+
+  function isResumeRequest(request) {
+    const url = requestUrl(request);
+    return Boolean(url && url.origin === location.origin && url.pathname === RESUME_PATH);
+  }
+
+  function isConversationSubmission(request) {
+    if (request.method.toUpperCase() !== "POST") return false;
+    const url = requestUrl(request);
+    return Boolean(
+      url &&
+      url.origin === location.origin &&
+      (url.pathname === "/backend-api/conversation" || url.pathname === "/backend-api/f/conversation")
+    );
+  }
+
+  function observeBackendRequest(request, upstreamFetch, fetchThis) {
+    const url = requestUrl(request);
+    if (!url || url.origin !== location.origin || !url.pathname.startsWith("/backend-api/")) return;
+    backendFetch = upstreamFetch;
+    backendFetchThis = fetchThis;
+    if (request.headers.get("authorization")) {
+      backendHeaders = new Headers(request.headers);
+      drainCanonicalFetches();
+    }
+  }
+
+  function snapshotRequest(request, upstreamFetch, fetchThis) {
+    const method = request.method.toUpperCase();
+    const hasBody = method !== "GET" && method !== "HEAD" && request.body !== null;
+    const bodyPromise = hasBody
+      ? request.clone().arrayBuffer().catch(() => null)
+      : Promise.resolve(null);
+    return {
+      url: request.url,
+      method,
+      headers: new Headers(request.headers),
+      credentials: request.credentials,
+      cache: request.cache,
+      redirect: request.redirect,
+      referrer: request.referrer,
+      referrerPolicy: request.referrerPolicy,
+      integrity: request.integrity,
+      keepalive: request.keepalive,
+      mode: request.mode,
+      hasBody,
+      bodyPromise,
+      upstreamFetch,
+      fetchThis,
+      conversationId: conversationIdFromLocation(),
+    };
+  }
+
+  async function requestFromSnapshot(snapshot, signal) {
+    const body = await snapshot.bodyPromise;
+    if (snapshot.hasBody && body === null) throw new Error("resume-body-unavailable");
+    const init = {
+      method: snapshot.method,
+      headers: new Headers(snapshot.headers),
+      credentials: snapshot.credentials,
+      cache: snapshot.cache,
+      redirect: snapshot.redirect,
+      referrer: snapshot.referrer,
+      referrerPolicy: snapshot.referrerPolicy,
+      integrity: snapshot.integrity,
+      keepalive: snapshot.keepalive,
+      mode: snapshot.mode,
+      signal,
+    };
+    if (body !== null) init.body = body.slice(0);
+    return new Request(snapshot.url, init);
+  }
+
+  function shouldDivertOfficialConversationStream(response, rawUrl, mimeType) {
     if (
       !takeoverActive ||
       !response.ok ||
@@ -355,13 +507,174 @@
     }
     try {
       const url = new URL(String(rawUrl || ""), location.href);
-      return url.origin === location.origin && url.pathname === "/backend-api/f/conversation/resume";
+      return (
+        url.origin === location.origin &&
+        /^\/backend-api\/(?:f\/)?conversation(?:\/resume)?$/.test(url.pathname)
+      );
     } catch {
       return false;
     }
   }
 
-  function completeOfficialResume(response) {
+  // The official renderer is fragile with long-lived streams. SlimGPT owns
+  // the real resume response and gives the official consumer an immediate
+  // terminal frame. If the owned stream drops without [DONE], the exact
+  // observed request is replayed immediately; delay is used only to stop a
+  // reconnect storm.
+  function adoptResumeRequest(snapshot) {
+    resetResumeSession();
+    const generation = ++resumeGeneration;
+    resumeSession = {
+      generation,
+      snapshot,
+      controller: new AbortController(),
+      reconnectTimer: null,
+      reconnectQueued: false,
+      reconnectTimes: [],
+      needsReconnect: false,
+    };
+    return generation;
+  }
+
+  function handleResumeStreamClose(generation, { sawDone, error }) {
+    const session = resumeSession;
+    if (!session || session.generation !== generation) return;
+    session.controller = null;
+    if (sawDone) {
+      session.needsReconnect = false;
+      emit({
+        type: "page-stream-status",
+        transport: "sse",
+        phase: "complete",
+        state: "idle",
+        conversationId: session.snapshot.conversationId || conversationIdFromLocation(),
+        timestamp: Date.now(),
+      });
+      return;
+    }
+    session.needsReconnect = true;
+    emit({
+      type: "page-stream-status",
+      transport: "sse",
+      phase: "closed",
+      state: "disconnected",
+      error: Boolean(error),
+      conversationId: session.snapshot.conversationId || conversationIdFromLocation(),
+      timestamp: Date.now(),
+    });
+    scheduleResumeReconnect(session);
+  }
+
+  function scheduleResumeReconnect(session = resumeSession) {
+    if (
+      !session ||
+      session !== resumeSession ||
+      !session.needsReconnect ||
+      session.controller ||
+      session.reconnectTimer ||
+      session.reconnectQueued ||
+      !takeoverActive ||
+      !navigator.onLine
+    ) {
+      return;
+    }
+
+    const now = Date.now();
+    session.reconnectTimes = session.reconnectTimes.filter((at) => now - at < RECONNECT_STORM_WINDOW_MS);
+    if (session.reconnectTimes.length >= RECONNECT_STORM_LIMIT) {
+      const delay = Math.max(1, session.reconnectTimes[0] + RECONNECT_STORM_WINDOW_MS - now);
+      session.reconnectTimer = setTimeout(() => {
+        if (session !== resumeSession) return;
+        session.reconnectTimer = null;
+        scheduleResumeReconnect(session);
+      }, delay);
+      return;
+    }
+
+    session.reconnectTimes.push(now);
+    session.reconnectQueued = true;
+    queueMicrotask(() => {
+      if (session !== resumeSession) return;
+      session.reconnectQueued = false;
+      void runResumeReconnect(session);
+    });
+  }
+
+  async function runResumeReconnect(session) {
+    if (
+      session !== resumeSession ||
+      !session.needsReconnect ||
+      session.controller ||
+      !takeoverActive ||
+      !navigator.onLine
+    ) {
+      return;
+    }
+
+    const controller = new AbortController();
+    session.controller = controller;
+    session.needsReconnect = false;
+    try {
+      const request = await requestFromSnapshot(session.snapshot, controller.signal);
+      if (session !== resumeSession) return;
+      const response = await Reflect.apply(
+        session.snapshot.upstreamFetch,
+        session.snapshot.fetchThis,
+        [request],
+      );
+      const mimeType = response.headers.get("content-type") || "";
+      if (!response.ok || !response.body || !mimeType.includes("text/event-stream")) {
+        throw new Error(`resume-http-${response.status}`);
+      }
+      emit({
+        type: "page-stream-status",
+        transport: "sse",
+        phase: "connected",
+        state: "connected",
+        conversationId: session.snapshot.conversationId || conversationIdFromLocation(),
+        timestamp: Date.now(),
+      });
+      await captureReadableStream(response.body, {
+        requestId: nextRequestId("resume"),
+        url: response.url || session.snapshot.url,
+        status: response.status,
+        mimeType,
+        resume: true,
+        replay: true,
+        cancelSignal: controller.signal,
+        onClose: (result) => handleResumeStreamClose(session.generation, result),
+      });
+    } catch (error) {
+      if (session !== resumeSession || controller.signal.aborted) return;
+      session.controller = null;
+      session.needsReconnect = true;
+      emit({
+        type: "page-stream-status",
+        transport: "sse",
+        phase: "closed",
+        state: "disconnected",
+        error: true,
+        conversationId: session.snapshot.conversationId || conversationIdFromLocation(),
+        timestamp: Date.now(),
+      });
+      scheduleResumeReconnect(session);
+    }
+  }
+
+  function reconnectResumeIfNeeded() {
+    if (resumeSession?.needsReconnect) scheduleResumeReconnect(resumeSession);
+  }
+
+  function resetResumeSession() {
+    const session = resumeSession;
+    resumeSession = null;
+    resumeGeneration += 1;
+    if (!session) return;
+    clearTimeout(session.reconnectTimer);
+    session.controller?.abort();
+  }
+
+  function completeOfficialStream(response) {
     try {
       void response.body.cancel().catch(() => {});
     } catch {
@@ -385,44 +698,55 @@
   async function captureReadableStream(stream, meta) {
     const reader = stream.getReader();
     const decoder = new TextDecoder();
+    const { onClose, cancelSignal, ...captureMeta } = meta;
+    const cancelReader = () => { void reader.cancel().catch(() => {}); };
+    if (cancelSignal?.aborted) cancelReader();
+    else cancelSignal?.addEventListener("abort", cancelReader, { once: true });
+    let markerTail = "";
+    let sawDone = false;
+    let readError = null;
+
+    const captureChunk = (data) => {
+      if (!data) return;
+      markerTail = `${markerTail}${data}`.slice(-256);
+      if (/(?:^|\n)\s*data:\s*\[DONE\]/.test(markerTail)) sawDone = true;
+      emit({
+        type: "page-capture",
+        transport: "sse",
+        phase: "chunk",
+        timestamp: Date.now(),
+        data,
+        ...captureMeta,
+      });
+    };
+
     try {
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
-        const data = decoder.decode(value, { stream: true });
-        if (!data) continue;
-        emit({
-          type: "page-capture",
-          transport: "sse",
-          phase: "chunk",
-          timestamp: Date.now(),
-          data,
-          ...meta,
-        });
+        captureChunk(decoder.decode(value, { stream: true }));
       }
-      const tail = decoder.decode();
-      if (tail) {
-        emit({
-          type: "page-capture",
-          transport: "sse",
-          phase: "chunk",
-          timestamp: Date.now(),
-          data: tail,
-          ...meta,
-        });
-      }
+      captureChunk(decoder.decode());
+    } catch (error) {
+      readError = error;
+    } finally {
       emit({
         type: "page-capture",
         transport: "sse",
         phase: "complete",
         timestamp: Date.now(),
         data: "",
-        ...meta,
+        graceful: sawDone,
+        disconnected: !sawDone,
+        ...captureMeta,
       });
-    } catch {
-      // Observation must never break the product request.
-    } finally {
+      cancelSignal?.removeEventListener("abort", cancelReader);
       reader.releaseLock();
+      try {
+        onClose?.({ sawDone, error: readError });
+      } catch {
+        // Transport recovery must never escape into the observed request.
+      }
     }
   }
 
@@ -634,29 +958,85 @@
       }
     };
     xhr.addEventListener("progress", () => capture("chunk"));
-    xhr.addEventListener("loadend", () => capture("complete"), { once: true });
+    xhr.addEventListener("loadend", () => {
+      capture("complete");
+      try {
+        const url = new URL(meta.url, location.href);
+        const submission = String(meta.method || "").toUpperCase() === "POST" &&
+          url.origin === location.origin &&
+          (url.pathname === "/backend-api/conversation" || url.pathname === "/backend-api/f/conversation");
+        if (submission) {
+          const ok = xhr.status >= 200 && xhr.status < 300;
+          settleSendConfirmation(ok, ok ? "request-accepted" : `http-${xhr.status || 0}`);
+        }
+      } catch {
+        // Capture remains best-effort; send confirmation will time out.
+      }
+    }, { once: true });
+  }
+
+  function queueCanonicalConversation(conversationId) {
+    if (!conversationId) return;
+    pendingCanonicalIds.add(conversationId);
+    drainCanonicalFetches();
+  }
+
+  function drainCanonicalFetches() {
+    if (!backendFetch || !backendHeaders) return;
+    for (const conversationId of pendingCanonicalIds) {
+      if (!canonicalFetches.has(conversationId)) void fetchCanonicalConversation(conversationId);
+    }
+  }
+
+  async function fetchCanonicalConversation(conversationId) {
+    if (canonicalFetches.has(conversationId) || !backendFetch || !backendHeaders) return;
+    const task = (async () => {
+      const headers = new Headers(backendHeaders);
+      headers.delete("content-length");
+      headers.delete("content-type");
+      headers.set("accept", "application/json");
+      const url = new URL(`/backend-api/conversations/${encodeURIComponent(conversationId)}`, location.origin);
+      const response = await Reflect.apply(backendFetch, backendFetchThis, [
+        url.href,
+        {
+          method: "GET",
+          credentials: "include",
+          cache: "no-store",
+          headers,
+        },
+      ]);
+      if (!response.ok) return;
+      pendingCanonicalIds.delete(conversationId);
+      await captureBoundedResponse(response, {
+        requestId: nextRequestId("sync"),
+        url: response.url || url.href,
+        status: response.status,
+        mimeType: response.headers.get("content-type") || "application/json",
+        synchronized: true,
+      });
+    })();
+    canonicalFetches.set(conversationId, task);
+    try {
+      await task;
+    } catch {
+      // A later WS notification or authenticated request retries this id.
+    } finally {
+      canonicalFetches.delete(conversationId);
+    }
   }
 
   function installWebSocketObserver() {
     const wrap = (UpstreamWebSocket) => function ObservedWebSocket(url, protocols) {
-      const socket = arguments.length > 1
+      const hasProtocols = arguments.length > 1;
+      const socket = hasProtocols
         ? new UpstreamWebSocket(url, protocols)
         : new UpstreamWebSocket(url);
-      if (interestingSocket(url) && !socket[WEBSOCKET_OBSERVED]) {
-        socket[WEBSOCKET_OBSERVED] = true;
-        const requestId = nextRequestId("ws");
-        socket.addEventListener("message", (event) => {
-          if (typeof event.data !== "string") return;
-          if (event.data.length > MAX_NON_STREAM_BODY) return;
-          emit({
-            type: "page-capture",
-            transport: "websocket",
-            requestId,
-            url: String(url),
-            phase: "message",
-            timestamp: Date.now(),
-            data: event.data,
-          });
+      if (interestingSocket(url)) {
+        adoptOfficialConversationSocket(socket, {
+          UpstreamWebSocket,
+          url: String(url),
+          hasProtocols,
+          protocols: Array.isArray(protocols) ? protocols.slice() : protocols,
         });
       }
       return socket;
@@ -691,22 +1071,290 @@
     }
   }
 
+  function adoptOfficialConversationSocket(socket, options) {
+    const previous = conversationSocketState;
+    const replayFrames = previous ? new Map(previous.replayFrames) : new Map();
+    if (previous) {
+      clearTimeout(previous.reconnectTimer);
+      if (previous.managed && previous.managed.readyState < 2) {
+        try { previous.managed.close(1000, "official-reconnected"); } catch {}
+      }
+    }
+
+    const state = {
+      generation: ++conversationSocketGeneration,
+      ...options,
+      original: socket,
+      managed: null,
+      replayFrames,
+      reconnectTimer: null,
+      reconnectQueued: false,
+      reconnectTimes: [],
+      needsReconnect: false,
+    };
+    conversationSocketState = state;
+
+    const upstreamSend = socket.send;
+    try {
+      socket.send = function slimgptObservedSocketSend(data) {
+        rememberSocketFrame(state, data);
+        return Reflect.apply(upstreamSend, socket, arguments);
+      };
+    } catch {
+      // Without replay frames the official client remains the reconnect owner.
+    }
+    observeConversationSocket(socket, state, false);
+  }
+
+  function rememberSocketFrame(state, data) {
+    if (state !== conversationSocketState || typeof data !== "string") return;
+    try {
+      const packet = JSON.parse(data);
+      const frames = Array.isArray(packet) ? packet : [packet];
+      const replayKeys = [];
+      for (const frame of frames) {
+        const command = frame?.command && typeof frame.command === "object"
+          ? frame.command
+          : frame;
+        if (command?.type === "connect") {
+          replayKeys.push("connect");
+          continue;
+        }
+        if (command?.type !== "subscribe") continue;
+        const topic = String(command?.data?.topic || command?.topic_id || command?.topic || "");
+        if (topic) replayKeys.push(`subscribe:${topic}`);
+      }
+      if (!replayKeys.length) return;
+      const key = replayKeys.length === 1
+        ? replayKeys[0]
+        : `packet:${replayKeys.join("|")}`;
+      state.replayFrames.set(key, data);
+    } catch {
+      // Binary and non-protocol frames are never replayed.
+    }
+  }
+
+  function observeConversationSocket(socket, state, managed) {
+    if (socket[WEBSOCKET_OBSERVED]) return;
+    socket[WEBSOCKET_OBSERVED] = true;
+    const requestId = nextRequestId("ws");
+    const publicUrl = safeSocketUrl(state.url);
+
+    const handleOpen = () => {
+      if (state !== conversationSocketState) {
+        if (managed) try { socket.close(1000, "stale"); } catch {}
+        return;
+      }
+      state.needsReconnect = false;
+      if (managed) {
+        for (const frame of state.replayFrames.values()) {
+          try { socket.send(frame); } catch {}
+        }
+      }
+      emit({
+        type: "page-stream-status",
+        transport: "websocket",
+        phase: "connected",
+        state: "connected",
+        url: publicUrl,
+        timestamp: Date.now(),
+      });
+    };
+    socket.addEventListener("open", handleOpen);
+    if (socket.readyState === 1) queueMicrotask(handleOpen);
+
+    socket.addEventListener("close", () => {
+      if (state !== conversationSocketState) return;
+      if (managed) state.managed = null;
+      else state.original = null;
+      state.needsReconnect = true;
+      emit({
+        type: "page-stream-status",
+        transport: "websocket",
+        phase: "closed",
+        state: "disconnected",
+        url: publicUrl,
+        timestamp: Date.now(),
+      });
+      scheduleConversationSocketReconnect(state);
+    });
+
+    socket.addEventListener("message", (event) => {
+      if (typeof event.data !== "string" || event.data.length > MAX_NON_STREAM_BODY) return;
+      const notifications = conversationNotifications(event.data);
+      emit({
+        type: "page-capture",
+        transport: "websocket",
+        requestId,
+        url: publicUrl,
+        phase: "message",
+        timestamp: Date.now(),
+        data: event.data,
+      });
+      if (!notifications.length || !takeoverActive) return;
+
+      // This listener is registered before the official caller can attach its
+      // own. Conversation notifications are consumed here so the heavyweight
+      // official parser never sees them; connection/subscription replies still
+      // pass through unchanged.
+      event.stopImmediatePropagation();
+      for (const notification of notifications) {
+        const conversationId = notification.conversationId;
+        const stateValue = /turn-(?:complete|completed|finished)$/.test(notification.type)
+          ? "idle"
+          : (/turn-(?:start|started|in-progress)$/.test(notification.type) ? "working" : null);
+        emit({
+          type: "page-stream-status",
+          transport: "websocket",
+          phase: notification.type,
+          ...(stateValue ? { state: stateValue } : {}),
+          conversationId,
+          timestamp: Date.now(),
+        });
+        if (conversationId) queueCanonicalConversation(conversationId);
+      }
+    });
+  }
+
+  function conversationNotifications(data) {
+    let parsed;
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      return [];
+    }
+    const frames = Array.isArray(parsed) ? parsed : [parsed];
+    const notifications = [];
+    for (const frame of frames) {
+      if (frame?.type !== "message" || frame?.topic_id !== "conversations") continue;
+      let payload = frame.payload;
+      if (typeof payload === "string") {
+        try { payload = JSON.parse(payload); } catch { payload = null; }
+      }
+      if (!payload || typeof payload !== "object") continue;
+      const eventPayload = payload.payload && typeof payload.payload === "object"
+        ? payload.payload
+        : payload;
+      notifications.push({
+        type: String(payload.type || eventPayload.type || "conversation-update"),
+        conversationId: eventPayload.conversation_id || eventPayload.conversationId || null,
+      });
+    }
+    return notifications;
+  }
+
+  function scheduleConversationSocketReconnect(state = conversationSocketState) {
+    if (
+      !state ||
+      state !== conversationSocketState ||
+      !state.needsReconnect ||
+      state.managed ||
+      state.reconnectTimer ||
+      state.reconnectQueued ||
+      !takeoverActive ||
+      !navigator.onLine
+    ) {
+      return;
+    }
+    if (![...state.replayFrames.keys()].some((key) => key.includes("subscribe:"))) return;
+
+    const now = Date.now();
+    state.reconnectTimes = state.reconnectTimes.filter((at) => now - at < RECONNECT_STORM_WINDOW_MS);
+    if (state.reconnectTimes.length >= RECONNECT_STORM_LIMIT) {
+      const delay = Math.max(1, state.reconnectTimes[0] + RECONNECT_STORM_WINDOW_MS - now);
+      state.reconnectTimer = setTimeout(() => {
+        if (state !== conversationSocketState) return;
+        state.reconnectTimer = null;
+        scheduleConversationSocketReconnect(state);
+      }, delay);
+      return;
+    }
+
+    state.reconnectTimes.push(now);
+    state.reconnectQueued = true;
+    queueMicrotask(() => {
+      if (state !== conversationSocketState) return;
+      state.reconnectQueued = false;
+      openManagedConversationSocket(state);
+    });
+  }
+
+  function openManagedConversationSocket(state) {
+    if (
+      state !== conversationSocketState ||
+      !state.needsReconnect ||
+      state.managed ||
+      !takeoverActive ||
+      !navigator.onLine
+    ) {
+      return;
+    }
+    try {
+      const socket = state.hasProtocols
+        ? new state.UpstreamWebSocket(state.url, state.protocols)
+        : new state.UpstreamWebSocket(state.url);
+      state.managed = socket;
+      state.needsReconnect = false;
+      observeConversationSocket(socket, state, true);
+    } catch {
+      state.managed = null;
+      state.needsReconnect = true;
+      scheduleConversationSocketReconnect(state);
+    }
+  }
+
+  function reconnectConversationSocketIfNeeded() {
+    if (conversationSocketState?.needsReconnect) {
+      scheduleConversationSocketReconnect(conversationSocketState);
+    }
+  }
+
+  function resetConversationSocket() {
+    const state = conversationSocketState;
+    conversationSocketState = null;
+    conversationSocketGeneration += 1;
+    if (!state) return;
+    clearTimeout(state.reconnectTimer);
+    if (state.managed && state.managed.readyState < 2) {
+      try { state.managed.close(1000, "page-hidden"); } catch {}
+    }
+  }
+
   function interestingSocket(rawUrl) {
     try {
       const url = new URL(String(rawUrl || ""), location.href);
       const host = url.hostname.toLowerCase();
       return (
-        host === "chatgpt.com" ||
-        host.endsWith(".chatgpt.com") ||
-        host === "openai.com" ||
-        host.endsWith(".openai.com")
+        url.protocol === "wss:" &&
+        (host === "ws.chatgpt.com" || host.endsWith(".chatgpt.com")) &&
+        url.pathname.includes("/ws/user/")
       );
     } catch {
       return false;
     }
   }
 
-  const emitLocation = () => emit({ type: "page-location", url: location.href });
+  function safeSocketUrl(rawUrl) {
+    try {
+      const url = new URL(String(rawUrl || ""), location.href);
+      return `${url.origin}${url.pathname}`;
+    } catch {
+      return "";
+    }
+  }
+
+  function conversationIdFromLocation() {
+    return location.pathname.match(/\/(?:c|uc)\/([^/?#]+)/)?.[1] || null;
+  }
+
+  function emitLocation() {
+    if (location.href !== observedLocationHref) {
+      observedLocationHref = location.href;
+      resetResumeSession();
+    }
+    emit({ type: "page-location", url: location.href });
+  }
+
   const nativePushState = history.pushState;
   history.pushState = function slimgptPushState() {
     const result = nativePushState.apply(this, arguments);
@@ -757,9 +1405,13 @@
       case "connect":
         emitPageStatus();
         return;
-      case "set-thinking-level":
-        syncOfficialThinkingLevel(payload.thinkingLevel);
+      case "set-thinking-level": {
+        const level = Number(payload.thinkingLevel);
+        if (Number.isInteger(level) && level >= 1 && level <= 5) {
+          await queueOfficialThinkingLevel(level);
+        }
         return;
+      }
       case "set-model-preference":
         if (payload.model && payload.model !== "auto" && location.pathname === "/") {
           const currentModel = new URL(location.href).searchParams.get("model");
@@ -791,19 +1443,182 @@
   }
 
   function emitPageStatus() {
-    emit({ type: "page-hook-ready", timestamp: Date.now(), url: location.href });
+    emit({
+      type: "page-hook-ready",
+      timestamp: Date.now(),
+      url: location.href,
+      thinkingLevel: readOfficialThinkingLevel(),
+    });
     emit({ type: "takeover-state", active: takeoverActive, url: location.href });
   }
 
-  function syncOfficialThinkingLevel(level) {
+  function findThinkingSlider() {
+    const selector = [
+      '[data-model-reasoning-effort-slider] [role="slider"]',
+      'input[type="range"][aria-label*="thinking" i]',
+      'input[type="range"][aria-label*="reasoning" i]',
+      '[role="slider"][aria-label*="thinking" i]',
+      '[role="slider"][aria-label*="reasoning" i]',
+      '[data-testid*="reasoning-slider"]',
+    ].join(', ');
+    return [...document.querySelectorAll(selector)].find((slider) => {
+      const container = slider.closest("[data-model-reasoning-effort-slider]");
+      return isVisible(container || slider);
+    }) || null;
+  }
+
+  function levelFromOfficialSlider(slider) {
+    if (!slider) return null;
+    const raw = slider.getAttribute("aria-valuenow") ?? slider.value;
+    const value = Number(raw);
+    if (!Number.isInteger(value)) return null;
+    const min = Number(slider.getAttribute("aria-valuemin") ?? slider.min);
+    const max = Number(slider.getAttribute("aria-valuemax") ?? slider.max);
+    if (min === 0 && max === 4 && value >= 0 && value <= 4) return value + 1;
+    return value >= 1 && value <= 5 ? value : null;
+  }
+
+  function readOfficialThinkingLevel() {
     try {
-      const slider = document.querySelector('input[type="range"][aria-label*="thinking" i], input[type="range"][aria-label*="reasoning" i], [role="slider"][aria-label*="thinking" i], [role="slider"][aria-label*="reasoning" i], [data-testid*="reasoning-slider"]');
-      if (slider) {
-        slider.value = level;
-        slider.dispatchEvent(new Event('input', { bubbles: true }));
-        slider.dispatchEvent(new Event('change', { bubbles: true }));
+      return levelFromOfficialSlider(findThinkingSlider());
+    } catch {
+      return null;
+    }
+  }
+
+  function findThinkingMenuTrigger() {
+    const composer = findComposerElement();
+    const form = composer?.closest("form");
+    if (!form) return null;
+    return [...form.querySelectorAll('button[aria-haspopup="menu"]')].find((button) => {
+      if (button.id === "composer-plus-btn" || button.dataset.testid === "composer-plus-btn") return false;
+      const label = `${button.textContent || ""} ${button.getAttribute("aria-label") || ""}`.trim();
+      return Boolean(label);
+    }) || null;
+  }
+
+  function activateOfficialControl(element) {
+    try { element.focus({ preventScroll: true }); } catch { try { element.focus(); } catch {} }
+    const rect = element.getBoundingClientRect();
+    const eventInit = {
+      bubbles: true,
+      cancelable: true,
+      button: 0,
+      buttons: 1,
+      clientX: rect.left + rect.width / 2,
+      clientY: rect.top + rect.height / 2,
+      pointerId: 1,
+      pointerType: "mouse",
+      isPrimary: true,
+    };
+    element.dispatchEvent(new PointerEvent("pointerdown", eventInit));
+    element.dispatchEvent(new MouseEvent("mousedown", eventInit));
+    element.dispatchEvent(new PointerEvent("pointerup", { ...eventInit, buttons: 0 }));
+    element.dispatchEvent(new MouseEvent("mouseup", { ...eventInit, buttons: 0 }));
+    element.dispatchEvent(new MouseEvent("click", { ...eventInit, buttons: 0, detail: 1 }));
+  }
+
+  function waitForThinkingSlider(timeoutMs = 5000) {
+    const existing = findThinkingSlider();
+    if (existing) return Promise.resolve(existing);
+    return new Promise((resolve) => {
+      let settled = false;
+      const observer = new MutationObserver(() => {
+        const slider = findThinkingSlider();
+        if (slider) finish(slider);
+      });
+      const timer = setTimeout(() => finish(null), timeoutMs);
+      const finish = (slider) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        observer.disconnect();
+        resolve(slider);
+      };
+      observer.observe(document.documentElement || document, { childList: true, subtree: true });
+    });
+  }
+
+  function waitForThinkingLevel(slider, level, timeoutMs = 5000) {
+    if (levelFromOfficialSlider(slider) === level) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      let settled = false;
+      const observer = new MutationObserver(() => {
+        if (levelFromOfficialSlider(slider) === level) finish(true);
+      });
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      const finish = (matched) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        observer.disconnect();
+        resolve(matched);
+      };
+      observer.observe(slider, { attributes: true, attributeFilter: ["aria-valuenow", "value"] });
+    });
+  }
+
+  async function moveOfficialSlider(slider, level) {
+    let current = levelFromOfficialSlider(slider);
+    if (current === level) return true;
+    if (slider instanceof HTMLInputElement) {
+      const min = Number(slider.min || slider.getAttribute("aria-valuemin"));
+      const target = min === 0 ? level - 1 : level;
+      const confirmation = waitForThinkingLevel(slider, level);
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      if (setter) setter.call(slider, String(target));
+      else slider.value = String(target);
+      slider.dispatchEvent(new Event("input", { bubbles: true }));
+      slider.dispatchEvent(new Event("change", { bubbles: true }));
+      return await confirmation;
+    }
+
+    try { slider.focus({ preventScroll: true }); } catch { try { slider.focus(); } catch {} }
+    while (current !== level) {
+      const key = level < current ? "ArrowLeft" : "ArrowRight";
+      const next = current + (level < current ? -1 : 1);
+      const confirmation = waitForThinkingLevel(slider, next);
+      slider.dispatchEvent(new KeyboardEvent("keydown", { key, code: key, bubbles: true, cancelable: true }));
+      slider.dispatchEvent(new KeyboardEvent("keyup", { key, code: key, bubbles: true }));
+      if (!await confirmation) return false;
+      current = next;
+    }
+    return true;
+  }
+
+  function queueOfficialThinkingLevel(level) {
+    thinkingSync = thinkingSync
+      .catch(() => {})
+      .then(() => setOfficialThinkingLevelFromSlider(level));
+    return thinkingSync;
+  }
+
+  async function setOfficialThinkingLevelFromSlider(level) {
+    if (!Number.isInteger(level) || level < 1 || level > 5) return false;
+    officialFocusPermitDepth += 1;
+    const shouldResleep = takeoverActive;
+    let trigger = null;
+    try {
+      wakeOfficialUi();
+      let slider = findThinkingSlider();
+      if (!slider) {
+        trigger = findThinkingMenuTrigger();
+        if (!trigger) return false;
+        const sliderReady = waitForThinkingSlider();
+        activateOfficialControl(trigger);
+        slider = await sliderReady;
       }
-    } catch {}
+      if (!slider) return false;
+      return await moveOfficialSlider(slider, level);
+    } finally {
+      if (trigger?.getAttribute("aria-expanded") === "true") {
+        try { activateOfficialControl(trigger); } catch {}
+      }
+      officialFocusPermitDepth = Math.max(0, officialFocusPermitDepth - 1);
+      emitPageStatus();
+      if (shouldResleep) scheduleRenderSleep();
+      queueMicrotask(focusTakeoverFrame);
+    }
   }
 
   async function handleSendCommand(payload) {
@@ -819,10 +1634,13 @@
     sendInFlight = true;
     let result;
     try {
+      const level = Number(payload?.thinkingLevel);
+      if (Number.isInteger(level) && level >= 1 && level <= 5) {
+        await queueOfficialThinkingLevel(level);
+      }
       officialFocusPermitDepth += 1;
       wakeOfficialUi();
       await waitForComposerElement(COMPOSER_WAKE_TIMEOUT);
-      await nextAnimationFrame();
       result = await sendThroughOfficialComposer(payload?.text, commandId);
     } catch (error) {
       result = { ok: false, commandId, error: String(error?.message || error) };
@@ -856,6 +1674,28 @@
     }).observe(document, { childList: true, subtree: true });
   }
 
+  function hasReactBinding(element) {
+    for (let node = element; node && node !== document; node = node.parentNode) {
+      try {
+        if (Object.getOwnPropertyNames(node).some((key) => /^__react(?:Fiber|Props|Container)\$/.test(key))) {
+          return true;
+        }
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  }
+
+  function maybeMarkOfficialUiHydrated() {
+    if (officialUiHydrated) return true;
+    const composer = findComposerElement();
+    if (!composer || !hasReactBinding(composer)) return false;
+    officialUiHydrated = true;
+    if (renderSleepRequested && takeoverActive) scheduleRenderSleep(0);
+    return true;
+  }
+
   function scheduleInitialTakeover() {
     const schedule = async () => {
       // The current ChatGPT lightweight shell mounts its composer after
@@ -875,7 +1715,7 @@
 
   function sleepOfficialUi() {
     const frame = document.getElementById(FRAME_ID);
-    if (!frame || frame.dataset.slimgptVisible !== "1") return;
+    if (!officialUiHydrated || !frame || frame.dataset.slimgptVisible !== "1") return;
     if (findBlockingOfficialUi()) {
       suspendTakeoverForBlocker();
       return;
@@ -888,6 +1728,11 @@
   }
 
   function scheduleRenderSleep(delay = 1200) {
+    renderSleepRequested = true;
+    if (!officialUiHydrated) {
+      maybeMarkOfficialUiHydrated();
+      return;
+    }
     clearTimeout(resleepTimer);
     resleepTimer = setTimeout(sleepOfficialUi, delay);
   }
@@ -905,14 +1750,16 @@
     frame.style.opacity = "1";
     document.getElementById(RESTORE_ID)?.remove();
     emit({ type: "takeover-state", active: true, url: location.href });
+    resumeDisconnectedTransports();
     queueMicrotask(focusTakeoverFrame);
-    scheduleRenderSleep(250);
+    scheduleRenderSleep(0);
   }
 
   function suspendTakeoverForBlocker() {
     const frame = document.getElementById(FRAME_ID);
     clearTimeout(resleepTimer);
     resleepTimer = null;
+    renderSleepRequested = false;
     wakeOfficialUi();
     takeoverActive = false;
     if (frame) {
@@ -964,6 +1811,7 @@
     const frame = document.getElementById(FRAME_ID);
     if (!frame) return;
     clearTimeout(resleepTimer);
+    renderSleepRequested = false;
     wakeOfficialUi();
     takeoverActive = false;
     frame.dataset.slimgptVisible = "0";
@@ -1049,26 +1897,95 @@
         range.selectNodeContents(composer);
         selection.removeAllRanges();
         selection.addRange(range);
-        document.execCommand("insertText", false, submittedText);
-        composer.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: submittedText }));
-      }
-
-      await nextAnimationFrame();
-      await nextAnimationFrame();
-      const actualText = composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement
-        ? composer.value
-        : composer.textContent;
-      if (String(actualText || "").trim() !== submittedText) {
-        return { ok: false, commandId, error: "composer-rejected-input" };
+        const inserted = document.execCommand("insertText", false, submittedText);
+        if (!inserted) {
+          composer.textContent = submittedText;
+          composer.dispatchEvent(new InputEvent("beforeinput", {
+            bubbles: true,
+            cancelable: true,
+            inputType: "insertText",
+            data: submittedText,
+          }));
+          composer.dispatchEvent(new InputEvent("input", {
+            bubbles: true,
+            inputType: "insertText",
+            data: submittedText,
+          }));
+        }
       }
 
       const sendButton = await waitForSendButton(composer, SEND_CONTROL_TIMEOUT);
-      if (!sendButton) return { ok: false, commandId, error: "send-control-not-ready" };
+      if (!sendButton) {
+        const actualText = composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement
+          ? composer.value
+          : composer.textContent;
+        const error = String(actualText || "").trim() === submittedText
+          ? "send-control-not-ready"
+          : "composer-rejected-input";
+        return { ok: false, commandId, error };
+      }
+      const officialLevel = readOfficialThinkingLevel();
+      const confirmation = beginSendConfirmation(submittedText);
       sendButton.click();
-      return { ok: true, commandId, method: "button" };
+      // A click is not proof. Success requires an accepted official
+      // conversation request or a matching user turn echoed into the DOM.
+      const confirmed = await confirmation;
+      if (!confirmed) {
+        return { ok: false, commandId, error: "send-unconfirmed", method: "button", officialThinkingLevel: officialLevel };
+      }
+      return { ok: true, commandId, method: "button", officialThinkingLevel: officialLevel };
     } catch (error) {
       return { ok: false, commandId, error: String(error?.message || error) };
     }
+  }
+
+  function settleSendConfirmation(ok, reason) {
+    const pending = pendingSendConfirmation;
+    if (!pending || pending.settled) return;
+    if (!ok) {
+      pending.finish(false);
+      return;
+    }
+    pending.acceptedReason = reason;
+    pending.finish(true);
+  }
+
+  function officialDomTextFor(submittedText) {
+    const needle = submittedText.slice(0, 48);
+    if (!needle) return false;
+    for (const node of document.querySelectorAll('[data-message-author-role="user"]')) {
+      if (String(node.textContent || "").includes(needle)) return true;
+    }
+    return false;
+  }
+
+  function beginSendConfirmation(submittedText) {
+    if (pendingSendConfirmation) pendingSendConfirmation.finish(false);
+    return new Promise((resolve) => {
+      let timer = null;
+      const observer = new MutationObserver(() => {
+        if (officialDomTextFor(submittedText)) finish(true);
+        else if (findBlockingOfficialUi()) finish(false);
+      });
+      const finish = (confirmed) => {
+        if (pending.settled) return;
+        pending.settled = true;
+        clearTimeout(timer);
+        observer.disconnect();
+        if (pendingSendConfirmation === pending) pendingSendConfirmation = null;
+        resolve(confirmed);
+      };
+      const pending = {
+        submittedText,
+        settled: false,
+        acceptedReason: null,
+        finish,
+      };
+      pendingSendConfirmation = pending;
+      observer.observe(document.documentElement || document, { childList: true, subtree: true, characterData: true });
+      timer = setTimeout(() => finish(false), SEND_CONFIRM_TIMEOUT);
+      if (officialDomTextFor(submittedText)) finish(true);
+    });
   }
 
   function findComposer() {
@@ -1100,7 +2017,7 @@
       'button[type="submit"]',
     ];
     const form = composer?.closest("form");
-    const roots = form ? [form, document] : [document];
+    const roots = form ? [form] : [document];
     for (const root of roots) {
       for (const selector of selectors) {
         const button = [...root.querySelectorAll(selector)].find(isUsableButton);
@@ -1110,14 +2027,31 @@
     return null;
   }
 
-  async function waitForSendButton(composer, timeoutMs) {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      const button = findSendButton(composer);
-      if (button) return button;
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    return null;
+  function waitForSendButton(composer, timeoutMs) {
+    const existing = findSendButton(composer);
+    if (existing) return Promise.resolve(existing);
+    return new Promise((resolve) => {
+      let settled = false;
+      const root = composer?.closest("form") || document.documentElement || document;
+      const observer = new MutationObserver(() => {
+        const button = findSendButton(composer);
+        if (button) finish(button);
+      });
+      const timer = setTimeout(() => finish(null), timeoutMs);
+      const finish = (button) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        observer.disconnect();
+        resolve(button);
+      };
+      observer.observe(root, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["disabled", "aria-disabled", "data-visually-disabled", "data-testid"],
+      });
+    });
   }
 
   function isUsableButton(element) {
@@ -1207,9 +2141,5 @@
     const style = getComputedStyle(element);
     const rect = element.getBoundingClientRect();
     return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
-  }
-
-  function nextAnimationFrame() {
-    return new Promise((resolve) => requestAnimationFrame(() => resolve()));
   }
 })();

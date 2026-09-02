@@ -14,9 +14,9 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     consumeSse,
     conversationIdFromPayload,
     conversationIdFromUrl,
+    conversationThinkingLevel,
     decodeCaptureBody,
     extractConversationItems,
-  getThinkingLevel,
     findConversationPayload,
     findMessageEvents,
     fingerprintCapture,
@@ -36,7 +36,6 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
   let liveMessages = $state(new Map());
   let pendingUser = $state(null);
   let currentConversationId = $state(null);
-  let presentedConversationId = $state(null);
   let loadingConversationId = $state(null);
   let navigationTimedOutId = $state(null);
   let captures = $state(0);
@@ -52,6 +51,9 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
   let sendTimer = null;
   let navigationTimer = null;
   let userSettings = $state({ ...DEFAULT_SETTINGS });
+  let thinkingLevelOverride = $state(null);
+  let workStates = $state(new Map());
+  let newChatWorkState = $state('idle');
   const MAX_CAPTURE_BUFFER = 20 * 1024 * 1024;
   const MAX_CACHED_PAYLOADS = 24;
   const sseBuffers = new Map();
@@ -64,21 +66,30 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     currentConversationId && hasRenderableConversationContent(currentConversationId)
   ));
   const currentMeta = $derived(currentConversationId ? conversationMap.get(currentConversationId) : null);
-  const displayConversationId = $derived(
-    currentConversationId && currentHasRenderableContent
-      ? currentConversationId
-      : (presentedConversationId || currentConversationId)
-  );
+  const displayConversationId = $derived(currentConversationId);
   const messages = $derived.by(() => {
     const id = displayConversationId;
-    const payload = id ? payloads.get(id) : null;
-    let rows = payload ? buildConversationView(payload, terminals.get(id)) : [];
-    const live = id ? liveMessages.get(id) || [] : [];
-    const liveById = new Map(live.map((item) => [item.id, item]));
-    const rowIds = new Set(rows.map((row) => row.id));
+    if (!id) return [];
+    const payload = payloads.get(id) || null;
+    const live = liveMessages.get(id) || [];
+    const liveRows = live.filter(Boolean);
+    const liveById = new Map(liveRows.map((item) => [item.id, item]));
+    const liveIds = new Set(liveRows.map((item) => item.id));
+    let rows = payload
+      ? buildConversationView(payload, terminals.get(id)).filter((row) => !liveIds.has(row.id))
+      : [];
     rows = rows.map((row) => liveById.has(row.id) ? { ...row, ...liveById.get(row.id) } : row);
-    if (pendingUser && id === currentConversationId && (!pendingUser.conversationId || pendingUser.conversationId === id)) rows.push(pendingUser.message);
-    for (const item of live) if (!rowIds.has(item.id)) rows.push(item);
+    if (pendingUser && pendingUser.conversationId === id) rows.push(pendingUser.message);
+    for (const item of liveRows) if (!liveById.has(item.id) || !rows.some((row) => row.id === item.id)) rows.push(item);
+    // De-duplicate by id while keeping order; guard against overlapping graph
+    // and live captures of the same message.
+    const seen = new Set();
+    rows = rows.filter((row) => {
+      const key = row?.id || row?.nodeId;
+      if (key && seen.has(key)) return false;
+      if (key) seen.add(key);
+      return true;
+    });
     return rows;
   });
   const turns = $derived(groupConversationTurns(messages));
@@ -86,23 +97,56 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
   const statusState = $derived(status.bridgeError ? 'error' : (liveConnected ? 'online' : 'offline'));
   const statusLabel = $derived(status.bridgeError ? '连接失败' : (liveConnected ? (status.takeover === false ? '已连接' : '已接管') : '连接中'));
   const conversationPending = $derived(Boolean(currentConversationId && !currentHasRenderableContent));
-  const conversationLoading = $derived(Boolean(conversationPending && loadingConversationId === currentConversationId));
   const conversationTimedOut = $derived(Boolean(conversationPending && navigationTimedOutId === currentConversationId));
+  const conversationWorkState = $derived(
+    sendInFlight
+      ? 'working'
+      : (currentConversationId ? (workStates.get(currentConversationId) || 'idle') : newChatWorkState)
+  );
+  const conversationThinkingDepth = $derived.by(() => {
+    const payload = currentConversationId ? payloads.get(currentConversationId) : null;
+    return payload ? conversationThinkingLevel(payload) : null;
+  });
+  const effectiveThinkingLevel = $derived(
+    thinkingLevelOverride ?? conversationThinkingDepth?.level ?? userSettings.thinkingLevel ?? 3
+  );
+  // Test observability mirror: smoke/live harnesses read this instead of
+  // polling internals. Updated only when derived state actually changes.
+  $effect(() => {
+    if (typeof window === 'undefined') return;
+    const live = currentConversationId ? liveMessages.get(currentConversationId) || [] : [];
+    const lastAssistant = [...live].reverse().find((message) => message?.role !== 'user' && message?.role !== 'tool');
+    window.__SLIMGPT_DEBUG__ = {
+      workState: conversationWorkState,
+      lastAssistant: lastAssistant ? {
+        id: lastAssistant.id,
+        status: lastAssistant.status,
+        endTurn: lastAssistant.endTurn,
+        hasText: Boolean(String(lastAssistant.text || '').trim()),
+        live: Boolean(lastAssistant.live),
+      } : null,
+      liveCount: live.length,
+    };
+  });
   let previousDisplayConversationId = null;
+  let previousTurnCount = 0;
 
   $effect(() => {
     const key = displayConversationId || 'new';
     const count = turns.length;
     if (key !== previousDisplayConversationId) {
       previousDisplayConversationId = key;
+      previousTurnCount = count;
       activeTurnIndex = Math.max(0, count - 1);
       return;
     }
     if (!count) {
+      previousTurnCount = 0;
       activeTurnIndex = 0;
       return;
     }
-    if (activeTurnIndex >= count) activeTurnIndex = count - 1;
+    if (previousTurnCount === 0 || activeTurnIndex >= count) activeTurnIndex = count - 1;
+    previousTurnCount = count;
   });
 
   onMount(() => {
@@ -139,6 +183,7 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
   }
 
   async function handleThinkingLevelChange(thinkingLevel) {
+    thinkingLevelOverride = thinkingLevel;
     userSettings = { ...userSettings, thinkingLevel };
     await saveUserSettings(userSettings);
     if (transport.supportsLiveChat) {
@@ -157,7 +202,14 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
       const bridgeError = message.bridgeReady === true ? false : (message.bridgeError ?? status.bridgeError);
       status = { ...status, ...message, bridgeError };
     }
-    else if (message.type === 'takeover-state') status = { ...status, takeover: message.active };
+    else if (message.type === 'takeover-state') {
+      status = { ...status, takeover: message.active };
+    }
+    else if (message.type === 'page-stream-status') {
+      const id = message.conversationId || currentConversationId;
+      if (message.state === 'working') setConversationWorkState(id, 'working');
+      else if (message.state === 'idle') setConversationWorkState(id, 'idle');
+    }
     else if (message.type === 'page-location') handlePageLocation(message.url);
     else if (message.type === 'canonical-capture') handleCapture(message);
     else if (message.type === 'composer-result') handleComposerResult(message);
@@ -187,8 +239,21 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     if (isEventStream) {
       const key = capture.requestId || capture.url || 'sse';
       const { rest, frames } = consumeSse(sseBuffers.get(key) || '', text, capture.phase === 'complete');
-      if (capture.phase === 'complete') sseBuffers.delete(key); else sseBuffers.set(key, rest);
-      for (const frame of frames) if (frame.json && frame.data !== '[DONE]') processStructured(frame.json, capture.url || '');
+      if (capture.phase === 'complete') {
+        sseBuffers.delete(key);
+        if (capture.graceful) {
+          setConversationWorkState(conversationIdFromUrl(capture.url || '') || currentConversationId, 'idle');
+        }
+      } else {
+        sseBuffers.set(key, rest);
+      }
+      for (const frame of frames) {
+        if (frame.data === '[DONE]') {
+          setConversationWorkState(conversationIdFromUrl(capture.url || '') || currentConversationId, 'idle');
+        } else if (frame.json) {
+          processStructured(frame.json, capture.url || '');
+        }
+      }
       return;
     }
 
@@ -259,11 +324,11 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
       const next = new Map(liveMessages);
       next.set(id, upsertLiveMessage(next.get(id) || [], event.message));
       liveMessages = next;
+      updateWorkStateFromMessage(id, event.message);
       updateConversationPreviewFromMessage(id, event.message);
       if (id === currentConversationId) {
-        if (hasRenderableConversationContent(id)) {
-          presentedConversationId = id;
-          if (loadingConversationId === id || navigationTimedOutId === id) finishConversationLoading();
+        if (hasRenderableConversationContent(id) && (loadingConversationId === id || navigationTimedOutId === id)) {
+          finishConversationLoading();
         }
         reconcilePending(event.message);
       }
@@ -282,7 +347,7 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     // Evict oldest cached conversation trees if exceeding limit
     while (nextPayloads.size > MAX_CACHED_PAYLOADS) {
       const oldestId = nextPayloads.keys().next().value;
-      if (oldestId === id || oldestId === currentConversationId || oldestId === presentedConversationId) break;
+      if (oldestId === id || oldestId === currentConversationId) break;
       nextPayloads.delete(oldestId);
       nextTerminals.delete(oldestId);
       nextLive.delete(oldestId);
@@ -293,9 +358,13 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     liveMessages = nextLive;
     const pageConversationId = conversationIdFromUrl(status.pageUrl || '');
     if (id === currentConversationId || id === pageConversationId || (!currentConversationId && !pageConversationId)) {
+      if (!currentConversationId && newChatWorkState === 'working') {
+        setConversationWorkState(id, 'working');
+        newChatWorkState = 'idle';
+      }
       currentConversationId = id;
-      presentedConversationId = id;
     }
+    updateWorkStateFromPayload(id, payload);
     const next = new Map(conversationMap);
     const previous = next.get(id) || {};
     const details = conversationDetailsFromPayload(payload, previous);
@@ -322,13 +391,15 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     status = { ...status, pageUrl: url };
     const id = conversationIdFromUrl(url);
     if (id) {
-      currentConversationId = id;
-      if (payloads.has(id)) presentedConversationId = id;
-      startConversationLoading(id);
+      if (id !== currentConversationId) {
+        currentConversationId = id;
+        thinkingLevelOverride = null;
+        startConversationLoading(id);
+      }
     }
     else if (url.startsWith('https://chatgpt.com/')) {
       currentConversationId = null;
-      presentedConversationId = null;
+      thinkingLevelOverride = null;
       finishConversationLoading();
     }
   }
@@ -344,7 +415,7 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
       return;
     }
     currentConversationId = id;
-    if (payloads.has(id)) presentedConversationId = id;
+    thinkingLevelOverride = null;
     startConversationLoading(id);
     sidebarOpen = false;
     overviewOpen = false;
@@ -361,7 +432,8 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
       return;
     }
     currentConversationId = null;
-    presentedConversationId = null;
+    thinkingLevelOverride = null;
+    newChatWorkState = 'idle';
     finishConversationLoading();
     pendingUser = null;
     sidebarOpen = false;
@@ -437,7 +509,7 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     }
     const stamp = Date.now();
     const commandId = crypto.randomUUID();
-    const thinkingLevel = options?.thinkingLevel || userSettings.thinkingLevel || 3;
+    const thinkingLevel = options?.thinkingLevel || effectiveThinkingLevel;
     const levelObj = THINKING_LEVELS.find((item) => item.level === thinkingLevel) || THINKING_LEVELS[2];
     sendInFlight = true;
     pendingCommandId = commandId;
@@ -459,6 +531,7 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
         pending: true,
       },
     };
+    setConversationWorkState(currentConversationId, 'working');
     if (currentConversationId) updateConversationPreview(currentConversationId, text, '');
     transport.send({
       type: 'send-message',
@@ -473,8 +546,9 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
       pendingCommandId = null;
       sendInFlight = false;
       pendingUser = null;
+      setConversationWorkState(currentConversationId, 'idle');
       setComposerStatus('官方输入框未确认提交；内容仍保留，请检查官方界面后手动决定是否重试', true);
-    }, 8_000);
+    }, 14_000);
     setComposerStatus('正在通过 ChatGPT 页面发送；断线后不会自动重发');
   }
 
@@ -486,19 +560,21 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     pendingCommandId = null;
     if (!message.ok) {
       pendingUser = null;
+      setConversationWorkState(currentConversationId, 'idle');
       const details = {
         'composer-not-found': '找不到官方输入框：请检查当前 ChatGPT 页面是否已登录或页面结构是否变化',
         'composer-rejected-input': '官方输入框没有接受这段文字；内容仍保留，未发送',
         'send-control-not-ready': '官方发送按钮未就绪；内容仍保留，未发送',
         'send-in-progress': '官方页面仍在处理上一条消息；本条未发送',
         'empty-message': '消息为空，未发送',
+        'send-unconfirmed': '已点击发送但官方页面未确认；消息可能未发出，请勿重复发送，可在官方界面核实',
       };
       const detail = details[message.error] || `发送失败：${message.error || 'unknown'}`;
       setComposerStatus(detail, true);
       return;
     }
     if (pendingUser && draft.trim() === pendingUser.text.trim()) draft = '';
-    setComposerStatus('消息已提交');
+    setComposerStatus('消息已发送（官方已确认）');
   }
 
   function reconcilePending(rawMessage) {
@@ -517,6 +593,39 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
         return;
       }
     }
+  }
+
+  function setConversationWorkState(id, state) {
+    if (!id) {
+      newChatWorkState = state;
+      return;
+    }
+    if (workStates.get(id) === state) return;
+    workStates = new Map(workStates).set(id, state);
+  }
+
+  function updateWorkStateFromMessage(id, message) {
+    const role = message?.author?.role || message?.role;
+    if (role !== 'assistant') return;
+    const statusValue = String(message?.status || '');
+    if (message?.end_turn === true || statusValue === 'finished_successfully' || statusValue === 'finished' || statusValue === 'failed') {
+      setConversationWorkState(id, 'idle');
+      return;
+    }
+    if (message?.end_turn === false || statusValue === 'in_progress' || statusValue === 'thinking' || statusValue === 'live') {
+      setConversationWorkState(id, 'working');
+    }
+  }
+
+  function updateWorkStateFromPayload(id, payload) {
+    const rows = buildConversationView(payload, payload?.current_node);
+    const assistant = [...rows].reverse().find((message) => message?.role === 'assistant');
+    if (!assistant) return;
+    updateWorkStateFromMessage(id, {
+      role: assistant.role,
+      status: assistant.status,
+      end_turn: assistant.endTurn,
+    });
   }
 
   function stepBranch(nodeId, delta) {
@@ -625,7 +734,16 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     <NavLeft>
       <Button small onClick={toggleSidebar}>☰</Button>
     </NavLeft>
-    <div class="mobile-title">{currentMeta?.title || 'SlimGPT'}</div>
+    <div class="mobile-title">
+      <span>{currentMeta?.title || 'SlimGPT'}</span>
+      <span
+        class="mobile-work-state"
+        class:working={conversationWorkState === 'working'}
+        role="status"
+        aria-label={conversationWorkState === 'working' ? '对话工作中' : '对话已停止'}
+        title={conversationWorkState === 'working' ? '工作中' : '已停止'}
+      ></span>
+    </div>
     <NavRight>
       <Button small onClick={toggleOverview}>概览</Button>
     </NavRight>
@@ -639,6 +757,7 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
         {statusLabel}
         {statusState}
         {captures}
+        workState={conversationWorkState}
         onShowOfficial={() => transport.send({ type: 'open-official', conversationId: currentConversationId })}
         onExportMarkdown={exportMarkdown}
         onNewChat={newChat}
@@ -652,7 +771,13 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
           <strong>{currentMeta?.title || (currentConversationId ? '加载中的对话' : '新对话')}</strong>
           <span>{currentMeta?.model ? `${currentMeta.model} · ` : ''}{currentConversationId ? 'ChatGPT 会话' : 'SlimGPT · 轻量模式'}</span>
         </div>
-        <Button small onClick={() => transport.openOfficial(currentConversationId)}>暂时显示官方界面</Button>
+        <div class="header-actions">
+          <span class="header-work-state" data-state={conversationWorkState} role="status">
+            <span class="work-dot" class:working={conversationWorkState === 'working'} aria-hidden="true"></span>
+            {conversationWorkState === 'working' ? '工作中' : '已停止'}
+          </span>
+          <Button small onClick={() => transport.openOfficial(currentConversationId)}>暂时显示官方界面</Button>
+        </div>
       </header>
 
       <section class="message-stage">
@@ -679,11 +804,18 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
             <span>{conversationTimedOut ? '可重新点击侧栏中的该会话重试' : (currentMeta?.title || '正在同步 ChatGPT 会话…')}</span>
           </div>
         {/if}
+
+        {#if conversationWorkState === 'working' && !conversationPending}
+          <div class="work-indicator" role="status" aria-live="polite">
+            <span class="work-indicator-spinner" aria-hidden="true"></span>
+            <span>对话进行中：正在生成或等待官方页面返回…</span>
+          </div>
+        {/if}
       </section>
 
       <Composer
         bind:value={draft}
-        thinkingLevel={userSettings.thinkingLevel || 3}
+        thinkingLevel={effectiveThinkingLevel}
         onThinkingLevelChange={handleThinkingLevelChange}
         disabled={!transport.supportsLiveChat || !status.bridgeReady}
         loading={conversationPending}

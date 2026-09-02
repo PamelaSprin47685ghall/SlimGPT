@@ -124,12 +124,56 @@ function parseSseBlock(block) {
 export function findConversationPayload(value, depth = 0) {
   if (!value || typeof value !== "object" || depth > 5) return null;
   if (value.mapping && typeof value.mapping === "object" && value.current_node) return value;
+  if (
+    Array.isArray(value.messages) &&
+    value.current_node &&
+    (value.conversation_id || value.id) &&
+    value.messages.some(looksLikeMessage)
+  ) {
+    return optimizedConversationToCanonical(value);
+  }
   for (const child of Object.values(value)) {
     if (!child || typeof child !== "object") continue;
     const found = findConversationPayload(child, depth + 1);
     if (found) return found;
   }
   return null;
+}
+
+function optimizedConversationToCanonical(value) {
+  const mapping = {};
+  let previousId = null;
+
+  for (const message of value.messages) {
+    if (!looksLikeMessage(message)) continue;
+    const id = String(message.id);
+    const requestedParent = message.metadata?.parent_id || message.parent_id || null;
+    const parent = requestedParent && requestedParent !== id
+      ? String(requestedParent)
+      : previousId;
+    mapping[id] = {
+      id,
+      parent,
+      children: [],
+      message,
+    };
+    previousId = id;
+  }
+
+  for (const node of Object.values(mapping)) {
+    if (node.parent && mapping[node.parent]) mapping[node.parent].children.push(node.id);
+    else node.parent = null;
+  }
+
+  const { messages, conversation_id: conversationId, ...rest } = value;
+  const currentNode = mapping[value.current_node] ? value.current_node : previousId;
+  return {
+    ...rest,
+    id: value.id || conversationId,
+    conversation_id: conversationId || value.id,
+    mapping,
+    current_node: currentNode,
+  };
 }
 
 export function extractConversationItems(value, depth = 0) {
@@ -273,7 +317,7 @@ export function conversationIdFromUrl(url) {
     const parsed = new URL(url, "https://chatgpt.com/");
     const routeMatch = parsed.pathname.match(/\/(?:c|uc)\/([^/?#]+)/);
     if (routeMatch) return routeMatch[1];
-    const apiMatch = parsed.pathname.match(/\/conversation\/([^/?#]+)/);
+    const apiMatch = parsed.pathname.match(/\/conversations?\/([^/?#]+)/);
     if (apiMatch) return apiMatch[1];
   } catch {
     // Ignore malformed URLs from transient capture records.
@@ -297,7 +341,7 @@ export function buildConversationView(payload, terminalId = null) {
   chain.reverse();
 
   return chain
-    .filter((node) => node?.message)
+    .filter((node) => node?.message && !node.message.metadata?.is_visually_hidden_from_conversation)
     .map((node) => messageNodeToView(node, mapping));
 }
 
@@ -342,8 +386,8 @@ function appendTurnReply(turn, message) {
 }
 
 function isTransientThinkingMessage(message) {
+  if (String(message?.text || "").trim() || message?.thought || message?.tool || message?.unrecognized) return false;
   if (message?.isThinking) return true;
-  if (String(message?.text || "").trim() || message?.tool) return false;
   return message?.status === "in_progress" || message?.status === "thinking" || message?.status === "live";
 }
 
@@ -360,7 +404,7 @@ export function messageNodeToView(node, mapping) {
   const error = status === "failed" || Boolean(message.metadata?.is_error) || Boolean(message.metadata?.error);
   const metadata = message.metadata || {};
   const model = metadata.model_slug || metadata.default_model_slug || metadata.model || null;
-  const reasoningEffort = metadata.reasoning_effort || metadata.reasoning_effort_level || null;
+  const reasoningEffort = metadata.thinking_effort || metadata.reasoning_effort || metadata.reasoning_effort_level || null;
   const thinkingLevel = metadata.thinking_level ? getThinkingLevel(metadata.thinking_level) : (reasoningEffort ? getThinkingLevel(reasoningEffort) : null);
 
   return {
@@ -382,7 +426,8 @@ export function messageNodeToView(node, mapping) {
     model,
     reasoningEffort,
     thinkingLevel,
-    isThinking: (status === "in_progress" || status === "thinking") && !text && !tool,
+    unrecognized: !text && !thought && !tool && hasNonTextExtras(message),
+    isThinking: (status === "in_progress" || status === "thinking") && !text && !tool && !hasNonTextExtras(message),
   };
 }
 
@@ -525,12 +570,78 @@ export function contentToText(content) {
 
 function partToText(part) {
   if (typeof part === "string") return part;
+  if (typeof part === "number" || typeof part === "boolean") return String(part);
   if (!part || typeof part !== "object") return "";
   if (part.content_type === "thought" || part.thought) return "";
-  if (typeof part.text === "string") return part.text;
+  if (typeof part.text === "string" && part.text.trim()) return part.text;
+  if (typeof part.transcript === "string" && part.transcript.trim()) return part.transcript;
+  if (Array.isArray(part.parts)) return part.parts.map(partToText).filter(Boolean).join("\n");
+  const attachment = attachmentLabel(part.asset_pointer);
+  if (attachment) return attachment;
   if (typeof part.content === "string") return part.content;
-  if (part.asset_pointer) return `[Attachment: ${part.asset_pointer}]`;
+  if (typeof part.summary === "string" && part.summary.trim()) return part.summary;
   return "";
+}
+
+function attachmentLabel(pointer) {
+  if (!pointer) return "";
+  if (typeof pointer === "string") return `[Attachment: ${pointer}]`;
+  if (typeof pointer !== "object") return "";
+  const id = pointer.asset_pointer || pointer.id || pointer.dalle_token || null;
+  if (!id) return "";
+  const kind = pointer.content_type ? ` (${pointer.content_type})` : "";
+  return `[Attachment: ${String(id).slice(0, 96)}${kind}]`;
+}
+
+export function hasNonTextExtras(message) {
+  const content = message?.content;
+  if (!content || typeof content !== "object") return false;
+  const contentType = String(content.content_type || "");
+  if (Array.isArray(content.parts)) {
+    let renderedText = false;
+    let sawExtras = false;
+    for (const part of content.parts) {
+      if (typeof part === "string") {
+        if (part.trim()) renderedText = true;
+        continue;
+      }
+      if (!part || typeof part !== "object") continue;
+      if (part.content_type === "thought" || part.thought) continue;
+      if (typeof part.text === "string" && part.text.trim()) {
+        renderedText = true;
+        continue;
+      }
+      if (typeof part.transcript === "string" && part.transcript.trim()) {
+        renderedText = true;
+        continue;
+      }
+      if (typeof part.content === "string" && part.content.trim()) {
+        renderedText = true;
+        continue;
+      }
+      if (part.asset_pointer || part.audio || part.image || part.upload_status || part.content_type) sawExtras = true;
+    }
+    if (renderedText) return false;
+    if (sawExtras) return true;
+    // All-text parts (including empty strings) are just an empty message —
+    // unless the top-level content_type itself is non-text, which stays
+    // visible as unrecognized content below.
+    if (["text", "thought"].includes(contentType) || !contentType) return false;
+  }
+  const selfRendered = typeof content.transcript === "string" && content.transcript.trim();
+  if (contentType && !["text", "thought"].includes(contentType) && content.text == null && content.result == null && !selfRendered) return true;
+  if (Array.isArray(content.files) && content.files.length) return true;
+  return false;
+}
+
+export function conversationThinkingLevel(payload) {
+  if (!payload?.mapping || typeof payload.mapping !== "object") return null;
+  const rows = buildConversationView(payload, payload.current_node);
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const level = rows[index]?.thinkingLevel;
+    if (level?.level) return level;
+  }
+  return null;
 }
 
 export function stepConversationBranch(payload, nodeId, delta) {
@@ -567,7 +678,7 @@ export function upsertLiveMessage(messages, rawMessage) {
   const error = status === "failed" || Boolean(rawMessage.metadata?.is_error) || Boolean(rawMessage.metadata?.error);
   const metadata = rawMessage.metadata || {};
   const model = metadata.model_slug || metadata.default_model_slug || metadata.model || null;
-  const reasoningEffort = metadata.reasoning_effort || metadata.reasoning_effort_level || null;
+  const reasoningEffort = metadata.thinking_effort || metadata.reasoning_effort || metadata.reasoning_effort_level || null;
   const thinkingLevel = metadata.thinking_level ? getThinkingLevel(metadata.thinking_level) : (reasoningEffort ? getThinkingLevel(reasoningEffort) : null);
 
   const item = {
@@ -589,7 +700,9 @@ export function upsertLiveMessage(messages, rawMessage) {
     model,
     reasoningEffort,
     thinkingLevel,
-    isThinking: (status === "in_progress" || status === "thinking") && !text && !tool,
+    conversationId: null,
+    unrecognized: !text && !thought && !tool && hasNonTextExtras(rawMessage),
+    isThinking: (status === "in_progress" || status === "thinking") && !text && !tool && !hasNonTextExtras(rawMessage),
     live: true,
   };
 
@@ -597,17 +710,35 @@ export function upsertLiveMessage(messages, rawMessage) {
   if (index === -1) return [...messages, item];
   const next = messages.slice();
   const previous = next[index];
+  // Lifecycle fields only move forward: a status-less capture (DOM observer)
+  // or an early in_progress delta must never regress a finished message.
+  const finished = (message) => message?.status === "finished_successfully" || message?.status === "finished" || message?.endTurn === true;
+  const mergedStatus = item.status ?? previous.status ?? null;
+  const mergedEndTurn = item.endTurn ?? previous.endTurn ?? null;
   next[index] = {
     ...previous,
     ...item,
+    status: mergedStatus,
+    endTurn: mergedEndTurn,
+    error: item.error || previous.error || false,
     name: item.name || previous.name || null,
     thought: item.thought || previous.thought || null,
+    text: item.text || previous.text || "",
     model: item.model || previous.model || null,
     reasoningEffort: item.reasoningEffort || previous.reasoningEffort || null,
     metadata: Object.keys(item.metadata || {}).length ? item.metadata : (previous.metadata || {}),
     tool: item.tool || previous.tool || null,
-    isThinking: item.isThinking,
+    isThinking: finished(previous) ? false : item.isThinking,
+    unrecognized: item.unrecognized || previous.unrecognized || false,
   };
+  if (finished(previous) && !finished({ status: mergedStatus, endTurn: mergedEndTurn })) {
+    // Regressed (e.g. a stale in_progress capture): restore the finished state.
+    next[index] = {
+      ...next[index],
+      status: previous.status,
+      endTurn: previous.endTurn,
+    };
+  }
   return next;
 }
 
