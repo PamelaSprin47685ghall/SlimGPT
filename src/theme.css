@@ -538,6 +538,7 @@ html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; backg
 .conversation-loading strong { font-size: 13px; font-weight: 650; }
 .conversation-loading > span:last-child { max-width: min(420px, 80vw); overflow: hidden; color: var(--slim-muted); font-size: 11.5px; text-overflow: ellipsis; white-space: nowrap; }
 .conversation-loading-spinner { width: 20px; height: 20px; margin-bottom: 2px; border: 2px solid var(--slim-line); border-top-color: var(--f7-theme-color); border-radius: 50%; animation: slimgpt-spin .8s linear infinite; }
+.history-sync-notice { position: absolute; top: 8px; left: 50%; z-index: 18; max-width: min(680px, calc(100% - 28px)); transform: translateX(-50%); padding: 5px 10px; border: 1px solid color-mix(in srgb, var(--f7-theme-color) 28%, var(--slim-line)); border-radius: 999px; background: color-mix(in srgb, var(--slim-panel) 92%, transparent); color: var(--slim-muted); font-size: 10.5px; line-height: 1.35; text-align: center; pointer-events: none; }
 @keyframes slimgpt-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .conversation-loading-spinner { animation: none; border-top-color: var(--slim-line); box-shadow: inset 0 0 0 4px var(--f7-theme-color); } }
 

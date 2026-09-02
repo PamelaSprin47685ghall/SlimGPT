@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import { compactObservationLedger, extensionStorageArea } from '../src/lib/storage.js';
 import {
+  buildConversationRecordTurns,
   buildConversationRecordView,
   hydrateConversationObservations,
   ingestConversationMessage,
@@ -165,11 +166,55 @@ test('persisted observation ledger round-trips full reasoning/tools across a sho
         },
       },
     },
-  });
+  }, { canonicalComplete: false });
 
   const rows = buildConversationRecordView(restored);
   assert.ok(rows.some((row) => row.thought?.includes('先保留完整思考，不做滑窗。')));
   assert.ok(rows.some((row) => row.tool?.kind === 'tool-call' && JSON.stringify(row.tool.payload).includes('persist me')));
   assert.ok(rows.some((row) => row.tool?.kind === 'tool-result'));
   assert.ok(rows.some((row) => row.text === 'latest short-window answer'));
+});
+
+test('persisted semantic turn identity still overrides a misleading parent after ledger reload', () => {
+  let live = ingestConversationMessage(null, {
+    id: 'late-reasoning',
+    parent_id: 'old-answer',
+    author: { role: 'assistant' },
+    content: { content_type: 'thought', text: 'belongs to second turn' },
+    metadata: { turn_exchange_id: 'turn-second' },
+  }, { outputIndex: 0, observationOrdinal: 1 });
+
+  const [entry] = compactObservationLedger([
+    { id: 'semantic-reload', observations: live.observations },
+  ]);
+  let restored = hydrateConversationObservations(null, entry.observations);
+  restored = ingestConversationPayload(restored, {
+    id: 'semantic-reload', current_node: 'second-answer',
+    mapping: {
+      'first-user': {
+        id: 'first-user', parent: null, children: ['old-answer'],
+        message: { id: 'first-user', author: { role: 'user' }, content: { parts: ['first'] } },
+      },
+      'old-answer': {
+        id: 'old-answer', parent: 'first-user', children: ['second-user'],
+        message: { id: 'old-answer', author: { role: 'assistant' }, content: { parts: ['old'] } },
+      },
+      'second-user': {
+        id: 'second-user', parent: 'old-answer', children: ['second-answer'],
+        message: {
+          id: 'second-user', author: { role: 'user' }, content: { parts: ['second'] },
+          metadata: { turn_exchange_id: 'turn-second' },
+        },
+      },
+      'second-answer': {
+        id: 'second-answer', parent: 'second-user', children: [],
+        message: { id: 'second-answer', author: { role: 'assistant' }, content: { parts: ['new'] } },
+      },
+    },
+  });
+
+  const turns = buildConversationRecordTurns(restored);
+  assert.equal(turns.length, 2);
+  assert.equal(turns[0].replies.some((item) => item.id === 'late-reasoning'), false);
+  assert.equal(turns[1].replies.some((item) => item.id === 'late-reasoning'), true);
 });

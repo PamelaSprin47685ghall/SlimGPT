@@ -479,7 +479,10 @@ function optimizedConversationToCanonical(value) {
 
   for (const node of Object.values(mapping)) {
     if (node.parent && mapping[node.parent]) mapping[node.parent].children.push(node.id);
-    else node.parent = null;
+    // Paginated conversation pages may point to a parent on an older page.
+    // Preserve that external parent id so page merges can reconnect the
+    // canonical chain later; only a genuinely absent parent is a root.
+    else if (!node.parent) node.parent = null;
   }
 
   const { messages, conversation_id: conversationId, ...rest } = value;
@@ -610,7 +613,11 @@ export function findMessageEvents(value) {
 
 function collectMessageEvents(root, output) {
   if (!root || typeof root !== "object") return;
-  const stack = [{ value: root, scope: { conversationId: null, conflicted: false } }];
+  const stack = [{
+    value: root,
+    scope: { conversationId: null, conflicted: false },
+    context: {},
+  }];
   const visited = new WeakSet();
   let inspected = 0;
   const MAX_INSPECTED_OBJECTS = 12_000;
@@ -625,6 +632,7 @@ function collectMessageEvents(root, output) {
 
     const directConversationId = value.conversation_id || value.conversationId || null;
     const scope = mergeConversationScope(entry.scope, directConversationId);
+    const context = mergeMessageEventContext(entry.context, value);
 
     if (looksLikeMessage(value.message)) {
       const messageScope = mergeConversationScope(
@@ -632,6 +640,7 @@ function collectMessageEvents(root, output) {
         value.message.conversation_id || value.message.conversationId || null,
       );
       output.push({
+        ...context,
         message: value.message,
         conversationId: messageScope.conversationId,
         conversationIdConflict: messageScope.conflicted,
@@ -639,6 +648,7 @@ function collectMessageEvents(root, output) {
     }
     if (looksLikeMessage(value) && (value.author || value.content)) {
       output.push({
+        ...context,
         message: value,
         conversationId: scope.conversationId,
         conversationIdConflict: scope.conflicted,
@@ -650,9 +660,66 @@ function collectMessageEvents(root, output) {
     for (let index = children.length - 1; index >= 0; index -= 1) {
       const child = children[index];
       if (!child || typeof child !== "object") continue;
-      stack.push({ value: child, scope });
+      stack.push({ value: child, scope, context });
     }
   }
+}
+
+function mergeMessageEventContext(previous, value) {
+  const sequenceNumber = Number.isFinite(Number(value?.sequence_number))
+    ? Number(value.sequence_number)
+    : previous?.sequenceNumber;
+  const outputIndex = Number.isFinite(Number(value?.output_index))
+    ? Number(value.output_index)
+    : previous?.outputIndex;
+  const responseId = firstNonEmptyString(
+    value?.response_id,
+    value?.responseId,
+    value?.response?.id,
+    previous?.responseId,
+  ) || null;
+  const itemId = firstNonEmptyString(
+    value?.item_id,
+    value?.itemId,
+    value?.output_item_id,
+    value?.outputItemId,
+    value?.item?.id,
+    previous?.itemId,
+  ) || null;
+  const eventType = firstNonEmptyString(value?.type, previous?.eventType) || null;
+  const turnIdentity = messageTurnIdentity(value);
+  const phase = firstNonEmptyString(
+    value?.phase,
+    value?.channel,
+    turnIdentity.phase,
+    previous?.phase,
+  ) || null;
+  const channel = firstNonEmptyString(
+    value?.channel,
+    value?.metadata?.channel,
+    previous?.channel,
+  ) || null;
+  const callIdentity = messageCallIdentity(value);
+  return {
+    sequenceNumber: sequenceNumber ?? null,
+    outputIndex: outputIndex ?? null,
+    responseId,
+    itemId,
+    eventType,
+    turnId: turnIdentity.turnId || previous?.turnId || null,
+    turnAliases: uniqueStrings([
+      ...(previous?.turnAliases || []),
+      ...(turnIdentity.turnAliases || []),
+    ]),
+    turnExchangeId: turnIdentity.turnExchangeId || previous?.turnExchangeId || null,
+    workingTurnId: turnIdentity.workingTurnId || previous?.workingTurnId || null,
+    turnRequestId: turnIdentity.requestId || previous?.turnRequestId || null,
+    turnTraceId: turnIdentity.turnTraceId || previous?.turnTraceId || null,
+    phase,
+    channel,
+    callId: callIdentity.callId || previous?.callId || null,
+    toolCallId: callIdentity.toolCallId || previous?.toolCallId || null,
+  };
 }
 
 function mergeConversationScope(scope, candidate) {
@@ -667,31 +734,48 @@ function mergeConversationScope(scope, candidate) {
 }
 
 function dedupeMessageEvents(events) {
-  const orderedKeys = [];
-  const merged = new Map();
+  const merged = [];
   for (const event of events) {
     const { message, conversationId, conversationIdConflict } = event;
-    const id = message?.id;
-    if (!id) continue;
+    if (!message?.id) continue;
     const scope = conversationIdConflict ? "conflict" : (conversationId || "unscoped");
-    const key = `${scope}\u0000${id}`;
-    if (!merged.has(key)) {
-      orderedKeys.push(key);
-      merged.set(key, event);
+    const eventIdentity = normalizedObservationIdentity(message, event);
+    const index = merged.findIndex((candidate) => {
+      const candidateScope = candidate.conversationIdConflict
+        ? "conflict"
+        : (candidate.conversationId || "unscoped");
+      const candidateIdentity = normalizedObservationIdentity(candidate.message, candidate);
+      return candidateScope === scope &&
+        observationSubjectsMatch(candidateIdentity, eventIdentity) &&
+        observationIdentitiesCompatible(candidateIdentity, eventIdentity);
+    });
+    if (index === -1) {
+      merged.push(event);
       continue;
     }
-    const previous = merged.get(key);
-    merged.set(key, {
+    const previous = merged[index];
+    merged[index] = {
       ...previous,
       ...event,
+      turnAliases: uniqueStrings([
+        ...(previous.turnAliases || []),
+        ...(event.turnAliases || []),
+      ]),
       message: mergeObservedMessage(previous.message, event.message),
       conversationIdConflict: Boolean(previous.conversationIdConflict || event.conversationIdConflict),
       conversationId: previous.conversationIdConflict || event.conversationIdConflict
         ? null
         : (event.conversationId || previous.conversationId || null),
-    });
+    };
   }
-  return orderedKeys.map((key) => merged.get(key));
+  return merged;
+}
+
+function messageEventIdentitiesCompatible(left, right) {
+  const leftIdentity = normalizedObservationIdentity(left.message, left);
+  const rightIdentity = normalizedObservationIdentity(right.message, right);
+  return observationSubjectsMatch(leftIdentity, rightIdentity) &&
+    observationIdentitiesCompatible(leftIdentity, rightIdentity);
 }
 
 function looksLikeMessage(value) {
@@ -812,6 +896,281 @@ export function isAsyncReasoningMessage(message) {
   );
 }
 
+export function messageTurnIdentity(message) {
+  if (!message || typeof message !== "object") {
+    return {
+      turnId: null,
+      turnAliases: [],
+      turnExchangeId: null,
+      workingTurnId: null,
+      requestId: null,
+      turnTraceId: null,
+      phase: null,
+    };
+  }
+  const metadata = message.metadata && typeof message.metadata === "object"
+    ? message.metadata
+    : {};
+  const turnExchangeId = firstNonEmptyString(
+    metadata.turn_exchange_id,
+    metadata.turnExchangeId,
+    message.turn_exchange_id,
+    message.turnExchangeId,
+  ) || null;
+  const workingTurnId = firstNonEmptyString(
+    metadata.working_turn_id,
+    metadata.workingTurnId,
+    message.working_turn_id,
+    message.workingTurnId,
+  ) || null;
+  const requestId = firstNonEmptyString(
+    metadata.request_id,
+    metadata.requestId,
+    message.request_id,
+    message.requestId,
+  ) || null;
+  const turnTraceId = firstNonEmptyString(
+    metadata.turn_trace_id,
+    metadata.turnTraceId,
+    message.turn_trace_id,
+    message.turnTraceId,
+  ) || null;
+  // `turn_exchange_id` is the strongest observed ChatGPT-Web grouping key.
+  // `working_turn_id` and `request_id` are retained as aliases because long
+  // tool/reasoning turns can surface different subsets of these fields.
+  const turnAliases = uniqueStrings([
+    turnExchangeId,
+    workingTurnId,
+    requestId,
+    turnTraceId,
+  ]);
+  const phase = firstNonEmptyString(
+    message.phase,
+    message.channel,
+    metadata.phase,
+    metadata.channel,
+  ) || null;
+  return {
+    turnId: turnAliases[0] || null,
+    turnAliases,
+    turnExchangeId,
+    workingTurnId,
+    requestId,
+    turnTraceId,
+    phase,
+  };
+}
+
+export function messageProtocolIdentity(message, context = {}) {
+  const source = message && typeof message === "object" ? message : {};
+  const metadata = source.metadata && typeof source.metadata === "object" ? source.metadata : {};
+  const content = source.content && typeof source.content === "object" ? source.content : {};
+  const turnIdentity = messageTurnIdentity(source);
+  const callIdentity = messageCallIdentity(source);
+  const sequenceNumber = firstFiniteNumber(
+    context.sequenceNumber,
+    source.sequence_number,
+    source.sequenceNumber,
+    metadata.sequence_number,
+    metadata.sequenceNumber,
+  );
+  const outputIndex = firstFiniteNumber(
+    context.outputIndex,
+    source.output_index,
+    source.outputIndex,
+    metadata.output_index,
+    metadata.outputIndex,
+  );
+  const responseId = firstNonEmptyString(
+    context.responseId,
+    source.response_id,
+    source.responseId,
+    metadata.response_id,
+    metadata.responseId,
+  ) || null;
+  const itemId = firstNonEmptyString(
+    context.itemId,
+    source.item_id,
+    source.itemId,
+    source.output_item_id,
+    source.outputItemId,
+    metadata.item_id,
+    metadata.itemId,
+    metadata.output_item_id,
+    metadata.outputItemId,
+  ) || null;
+  const phase = firstNonEmptyString(
+    context.phase,
+    source.phase,
+    source.channel,
+    metadata.phase,
+    metadata.channel,
+    turnIdentity.phase,
+  ) || null;
+  const channel = firstNonEmptyString(
+    context.channel,
+    source.channel,
+    metadata.channel,
+  ) || null;
+  const parentMessageId = firstNonEmptyString(
+    context.parentMessageId,
+    source.parent_id,
+    metadata.parent_id,
+  ) || null;
+  const turnUserMessageId = firstNonEmptyString(
+    context.turnUserMessageId,
+    source.turn_user_message_id,
+    source.turnUserMessageId,
+    metadata.turn_user_message_id,
+    metadata.turnUserMessageId,
+  ) || null;
+  const contentType = firstNonEmptyString(
+    content.content_type,
+    source.content_type,
+    metadata.content_type,
+  ) || null;
+  const role = firstNonEmptyString(source.author?.role, source.role) || null;
+  return {
+    conversationId: firstNonEmptyString(
+      context.conversationId,
+      source.conversation_id,
+      source.conversationId,
+    ) || null,
+    messageId: firstNonEmptyString(source.id, context.messageId) || null,
+    itemId,
+    parentMessageId,
+    semanticTurnAliases: uniqueStrings([
+      ...(context.turnAliases || []),
+      context.semanticTurnId,
+      context.turnId,
+      ...(turnIdentity.turnAliases || []),
+    ]),
+    turnUserMessageId,
+    responseId,
+    transportSessionId: firstNonEmptyString(
+      context.transportSessionId,
+      context.transportTurnId,
+    ) || null,
+    sequenceNumber,
+    outputIndex,
+    callId: firstNonEmptyString(context.callId, callIdentity.callId) || null,
+    toolCallId: firstNonEmptyString(context.toolCallId, callIdentity.toolCallId) || null,
+    callIds: uniqueStrings([
+      ...(context.callIds || []),
+      ...(callIdentity.callIds || []),
+    ]),
+    phase,
+    channel,
+    role,
+    contentType,
+    eventType: firstNonEmptyString(context.eventType) || null,
+    turnExchangeId: turnIdentity.turnExchangeId,
+    workingTurnId: turnIdentity.workingTurnId,
+    requestId: turnIdentity.requestId,
+    turnTraceId: turnIdentity.turnTraceId,
+  };
+}
+
+function messageCallIdentity(message) {
+  if (!message || typeof message !== "object") {
+    return { callId: null, toolCallId: null, callIds: [] };
+  }
+  const metadata = message.metadata && typeof message.metadata === "object" ? message.metadata : {};
+  const content = message.content && typeof message.content === "object" ? message.content : {};
+  const toolCalls = Array.isArray(message.tool_calls)
+    ? message.tool_calls
+    : Array.isArray(metadata.tool_calls)
+      ? metadata.tool_calls
+      : Array.isArray(content.tool_calls)
+        ? content.tool_calls
+        : [];
+  const callId = firstNonEmptyString(
+    message.call_id,
+    metadata.call_id,
+    content.call_id,
+    toolCalls[0]?.call_id,
+    toolCalls[0]?.id,
+  ) || null;
+  const toolCallId = firstNonEmptyString(
+    message.tool_call_id,
+    metadata.tool_call_id,
+    content.tool_call_id,
+    toolCalls[0]?.tool_call_id,
+    toolCalls[0]?.id,
+  ) || null;
+  const callIds = uniqueStrings([
+    callId,
+    toolCallId,
+    ...toolCalls.flatMap((call) => [call?.id, call?.call_id, call?.tool_call_id]),
+  ]);
+  return { callId, toolCallId, callIds };
+}
+
+function firstFiniteNumber(...values) {
+  for (const value of values) {
+    if (value == null || value === "") continue;
+    const number = Number(value);
+    if (Number.isFinite(number)) return number;
+  }
+  return null;
+}
+
+function normalizedObservationIdentity(message, context = {}) {
+  const identity = messageProtocolIdentity(message, context);
+  const tool = getToolMessageInfo(message);
+  return {
+    ...identity,
+    itemKind: tool?.kind || identity.contentType || identity.role || null,
+  };
+}
+
+function observationIdentitiesCompatible(left, right) {
+  if (!left || !right) return true;
+  for (const key of ["responseId", "itemId", "outputIndex", "callId", "toolCallId", "phase", "itemKind"]) {
+    const leftValue = left[key];
+    const rightValue = right[key];
+    if (leftValue != null && rightValue != null && leftValue !== rightValue) return false;
+  }
+  if (left.callIds?.length && right.callIds?.length) {
+    const overlap = left.callIds.some((value) => right.callIds.includes(value));
+    if (!overlap && (left.callId || left.toolCallId) && (right.callId || right.toolCallId)) return false;
+  }
+  return true;
+}
+
+function observationSubjectsMatch(left, right) {
+  if (!left || !right) return false;
+  if (left.messageId && right.messageId && left.messageId === right.messageId) return true;
+  return Boolean(left.itemId && right.itemId && left.itemId === right.itemId);
+}
+
+function observationIdentityKey(identity) {
+  const semantic = identity?.semanticTurnAliases?.[0] || "";
+  return [
+    identity?.messageId || "message",
+    identity?.responseId || "",
+    identity?.itemId || "",
+    identity?.outputIndex ?? "",
+    identity?.callId || identity?.toolCallId || "",
+    identity?.phase || "",
+    identity?.itemKind || identity?.contentType || identity?.role || "",
+    semantic,
+  ].join("\u0000");
+}
+
+function uniqueStrings(values) {
+  const output = [];
+  const seen = new Set();
+  for (const value of values || []) {
+    if (typeof value !== "string") continue;
+    const normalized = value.trim();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    output.push(normalized);
+  }
+  return output;
+}
+
 export function messageNodeToView(node, mapping) {
   const message = node.message || {};
   const siblings = node.parent && mapping[node.parent]?.children
@@ -830,6 +1189,9 @@ export function messageNodeToView(node, mapping) {
   const thinkingLevel = metadata.thinking_level ? getThinkingLevel(metadata.thinking_level) : (reasoningEffort ? getThinkingLevel(reasoningEffort) : null);
   const durationSec = metadata.finished_duration_sec ?? null;
   const thinkingDuration = formatThinkingDuration(durationSec, metadata.reasoning_start_time, metadata.reasoning_end_time, metadata);
+  const protocolIdentity = messageProtocolIdentity(message, {
+    parentMessageId: node.parent || null,
+  });
 
   const ct = String(message.content?.content_type || "");
   const isSpinner = ct === "tether_browsing_display" && !message.content?.result && !message.content?.summary;
@@ -839,7 +1201,25 @@ export function messageNodeToView(node, mapping) {
   return {
     id: message.id || node.id,
     nodeId: node.id,
+    itemId: protocolIdentity.itemId,
+    parentId: protocolIdentity.parentMessageId,
+    turnId: protocolIdentity.semanticTurnAliases[0] || null,
+    turnAliases: protocolIdentity.semanticTurnAliases,
+    turnExchangeId: protocolIdentity.turnExchangeId,
+    workingTurnId: protocolIdentity.workingTurnId,
+    turnRequestId: protocolIdentity.requestId,
+    turnTraceId: protocolIdentity.turnTraceId,
+    responseId: protocolIdentity.responseId,
+    sequenceNumber: protocolIdentity.sequenceNumber,
+    outputIndex: protocolIdentity.outputIndex,
+    callId: protocolIdentity.callId,
+    toolCallId: protocolIdentity.toolCallId,
+    callIds: protocolIdentity.callIds,
+    phase: protocolIdentity.phase,
+    channel: protocolIdentity.channel,
+    eventType: protocolIdentity.eventType,
     role,
+    contentType: ct || null,
     name: message.author?.name || null,
     text,
     thought,
@@ -858,6 +1238,11 @@ export function messageNodeToView(node, mapping) {
     thinkingLevel,
     unrecognized: !text && !thought && !tool && !isSpinner && hasNonTextExtras(message),
     isThinking: (status === "in_progress" || status === "thinking") && !text && !tool && !hasNonTextExtras(message),
+    observationKey: observationIdentityKey({
+      ...protocolIdentity,
+      messageId: message.id || node.id,
+      itemKind: tool?.kind || ct || role,
+    }),
   };
 }
 
@@ -972,6 +1357,7 @@ export function getToolMessageInfo(message) {
         ? content.tool_calls
         : null;
   const contentType = String(content.content_type || "");
+  const callIdentity = messageCallIdentity(message);
 
   let kind = null;
   if (
@@ -1010,6 +1396,9 @@ export function getToolMessageInfo(message) {
     title,
     recipient: recipient || null,
     contentType: contentType || null,
+    callId: callIdentity.callId,
+    toolCallId: callIdentity.toolCallId,
+    callIds: callIdentity.callIds,
     payload: extractToolPayload(message, toolCalls),
   };
 }
@@ -1262,16 +1651,49 @@ function descendToLeaf(mapping, start) {
 
 export function upsertLiveMessage(messages, rawMessage, options = {}) {
   if (!rawMessage?.id) return messages;
-  const index = messages.findIndex((message) => message.id === rawMessage.id);
+  const incomingIdentity = normalizedObservationIdentity(rawMessage, options);
+  const index = findCompatibleObservationIndex(messages, incomingIdentity);
   const previous = index >= 0 ? messages[index] : null;
   const mergedRaw = previous?._rawMessage
     ? mergeObservedMessage(previous._rawMessage, rawMessage, options)
     : cloneConversationMessage(rawMessage);
-  const item = liveMessageToView(mergedRaw);
+  const protocolIdentity = messageProtocolIdentity(mergedRaw, options);
+  const item = liveMessageToView(mergedRaw, options);
   item._rawMessage = mergedRaw;
-  item.parentId = mergedRaw?.metadata?.parent_id || mergedRaw?.parent_id || previous?.parentId || null;
+  item.parentId = protocolIdentity.parentMessageId || previous?.parentId || null;
+  item.itemId = protocolIdentity.itemId || previous?.itemId || null;
+  item.turnId = protocolIdentity.semanticTurnAliases[0] || previous?.turnId || null;
+  item.turnAliases = uniqueStrings([
+    ...(previous?.turnAliases || []),
+    ...(protocolIdentity.semanticTurnAliases || []),
+  ]);
+  item.turnExchangeId = protocolIdentity.turnExchangeId || previous?.turnExchangeId || null;
+  item.workingTurnId = protocolIdentity.workingTurnId || previous?.workingTurnId || null;
+  item.turnRequestId = protocolIdentity.requestId || previous?.turnRequestId || null;
+  item.turnTraceId = protocolIdentity.turnTraceId || previous?.turnTraceId || null;
+  item.phase = protocolIdentity.phase || previous?.phase || null;
+  item.channel = protocolIdentity.channel || previous?.channel || null;
+  item.eventType = protocolIdentity.eventType || previous?.eventType || null;
+  item.transportTurnId = protocolIdentity.transportSessionId || previous?.transportTurnId || null;
+  item.turnUserMessageId = protocolIdentity.turnUserMessageId || previous?.turnUserMessageId || null;
+  item.turnParentMessageId = options.turnParentMessageId || previous?.turnParentMessageId || null;
+  item.captureId = options.captureId || previous?.captureId || null;
+  item.captureTransport = options.captureTransport || previous?.captureTransport || null;
+  item.observationOrdinal = previous?.observationOrdinal ?? options.observationOrdinal ?? null;
+  item.sequenceNumber = previous?.sequenceNumber ?? protocolIdentity.sequenceNumber ?? null;
+  item.outputIndex = previous?.outputIndex ?? protocolIdentity.outputIndex ?? null;
+  item.responseId = protocolIdentity.responseId || previous?.responseId || null;
+  item.callId = protocolIdentity.callId || previous?.callId || item.tool?.callId || null;
+  item.toolCallId = protocolIdentity.toolCallId || previous?.toolCallId || item.tool?.toolCallId || null;
+  item.callIds = uniqueStrings([
+    ...(previous?.callIds || []),
+    ...(protocolIdentity.callIds || []),
+    ...(item.tool?.callIds || []),
+  ]);
+  item.observationMode = options.textMode || previous?.observationMode || null;
   item.firstSeenAt = previous?.firstSeenAt || Date.now();
   item.lastSeenAt = Date.now();
+  item.observationKey = observationIdentityKey(viewObservationIdentity(item));
 
   if (index === -1) return [...messages, item];
   const next = messages.slice();
@@ -1279,7 +1701,39 @@ export function upsertLiveMessage(messages, rawMessage, options = {}) {
   return next;
 }
 
-function liveMessageToView(rawMessage) {
+function findCompatibleObservationIndex(messages, incomingIdentity) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const candidate = messages[index];
+    const candidateIdentity = viewObservationIdentity(candidate);
+    if (!observationSubjectsMatch(candidateIdentity, incomingIdentity)) continue;
+    if (observationIdentitiesCompatible(candidateIdentity, incomingIdentity)) return index;
+  }
+  return -1;
+}
+
+function viewObservationIdentity(item) {
+  return {
+    messageId: item?.id || null,
+    itemId: item?.itemId || null,
+    responseId: item?.responseId || null,
+    outputIndex: firstFiniteNumber(item?.outputIndex),
+    sequenceNumber: firstFiniteNumber(item?.sequenceNumber),
+    callId: item?.callId || item?.tool?.callId || null,
+    toolCallId: item?.toolCallId || item?.tool?.toolCallId || null,
+    callIds: uniqueStrings([
+      ...(item?.callIds || []),
+      ...(item?.tool?.callIds || []),
+    ]),
+    phase: item?.phase || null,
+    channel: item?.channel || null,
+    itemKind: item?.tool?.kind || item?.contentType || item?.role || null,
+    contentType: item?.contentType || null,
+    role: item?.role || null,
+    semanticTurnAliases: semanticTurnAliases(item),
+  };
+}
+
+function liveMessageToView(rawMessage, options = {}) {
   const metadata = rawMessage.metadata || {};
   const isAsyncReasoning = isAsyncReasoningMessage(rawMessage);
   const thought = extractThought(rawMessage);
@@ -1292,6 +1746,7 @@ function liveMessageToView(rawMessage) {
   const thinkingLevel = metadata.thinking_level ? getThinkingLevel(metadata.thinking_level) : (reasoningEffort ? getThinkingLevel(reasoningEffort) : null);
   const durationSec = metadata.finished_duration_sec ?? null;
   const thinkingDuration = formatThinkingDuration(durationSec, metadata.reasoning_start_time, metadata.reasoning_end_time, metadata);
+  const protocolIdentity = messageProtocolIdentity(rawMessage, options);
 
   const ct = String(rawMessage.content?.content_type || "");
   const isSpinner = ct === "tether_browsing_display" && !rawMessage.content?.result && !rawMessage.content?.summary;
@@ -1300,7 +1755,25 @@ function liveMessageToView(rawMessage) {
   const item = {
     id: rawMessage.id,
     nodeId: rawMessage.id,
+    itemId: protocolIdentity.itemId,
+    parentId: protocolIdentity.parentMessageId,
+    turnId: protocolIdentity.semanticTurnAliases[0] || null,
+    turnAliases: protocolIdentity.semanticTurnAliases,
+    turnExchangeId: protocolIdentity.turnExchangeId,
+    workingTurnId: protocolIdentity.workingTurnId,
+    turnRequestId: protocolIdentity.requestId,
+    turnTraceId: protocolIdentity.turnTraceId,
+    responseId: protocolIdentity.responseId,
+    sequenceNumber: protocolIdentity.sequenceNumber,
+    outputIndex: protocolIdentity.outputIndex,
+    callId: protocolIdentity.callId,
+    toolCallId: protocolIdentity.toolCallId,
+    callIds: protocolIdentity.callIds,
+    phase: protocolIdentity.phase,
+    channel: protocolIdentity.channel,
+    eventType: protocolIdentity.eventType,
     role,
+    contentType: ct || null,
     name: rawMessage.author?.name || null,
     text,
     thought,
@@ -1322,6 +1795,11 @@ function liveMessageToView(rawMessage) {
     isThinking: (status === "in_progress" || status === "thinking") && !text && !tool && !hasNonTextExtras(rawMessage),
     live: true,
   };
+  item.observationKey = observationIdentityKey({
+    ...protocolIdentity,
+    messageId: rawMessage.id,
+    itemKind: tool?.kind || ct || role,
+  });
   return item;
 }
 
@@ -1376,12 +1854,14 @@ export function createConversationRecord(previous = null) {
   return {
     payload: previous?.payload || null,
     terminal: previous?.terminal || previous?.payload?.current_node || null,
+    canonicalComplete: Boolean(previous?.canonicalComplete),
     observations: Array.isArray(previous?.observations) ? previous.observations : [],
   };
 }
 
-export function ingestConversationPayload(record, incomingPayload) {
+export function ingestConversationPayload(record, incomingPayload, options = {}) {
   const previous = createConversationRecord(record);
+  const explicitCompleteness = Object.prototype.hasOwnProperty.call(options, "canonicalComplete");
   const previousPayload = previous.payload;
   const payload = previousPayload
     ? mergeConversationPayload(previousPayload, incomingPayload)
@@ -1395,6 +1875,8 @@ export function ingestConversationPayload(record, incomingPayload) {
   return {
     payload,
     terminal,
+    canonicalComplete: previous.canonicalComplete ||
+      (explicitCompleteness ? options.canonicalComplete === true : true),
     observations: previous.observations,
   };
 }
@@ -1412,7 +1894,11 @@ export function hydrateConversationObservations(record, observations) {
   if (!Array.isArray(observations)) return current;
   for (const observation of observations) {
     if (!observation?.id) continue;
-    const index = current.observations.findIndex((item) => item?.id === observation.id);
+    const hydratedIdentity = viewObservationIdentity(observation);
+    const index = current.observations.findIndex((item) => (
+      observationSubjectsMatch(viewObservationIdentity(item), hydratedIdentity) &&
+      observationIdentitiesCompatible(viewObservationIdentity(item), hydratedIdentity)
+    ));
     const next = current.observations.slice();
     if (index === -1) next.push({ ...observation });
     else next[index] = mergeHydratedObservation(observation, next[index]);
@@ -1422,6 +1908,24 @@ export function hydrateConversationObservations(record, observations) {
     };
   }
   return current;
+}
+
+export function bindConversationTurnUser(record, turnId, userMessageId) {
+  const current = createConversationRecord(record);
+  if (!turnId || !userMessageId) return current;
+  let changed = false;
+  const observations = current.observations.map((observation) => {
+    if (
+      !observation ||
+      !semanticTurnAliases(observation).includes(turnId) ||
+      observation.turnUserMessageId === userMessageId
+    ) {
+      return observation;
+    }
+    changed = true;
+    return { ...observation, turnUserMessageId: userMessageId };
+  });
+  return changed ? { ...current, observations } : current;
 }
 
 function mergeHydratedObservation(persisted, current) {
@@ -1454,74 +1958,636 @@ export function setConversationRecordTerminal(record, terminal) {
 }
 
 export function buildConversationRecordView(record) {
+  return buildConversationRecordTurns(record)
+    .flatMap((turn) => [turn.user, ...(turn.replies || [])].filter(Boolean));
+}
+
+export function buildConversationRecordTurns(record, pendingUserMessage = null) {
   const current = createConversationRecord(record);
-  const canonical = current.payload
+  const allPayloadRows = current.payload
     ? buildConversationView(current.payload, current.terminal || current.payload.current_node)
     : [];
+  const canonical = current.canonicalComplete ? allPayloadRows : [];
   const followingLatest = !current.payload ||
     !current.terminal ||
     current.terminal === current.payload.current_node;
   const observations = followingLatest
     ? current.observations
     : observationsForSelectedBranch(canonical, current.observations);
-  return mergeConversationViewObservations(canonical, observations);
+  const observationsByMessageId = groupObservationsByMessageId(observations);
+  const usedObservations = new Set();
+  const canonicalRows = canonical.map((row) => {
+    const candidates = observationSubjectCandidates(observationsByMessageId, row);
+    const canonicalIdentity = viewObservationIdentity(row);
+    const observation = candidates.find((candidate) => (
+      !usedObservations.has(candidate) &&
+      observationIdentitiesCompatible(canonicalIdentity, viewObservationIdentity(candidate))
+    ));
+    if (!observation) return row;
+    usedObservations.add(observation);
+    return mergeCanonicalAndObservedView(row, observation);
+  });
+
+  const turns = [];
+  const turnByUserId = new Map();
+  const turnBySemanticId = new Map();
+  const itemTurn = new Map();
+  const responseTurn = new Map();
+  const callTurn = new Map();
+  let currentTurn = null;
+
+  for (const row of canonicalRows) {
+    if (isInternalConversationContext(row)) continue;
+    if (isVisibleConversationUser(row)) {
+      currentTurn = createTurnForUser(row, "canonical");
+      turns.push(currentTurn);
+      indexTurn(currentTurn, row, turnByUserId, turnBySemanticId, itemTurn);
+      indexProtocolTurn(currentTurn, row, responseTurn, callTurn);
+      continue;
+    }
+    if (row?.role === "user") continue;
+    if (!currentTurn) continue;
+    appendTurnReply(currentTurn, row);
+    indexTurnItem(currentTurn, row, itemTurn);
+    indexProtocolTurn(currentTurn, row, responseTurn, callTurn);
+  }
+
+  if (pendingUserMessage) {
+    const pendingId = pendingUserMessage.id || pendingUserMessage.nodeId;
+    const alreadyPresent = pendingId && turnByUserId.has(pendingId);
+    if (!alreadyPresent) {
+      const pendingTurn = createTurnForUser(pendingUserMessage, "pending");
+      turns.push(pendingTurn);
+      indexTurn(pendingTurn, pendingUserMessage, turnByUserId, turnBySemanticId, itemTurn);
+      indexProtocolTurn(pendingTurn, pendingUserMessage, responseTurn, callTurn);
+    }
+  }
+
+  const provisionalSourceRows = current.canonicalComplete
+    ? []
+    : currentTurnOutputSuffix(allPayloadRows);
+  const provisionalPayloadRows = provisionalSourceRows
+      .map((row, index) => ({
+        ...row,
+        observationOnly: true,
+        provisionalCanonical: true,
+        observationOrdinal: Number.MAX_SAFE_INTEGER - provisionalSourceRows.length + index,
+      }));
+  const liveOnly = [
+    ...observations.filter((observation) => observation?.id && !usedObservations.has(observation)),
+    ...provisionalPayloadRows.filter((row) => !observationSubjectCandidates(
+      observationsByMessageId,
+      row,
+    ).some((observation) => (
+      observationIdentitiesCompatible(viewObservationIdentity(row), viewObservationIdentity(observation))
+    ))),
+  ]
+    .sort(compareObservationOrder);
+
+  // User observations establish a turn before any output item is attached.
+  for (const observation of liveOnly) {
+    if (!isVisibleConversationUser(observation)) continue;
+    if (turnByUserId.has(observation.id)) continue;
+    const turn = createTurnForUser(observation, "observed");
+    turns.push(turn);
+    indexTurn(turn, observation, turnByUserId, turnBySemanticId, itemTurn);
+    indexProtocolTurn(turn, observation, responseTurn, callTurn);
+  }
+
+  const observationByMessageId = uniqueObservationByMessageId(liveOnly);
+  const attachObservation = (target, observation) => {
+    appendTurnReply(target, observation);
+    indexTurnItem(target, observation, itemTurn);
+    indexSemanticTurnAliases(target, observation, turnBySemanticId);
+    indexProtocolTurn(target, observation, responseTurn, callTurn);
+  };
+  const resolveObservationTarget = (observation) => {
+    let target = null;
+    let identityConflict = false;
+
+    if (observation.turnUserMessageId) target = turnByUserId.get(observation.turnUserMessageId) || null;
+    if (!target) {
+      const semanticResolution = resolveTurnFromSemanticIdentity(observation, turnBySemanticId);
+      target = semanticResolution.turn;
+      identityConflict = semanticResolution.conflicted;
+    }
+    if (!target && !identityConflict) {
+      const protocolResolution = resolveTurnFromProtocolIdentity(observation, itemTurn, responseTurn, callTurn);
+      target = protocolResolution.turn;
+      identityConflict = protocolResolution.conflicted;
+    }
+    if (!target && !identityConflict) {
+      target = resolveObservationTurnFromParents(
+        observation,
+        observationByMessageId,
+        itemTurn,
+      );
+    }
+    return { target, identityConflict };
+  };
+  const attachResolvableUntilStable = (input) => {
+    let pending = input;
+    let changed = true;
+    while (changed && pending.length) {
+      changed = false;
+      const next = [];
+      for (const observation of pending) {
+        const { target } = resolveObservationTarget(observation);
+        if (!target) {
+          next.push(observation);
+          continue;
+        }
+        attachObservation(target, observation);
+        changed = true;
+      }
+      pending = next;
+    }
+    return pending;
+  };
+
+  let pendingOutputs = liveOnly.filter((observation) => (
+    !isInternalConversationContext(observation) && observation.role !== "user"
+  ));
+
+  // Resolve to fixed point so arrival order cannot decide ownership. A tool
+  // result/response item that arrives before its anchor gets another chance
+  // after the anchor is indexed later in the same observed batch.
+  pendingOutputs = attachResolvableUntilStable(pendingOutputs);
+
+  // Strong semantic identity without a canonical user creates a current
+  // observed session, never a historical fallback. Creating those sessions
+  // can in turn unlock response/call/parent-linked items on another pass.
+  const afterSemanticSessions = [];
+  for (const observation of pendingOutputs) {
+    const semanticResolution = resolveTurnFromSemanticIdentity(observation, turnBySemanticId);
+    const protocolResolution = resolveTurnFromProtocolIdentity(observation, itemTurn, responseTurn, callTurn);
+    const identityConflict = semanticResolution.conflicted || protocolResolution.conflicted;
+    let target = semanticResolution.turn || protocolResolution.turn || null;
+
+    if (!target && !identityConflict && semanticTurnAliases(observation).length) {
+      const semanticId = semanticTurnAliases(observation)[0];
+      target = {
+        id: `turn-session-${semanticId}`,
+        turnKey: semanticId,
+        user: null,
+        replies: [],
+        source: "observed-session",
+      };
+      turns.push(target);
+      indexSemanticTurnAliases(target, observation, turnBySemanticId);
+    }
+
+    if (!target) {
+      afterSemanticSessions.push(observation);
+      continue;
+    }
+    attachObservation(target, observation);
+  }
+
+  pendingOutputs = attachResolvableUntilStable(afterSemanticSessions);
+
+  const unassignedTurns = new Map();
+  for (const observation of pendingOutputs) {
+    // Never guess a historical turn. Unknown output is grouped only with
+    // evidence from the same response/request/parent component, never in
+    // one global bucket that can reorder unrelated episodes.
+    const { identityConflict } = resolveObservationTarget(observation);
+    const groupKey = unresolvedObservationGroupKey(
+      observation,
+      observationByMessageId,
+      { ignoreIdentity: identityConflict },
+    );
+    let target = unassignedTurns.get(groupKey) || null;
+    if (!target) {
+      target = {
+        id: `turn-unassigned-${groupKey}`,
+        turnKey: `unassigned:${groupKey}`,
+        user: null,
+        replies: [],
+        source: "unassigned",
+      };
+      unassignedTurns.set(groupKey, target);
+      turns.push(target);
+    }
+    attachObservation(target, observation);
+  }
+
+  for (const turn of turns) sortTurnReplies(turn);
+  return turns.filter((turn) => turn.user || turn.replies.length);
+}
+
+function groupObservationsByMessageId(observations) {
+  const grouped = new Map();
+  for (const observation of observations || []) {
+    for (const id of uniqueStrings([observation?.id, observation?.nodeId, observation?.itemId])) {
+      const items = grouped.get(id) || [];
+      if (!items.includes(observation)) items.push(observation);
+      grouped.set(id, items);
+    }
+  }
+  return grouped;
+}
+
+function observationSubjectCandidates(index, item) {
+  const candidates = [];
+  const seen = new Set();
+  for (const id of uniqueStrings([item?.id, item?.nodeId, item?.itemId])) {
+    for (const observation of index.get(id) || []) {
+      if (seen.has(observation)) continue;
+      seen.add(observation);
+      candidates.push(observation);
+    }
+  }
+  return candidates;
+}
+
+function uniqueObservationByMessageId(observations) {
+  const grouped = groupObservationsByMessageId(observations);
+  const unique = new Map();
+  for (const [id, items] of grouped) unique.set(id, items.length === 1 ? items[0] : null);
+  return unique;
+}
+
+function currentTurnOutputSuffix(rows) {
+  const source = Array.isArray(rows) ? rows : [];
+  let lastVisibleUser = -1;
+  for (let index = 0; index < source.length; index += 1) {
+    if (isVisibleConversationUser(source[index])) lastVisibleUser = index;
+  }
+  const suffix = lastVisibleUser >= 0
+    ? source.slice(lastVisibleUser + 1)
+    : source.slice(-1);
+  return suffix.filter((row) => row?.role !== "user" && !isInternalConversationContext(row));
+}
+
+function sortTurnReplies(turn) {
+  const replies = Array.isArray(turn?.replies) ? turn.replies : [];
+  if (replies.length < 2) return;
+  const idIndex = new Map();
+  const indexReplyId = (id, index) => {
+    if (!id) return;
+    if (!idIndex.has(id)) {
+      idIndex.set(id, index);
+      return;
+    }
+    if (idIndex.get(id) !== index) idIndex.set(id, null);
+  };
+  replies.forEach((reply, index) => {
+    indexReplyId(reply?.id, index);
+    indexReplyId(reply?.nodeId, index);
+    indexReplyId(reply?.itemId, index);
+  });
+  const indegree = new Array(replies.length).fill(0);
+  const children = Array.from({ length: replies.length }, () => []);
+  const edges = new Set();
+  const addEdge = (parentIndex, childIndex) => {
+    if (parentIndex == null || childIndex == null || parentIndex === childIndex) return;
+    const key = `${parentIndex}:${childIndex}`;
+    if (edges.has(key)) return;
+    edges.add(key);
+    children[parentIndex].push(childIndex);
+    indegree[childIndex] += 1;
+  };
+  for (let index = 0; index < replies.length; index += 1) {
+    const parentIndex = idIndex.get(replies[index]?.parentId);
+    addEdge(parentIndex, index);
+  }
+
+  // Tool results are ordered after the call they explicitly answer, even if
+  // transport delivery is interleaved or arrives out of order.
+  const callIndex = new Map();
+  for (let index = 0; index < replies.length; index += 1) {
+    if (replies[index]?.tool?.kind !== "tool-call") continue;
+    for (const callId of itemCallIds(replies[index])) {
+      if (!callIndex.has(callId)) callIndex.set(callId, index);
+      else if (callIndex.get(callId) !== index) callIndex.set(callId, null);
+    }
+  }
+  for (let index = 0; index < replies.length; index += 1) {
+    if (replies[index]?.tool?.kind !== "tool-result") continue;
+    for (const callId of itemCallIds(replies[index])) {
+      const parentIndex = callIndex.get(callId);
+      if (parentIndex != null) addEdge(parentIndex, index);
+    }
+  }
+  const originalIndex = new Map(replies.map((reply, index) => [reply, index]));
+  const ready = [];
+  for (let index = 0; index < replies.length; index += 1) if (indegree[index] === 0) ready.push(index);
+  const compareIndex = (left, right) => compareTurnReplyOrder(
+    replies[left],
+    replies[right],
+    originalIndex.get(replies[left]),
+    originalIndex.get(replies[right]),
+  );
+  ready.sort(compareIndex);
+  const ordered = [];
+  while (ready.length) {
+    const index = ready.shift();
+    ordered.push(replies[index]);
+    for (const child of children[index]) {
+      indegree[child] -= 1;
+      if (indegree[child] === 0) {
+        ready.push(child);
+        ready.sort(compareIndex);
+      }
+    }
+  }
+  if (ordered.length === replies.length) {
+    turn.replies = ordered;
+  }
+}
+
+function compareTurnReplyOrder(left, right, leftIndex, rightIndex) {
+  const leftOutput = finiteNumber(left?.outputIndex);
+  const rightOutput = finiteNumber(right?.outputIndex);
+  if (leftOutput != null && rightOutput != null && leftOutput !== rightOutput) return leftOutput - rightOutput;
+  const leftSequence = finiteNumber(left?.sequenceNumber);
+  const rightSequence = finiteNumber(right?.sequenceNumber);
+  if (leftSequence != null && rightSequence != null && leftSequence !== rightSequence) return leftSequence - rightSequence;
+  const leftOrdinal = finiteNumber(left?.observationOrdinal);
+  const rightOrdinal = finiteNumber(right?.observationOrdinal);
+  if (leftOrdinal != null && rightOrdinal != null && leftOrdinal !== rightOrdinal) return leftOrdinal - rightOrdinal;
+  return leftIndex - rightIndex;
+}
+
+function finiteNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function isVisibleConversationUser(message) {
+  if (message?.role !== "user") return false;
+  if (isInternalConversationContext(message)) return false;
+  return Boolean(
+    String(message?.text || "").trim() ||
+    message?.unrecognized ||
+    message?.tool
+  );
+}
+
+function isInternalConversationContext(message) {
+  const contentType = String(message?.contentType || message?.metadata?.content_type || "").toLowerCase();
+  if (message?.role === "system") return true;
+  return contentType === "user_editable_context" ||
+    contentType === "model_editable_context" ||
+    Boolean(message?.metadata?.is_visually_hidden_from_conversation);
+}
+
+function createTurnForUser(user, source) {
+  const userId = user?.id || user?.nodeId || `anonymous-${source}`;
+  const turnKey = semanticTurnAliases(user)[0] || `user:${userId}`;
+  return {
+    id: `turn-${turnKey}`,
+    turnKey,
+    user,
+    replies: [],
+    source,
+  };
+}
+
+function indexTurn(turn, user, turnByUserId, turnBySemanticId, itemTurn) {
+  const userId = user?.id || user?.nodeId;
+  if (userId) turnByUserId.set(userId, turn);
+  if (user?.turnUserMessageId) turnByUserId.set(user.turnUserMessageId, turn);
+  indexSemanticTurnAliases(turn, user, turnBySemanticId);
+  indexTurnItem(turn, user, itemTurn);
+}
+
+function semanticTurnAliases(item) {
+  return uniqueStrings([
+    ...(item?.turnAliases || []),
+    item?.turnId,
+    item?.turnExchangeId,
+    item?.workingTurnId,
+    item?.turnRequestId,
+    item?.turnTraceId,
+  ]);
+}
+
+function indexSemanticTurnAliases(turn, item, turnBySemanticId) {
+  for (const alias of semanticTurnAliases(item)) {
+    indexUniqueTurn(turnBySemanticId, alias, turn);
+  }
+}
+
+function resolveTurnFromSemanticIdentity(observation, turnBySemanticId) {
+  const candidates = new Set();
+  let conflicted = false;
+  for (const alias of semanticTurnAliases(observation)) {
+    if (!turnBySemanticId.has(alias)) continue;
+    const turn = turnBySemanticId.get(alias);
+    if (!turn) conflicted = true;
+    else candidates.add(turn);
+  }
+  if (candidates.size > 1) conflicted = true;
+  return {
+    turn: conflicted ? null : (candidates.values().next().value || null),
+    conflicted,
+  };
+}
+
+function indexTurnItem(turn, item, itemTurn) {
+  for (const id of uniqueStrings([item?.id, item?.nodeId, item?.itemId])) {
+    indexUniqueTurn(itemTurn, id, turn);
+  }
+}
+
+function indexProtocolTurn(turn, item, responseTurn, callTurn) {
+  if (item?.responseId) indexUniqueTurn(responseTurn, item.responseId, turn);
+  for (const callId of itemCallIds(item)) indexUniqueTurn(callTurn, callId, turn);
+}
+
+function indexUniqueTurn(index, key, turn) {
+  if (!key) return;
+  if (!index.has(key)) {
+    index.set(key, turn);
+    return;
+  }
+  const previous = index.get(key);
+  if (previous && previous !== turn) index.set(key, null);
+}
+
+function resolveTurnFromProtocolIdentity(observation, itemTurn, responseTurn, callTurn) {
+  const candidates = new Set();
+  let conflicted = false;
+  const consider = (index, key) => {
+    if (!key || !index.has(key)) return;
+    const turn = index.get(key);
+    if (!turn) conflicted = true;
+    else candidates.add(turn);
+  };
+  consider(itemTurn, observation?.itemId);
+  consider(responseTurn, observation?.responseId);
+  for (const callId of itemCallIds(observation)) {
+    consider(callTurn, callId);
+  }
+  if (candidates.size > 1) conflicted = true;
+  return {
+    turn: conflicted ? null : (candidates.values().next().value || null),
+    conflicted,
+  };
+}
+
+function itemCallIds(item) {
+  return uniqueStrings([
+    ...(item?.callIds || []),
+    item?.callId,
+    item?.toolCallId,
+    ...(item?.tool?.callIds || []),
+    item?.tool?.callId,
+    item?.tool?.toolCallId,
+  ]);
+}
+
+function resolveObservationTurnFromParents(observation, observationByMessageId, itemTurn) {
+  const visited = new Set();
+  let parentId = observation?.parentId || observation?.turnParentMessageId || null;
+  while (parentId && !visited.has(parentId)) {
+    visited.add(parentId);
+    if (itemTurn.has(parentId)) return itemTurn.get(parentId);
+    const parent = observationByMessageId.get(parentId);
+    if (!parent) break;
+    parentId = parent.parentId || null;
+  }
+  return null;
+}
+
+function unresolvedObservationGroupKey(observation, observationByMessageId, options = {}) {
+  if (!options.ignoreIdentity) {
+    const semanticId = semanticTurnAliases(observation)[0];
+    if (semanticId) return `turn:${semanticId}`;
+    if (observation?.responseId) return `response:${observation.responseId}`;
+  }
+  if (observation?.transportTurnId) return `transport:${observation.transportTurnId}`;
+  if (observation?.captureId) return `capture:${observation.captureId}`;
+  const visited = new Set();
+  let current = observation;
+  while (current?.parentId && !visited.has(current.parentId)) {
+    visited.add(current.parentId);
+    const parent = observationByMessageId.get(current.parentId);
+    if (!parent) break;
+    current = parent;
+  }
+  return `root:${current?.id || observation?.id || "unknown"}`;
+}
+
+function compareObservationOrder(left, right) {
+  const leftOutput = Number(left?.outputIndex);
+  const rightOutput = Number(right?.outputIndex);
+  if (Number.isFinite(leftOutput) && Number.isFinite(rightOutput) && leftOutput !== rightOutput) {
+    return leftOutput - rightOutput;
+  }
+  const leftSequence = Number(left?.sequenceNumber);
+  const rightSequence = Number(right?.sequenceNumber);
+  if (Number.isFinite(leftSequence) && Number.isFinite(rightSequence) && leftSequence !== rightSequence) {
+    return leftSequence - rightSequence;
+  }
+  const leftOrdinal = Number(left?.observationOrdinal);
+  const rightOrdinal = Number(right?.observationOrdinal);
+  if (Number.isFinite(leftOrdinal) && Number.isFinite(rightOrdinal) && leftOrdinal !== rightOrdinal) {
+    return leftOrdinal - rightOrdinal;
+  }
+  return String(left?.id || "").localeCompare(String(right?.id || ""));
 }
 
 function observationsForSelectedBranch(canonicalRows, observations) {
   const canonicalIds = new Set();
+  const canonicalUserIds = new Set();
+  const canonicalTurnAliases = new Set();
   for (const row of canonicalRows || []) {
     if (row?.id) canonicalIds.add(row.id);
     if (row?.nodeId) canonicalIds.add(row.nodeId);
+    if (row?.role === "user") {
+      if (row?.id) canonicalUserIds.add(row.id);
+      if (row?.nodeId) canonicalUserIds.add(row.nodeId);
+      for (const alias of semanticTurnAliases(row)) canonicalTurnAliases.add(alias);
+    }
   }
-  const byId = new Map((observations || []).filter((item) => item?.id).map((item) => [item.id, item]));
-  const memo = new Map();
+  const source = (observations || []).filter((observation) => observation?.id);
+  const byId = uniqueObservationByMessageId(source);
+  const anchored = new Set();
+  const foreign = new Set();
+  const responseGroups = new Map();
+  const callGroups = new Map();
 
-  const isAnchored = (observation, visiting = new Set()) => {
-    if (!observation?.id) return false;
-    if (canonicalIds.has(observation.id) || canonicalIds.has(observation.nodeId)) return true;
-    if (memo.has(observation.id)) return memo.get(observation.id);
-    if (visiting.has(observation.id)) return false;
-    visiting.add(observation.id);
-    const parentId = observation.parentId;
-    const anchored = Boolean(
-      parentId && (
-        canonicalIds.has(parentId) ||
-        (byId.has(parentId) && isAnchored(byId.get(parentId), visiting))
-      )
-    );
-    visiting.delete(observation.id);
-    memo.set(observation.id, anchored);
-    return anchored;
+  const addGroup = (groups, key, observation) => {
+    if (!key) return;
+    const group = groups.get(key) || [];
+    group.push(observation);
+    groups.set(key, group);
   };
 
-  return (observations || []).filter((observation) => isAnchored(observation));
+  for (const observation of source) {
+    const aliases = semanticTurnAliases(observation);
+    const exactUser = observation.turnUserMessageId || null;
+    const hasSelectedAlias = aliases.some((alias) => canonicalTurnAliases.has(alias));
+    const hasForeignUser = Boolean(exactUser && !canonicalUserIds.has(exactUser));
+    const hasForeignSemantic = Boolean(aliases.length && !hasSelectedAlias);
+    if (hasForeignUser || hasForeignSemantic) foreign.add(observation);
+    if (
+      !foreign.has(observation) && (
+        (exactUser && canonicalUserIds.has(exactUser)) ||
+        hasSelectedAlias ||
+        canonicalIds.has(observation.id) ||
+        canonicalIds.has(observation.nodeId) ||
+        canonicalIds.has(observation.parentId)
+      )
+    ) {
+      anchored.add(observation);
+    }
+    addGroup(responseGroups, observation.responseId, observation);
+    for (const callId of itemCallIds(observation)) addGroup(callGroups, callId, observation);
+  }
+
+  const groupCanPropagate = (group) => !group.some((observation) => foreign.has(observation));
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const observation of source) {
+      if (anchored.has(observation) || foreign.has(observation)) continue;
+      const parent = observation.parentId ? byId.get(observation.parentId) : null;
+      if (parent && anchored.has(parent)) {
+        anchored.add(observation);
+        changed = true;
+        continue;
+      }
+      const responseGroup = observation.responseId ? responseGroups.get(observation.responseId) : null;
+      if (responseGroup?.some((candidate) => anchored.has(candidate)) && groupCanPropagate(responseGroup)) {
+        anchored.add(observation);
+        changed = true;
+        continue;
+      }
+      for (const callId of itemCallIds(observation)) {
+        const callGroup = callGroups.get(callId);
+        if (!callGroup?.some((candidate) => anchored.has(candidate)) || !groupCanPropagate(callGroup)) continue;
+        anchored.add(observation);
+        changed = true;
+        break;
+      }
+    }
+  }
+
+  return source.filter((observation) => anchored.has(observation));
 }
 
 export function mergeConversationViewObservations(canonicalRows, observations) {
   const rows = Array.isArray(canonicalRows) ? canonicalRows.map((row) => ({ ...row })) : [];
   const observed = Array.isArray(observations) ? observations.filter(Boolean) : [];
-  const rowIndexById = new Map();
-  const rebuildIndex = () => {
-    rowIndexById.clear();
-    rows.forEach((row, index) => {
-      if (row?.id) rowIndexById.set(row.id, index);
-      if (row?.nodeId) rowIndexById.set(row.nodeId, index);
-    });
-  };
-  rebuildIndex();
 
   for (const observation of observed) {
-    const existingIndex = rowIndexById.get(observation.id);
-    if (existingIndex != null) {
+    const observationIdentity = viewObservationIdentity(observation);
+    const existingIndex = rows.findIndex((row) => (
+      observationSubjectsMatch(viewObservationIdentity(row), observationIdentity) &&
+      observationIdentitiesCompatible(viewObservationIdentity(row), observationIdentity)
+    ));
+    if (existingIndex >= 0) {
       rows[existingIndex] = mergeCanonicalAndObservedView(rows[existingIndex], observation);
-      rebuildIndex();
       continue;
     }
 
     const nextRow = { ...observation, observationOnly: true };
     const insertionIndex = observationInsertionIndex(rows, nextRow);
     rows.splice(insertionIndex, 0, nextRow);
-    rebuildIndex();
   }
   return rows;
 }
@@ -1566,16 +2632,6 @@ function observationInsertionIndex(rows, observation) {
       while (index < rows.length && rows[index]?.observationOnly && rows[index]?.parentId === observation.parentId) index += 1;
       return index;
     }
-  }
-
-  const time = Number(observation.createTime || 0);
-  if (time > 0) {
-    let insertAfter = -1;
-    for (let index = 0; index < rows.length; index += 1) {
-      const rowTime = Number(rows[index]?.createTime || 0);
-      if (rowTime > 0 && rowTime <= time) insertAfter = index;
-    }
-    if (insertAfter >= 0) return insertAfter + 1;
   }
   return rows.length;
 }

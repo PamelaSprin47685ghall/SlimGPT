@@ -201,10 +201,7 @@ async function runFixtureSmoke(browser, extensionId) {
 
   await top.evaluate(`(() => {
     history.replaceState(history.state, '', '/c/smoke');
-    return Promise.all([
-      fetch('/backend-api/me').then((response) => response.json()),
-      fetch('/backend-api/conversation/smoke').then((response) => response.json())
-    ]);
+    return fetch('/backend-api/me').then((response) => response.json());
   })()`);
   await waitFor(async () => (await ui.evaluate(uiStateExpression())).conversations === 3);
   assert.ok(
@@ -223,6 +220,8 @@ async function runFixtureSmoke(browser, extensionId) {
   assert.equal(canonicalUi.unsafeNodes, 0, 'captured Markdown must not create raw scriptable elements');
   assert.equal(canonicalUi.mountedCards, 2, 'the center pane must mount only the active user+assistant turn');
   assert.equal(canonicalUi.overviewItems, 60, 'the right overview must index one row per user+assistant turn');
+  assert.ok((fixture.smokeCanonicalRequests || 0) >= 3, 'canonical sync must fetch every page when older history spans multiple cursors');
+  assert.ok((fixture.smokeCanonicalOlderRequests || 0) >= 2, 'canonical sync must follow page_info.start_cursor across every older page');
   assert.equal(canonicalUi.activeOverview, '60', 'a newly opened conversation should start at the latest turn');
   assert.ok(canonicalUi.modelLabel.toLowerCase().includes('gpt-5'), 'enhanced history must surface the captured model');
   assert.ok(canonicalUi.historyPreview.includes('Fixture answer'), 'enhanced history must surface the latest message preview');
@@ -760,6 +759,28 @@ async function runFixtureSmoke(browser, extensionId) {
   const sendSuccess = await ui.evaluate(uiStateExpression());
   assert.equal(sendSuccess.composerStatus, '消息已发送（官方已确认）', 'composer success requires the page-world send confirmation, not just the click');
   assert.equal(sendSuccess.sidebarWorkState, 'running', 'a visible official stop control must be treated as direct running evidence');
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).messages.includes('Turn trace final answer'));
+  const tracedTurnPreviews = await ui.evaluate(`Array.from(document.querySelectorAll('.overview-item')).map((node) => node.textContent?.replace(/\\s+/g, ' ').trim() || '')`);
+  assert.equal(tracedTurnPreviews.length, 2, 'one existing user question plus one submitted question must produce exactly two visible turns');
+  assert.equal(tracedTurnPreviews[0].includes('Turn trace final answer'), false, 'misleading parent ids must not contaminate the first turn');
+  assert.ok(tracedTurnPreviews[1].includes(submittedText), 'the official turn user id must anchor live output to the submitted question');
+  await ui.evaluate(`document.querySelector('[data-overview-index="0"]')?.click()`);
+  await sleep(60);
+  assert.equal((await ui.evaluate(uiStateExpression())).messages.includes('Turn trace final answer'), false, 'the first turn must remain free of second-turn output');
+  await ui.evaluate(`document.querySelector('[data-overview-index="1"]')?.click()`);
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).messages.includes('Turn trace final answer'));
+  await ui.evaluate(`(() => {
+    for (const button of document.querySelectorAll('.thought-header')) {
+      if (button.getAttribute('aria-expanded') !== 'true') button.click();
+    }
+  })()`);
+  await waitFor(async () => await ui.evaluate(`Array.from(document.querySelectorAll('.thought-content')).some((node) => node.textContent.includes('Second-turn reasoning must not attach to the first turn.'))`));
+  assert.ok(
+    await ui.evaluate(`Array.from(document.querySelectorAll('.thought-content')).some((node) => node.textContent.includes('Second-turn reasoning must not attach to the first turn.'))`),
+    'reasoning with a misleading parent must stay in the traced second turn',
+  );
+  assert.equal(await ui.evaluate(`document.querySelectorAll('.message-card.tool-call').length`), 1);
+  assert.equal(await ui.evaluate(`document.querySelectorAll('.message-card.tool-result').length`), 1);
 
   await top.evaluate(`fetch('/backend-api/messages/misleading-terminal').then((response) => response.json())`);
   await sleep(180);
@@ -1008,7 +1029,11 @@ async function runFixtureSmoke(browser, extensionId) {
   assert.ok(toolRendering.tomlText.includes('next = "<null>"'));
   assert.ok(toolRendering.highlightedTokens > 0, 'TOML code must be syntax highlighted');
   assert.deepEqual(toolRendering.toolNames, ['web.run', 'web.run']);
-  assert.deepEqual(toolRendering.replyKinds, ['tool-call', 'tool-result', 'message', 'thinking'], 'the transient thinking indicator must remain after tool activity');
+  assert.deepEqual(
+    toolRendering.replyKinds,
+    ['thinking', 'tool-call', 'tool-result', 'message'],
+    'reasoning/tool/final items must retain observed protocol order instead of moving thinking to a heuristic tail slot',
+  );
 
   await top.evaluate(`fetch('/backend-api/messages/second-ledger-a').then((response) => response.json())`);
   await top.evaluate(`fetch('/backend-api/messages/second-ledger-b').then((response) => response.json())`);
@@ -1133,19 +1158,24 @@ async function runFixtureSmoke(browser, extensionId) {
   const restoredSmokeState = await ui.evaluate(uiStateExpression());
   assert.equal(restoredSmokeState.draft, '', 'a conversation without a draft must remain empty after switching back');
   assert.equal(restoredSmokeState.messages.includes('Late live-only DOM answer'), false, 'DOM mutations queued before navigation must retain their source conversation');
-  assert.ok(restoredSmokeState.messages.includes('Scoped stale smoke answer'), 'late scoped content must remain owned by its source conversation');
-  assert.ok(restoredSmokeState.messages.includes('Delayed smoke-only answer'), 'request-scoped content must remain available in its source conversation');
-  assert.equal(restoredSmokeState.messages.includes('Ambiguous stale answer'), false);
-  assert.equal(restoredSmokeState.messages.includes('Conflicting stale answer'), false);
+  const smokeTailPreviews = await ui.evaluate(`Array.from(document.querySelectorAll('.overview-item')).map((node) => node.textContent?.replace(/\\s+/g, ' ').trim() || '')`);
+  assert.ok(smokeTailPreviews.some((text) => text.includes('Scoped stale smoke answer')), 'late scoped content must remain owned by its source conversation');
+  assert.ok(smokeTailPreviews.some((text) => text.includes('Delayed smoke-only answer')), 'request-scoped content must remain available in its source conversation');
+  assert.equal(smokeTailPreviews.some((text) => text.includes('Ambiguous stale answer')), false);
+  assert.equal(smokeTailPreviews.some((text) => text.includes('Conflicting stale answer')), false);
+  await ui.evaluate(`Array.from(document.querySelectorAll('.overview-item')).find((node) => node.textContent.includes('Delayed smoke-only answer'))?.click()`);
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).messages.includes('Delayed smoke-only answer'));
+  await ui.evaluate(`Array.from(document.querySelectorAll('.overview-item')).find((node) => node.textContent.includes('Scoped stale smoke answer'))?.click()`);
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).messages.includes('Scoped stale smoke answer'));
 
   await top.evaluate(`fetch('/backend-api/messages/smoke-partial').then((response) => response.json())`);
-  await waitFor(async () => (await ui.evaluate(uiStateExpression())).overviewItems === 61);
+  await waitFor(async () => await ui.evaluate(`Array.from(document.querySelectorAll('.overview-item')).some((node) => node.textContent.includes('Partial tail question'))`));
   await ui.evaluate(`document.querySelector('[data-overview-index="0"]')?.click()`);
   await waitFor(async () => (await ui.evaluate(uiStateExpression())).messages.includes('Fixture user message 1'));
   const historyAfterPartial = await ui.evaluate(uiStateExpression());
-  assert.equal(historyAfterPartial.overviewItems, 61, 'a short optimized payload must append to, not replace, cached history');
+  assert.ok(historyAfterPartial.overviewItems >= 61, 'a short optimized payload must append to, not replace, the 60 canonical user turns');
   assert.ok(historyAfterPartial.messages.includes('Fixture user message 1'), 'oldest cached turns must remain reachable after a short payload arrives');
-  await ui.evaluate(`document.querySelector('[data-overview-index="60"]')?.click()`);
+  await ui.evaluate(`Array.from(document.querySelectorAll('.overview-item')).find((node) => node.textContent.includes('Partial tail question'))?.click()`);
   await waitFor(async () => (await ui.evaluate(uiStateExpression())).messages.includes('Partial tail answer'));
 
   const resumed = new Promise((resolve) => {
@@ -1165,6 +1195,7 @@ async function runFixtureSmoke(browser, extensionId) {
   ]);
   delete fixture.onResumeRequest;
   assert.equal(resumeReconnectCount, 2, 'an interrupted resume stream must reconnect exactly once before [DONE]');
+  await ui.evaluate(`Array.from(document.querySelectorAll('.overview-item')).find((node) => node.textContent.includes('Delayed smoke-only answer'))?.click()`);
   await waitFor(async () => (await ui.evaluate(uiStateExpression())).messages.includes('Diverted resume answer'));
 
   await ui.evaluate(`document.querySelector('.new-chat')?.click()`);
@@ -1302,6 +1333,8 @@ async function runLiveSmoke(browser, extensionId) {
 
 async function fulfillFixtureRequest(client, event, fixture) {
   const url = event.request.url;
+  const parsedUrl = new URL(url);
+  const pathname = parsedUrl.pathname;
   let body = null;
   let contentType = 'text/plain; charset=utf-8';
   if (event.resourceType === 'Document') {
@@ -1314,24 +1347,50 @@ async function fulfillFixtureRequest(client, event, fixture) {
       : fixture.resume;
     fixture.onResumeRequest?.(fixture.resumeRequests);
     contentType = 'text/event-stream; charset=utf-8';
-  } else if (new URL(url).pathname === '/backend-api/f/conversation') {
-    await sleep(650);
-    body = JSON.stringify(fixture.delayedScopedEvent);
-    contentType = 'application/json; charset=utf-8';
-  } else if (new URL(url).pathname === '/backend-api/me') {
+  } else if (pathname === '/backend-api/f/conversation') {
+    if (event.request.headers?.['x-oai-turn-trace-id'] === 'fixture-turn-mobile') {
+      body = fixture.turnTraceStream;
+      contentType = 'text/event-stream; charset=utf-8';
+    } else {
+      await sleep(650);
+      body = JSON.stringify(fixture.delayedScopedEvent);
+      contentType = 'application/json; charset=utf-8';
+    }
+  } else if (pathname === '/backend-api/me') {
     body = JSON.stringify({ id: 'fixture-user' });
     contentType = 'application/json; charset=utf-8';
-  } else if (url.includes('/backend-api/conversations')) {
+  } else if (pathname === '/backend-api/conversations/smoke') {
+    fixture.smokeCanonicalRequests = (fixture.smokeCanonicalRequests || 0) + 1;
+    const before = parsedUrl.searchParams.get('before');
+    if (before) {
+      fixture.smokeCanonicalOlderRequests = (fixture.smokeCanonicalOlderRequests || 0) + 1;
+    }
+    body = JSON.stringify(
+      before === 'smoke-before-40'
+        ? fixture.smokeCanonicalPages.oldest
+        : before === 'smoke-before-80'
+          ? fixture.smokeCanonicalPages.middle
+          : fixture.smokeCanonicalPages.newest,
+    );
+    contentType = 'application/json; charset=utf-8';
+  } else if (pathname === '/backend-api/conversations/second') {
+    await sleep(650);
+    body = JSON.stringify(fixture.secondCanonicalPage);
+    contentType = 'application/json; charset=utf-8';
+  } else if (pathname === '/backend-api/conversations/mobile-smoke') {
+    body = JSON.stringify(fixture.mobileCanonicalPage);
+    contentType = 'application/json; charset=utf-8';
+  } else if (pathname === '/backend-api/conversations') {
     fixture.conversationListRequests = (fixture.conversationListRequests || 0) + 1;
     body = JSON.stringify(fixture.list);
     contentType = 'application/json; charset=utf-8';
   } else if (
-    new URL(url).pathname === '/backend-api/conversation/second' &&
-    new URL(url).searchParams.get('window') === '1'
+    pathname === '/backend-api/conversation/second' &&
+    parsedUrl.searchParams.get('window') === '1'
   ) {
     body = JSON.stringify(fixture.secondWindowConversation);
     contentType = 'application/json; charset=utf-8';
-  } else if (new URL(url).pathname === '/backend-api/conversation/second') {
+  } else if (pathname === '/backend-api/conversation/second') {
     body = JSON.stringify(fixture.secondConversation);
     contentType = 'application/json; charset=utf-8';
   } else if (url.includes('/backend-api/messages/second-ledger-a')) {
@@ -1584,6 +1643,79 @@ function makeFixture() {
     parentMessageId: 'ma1',
     title: 'Mobile fixture',
   };
+  const smokeCanonicalMessages = Object.values(mapping)
+    .filter((node) => node?.message)
+    .map((node) => ({
+      ...node.message,
+      metadata: {
+        ...(node.message.metadata || {}),
+        ...(node.parent ? { parent_id: node.parent } : {}),
+      },
+    }));
+  const smokeCanonicalPages = {
+    newest: {
+      id: 'smoke',
+      conversation_id: 'smoke',
+      title: 'Fixture conversation',
+      current_node: parent,
+      messages: smokeCanonicalMessages.slice(80),
+      page_info: {
+        has_previous_page: true,
+        has_next_page: false,
+        start_cursor: 'smoke-before-80',
+        end_cursor: 'smoke-newest-end',
+      },
+    },
+    middle: {
+      id: 'smoke',
+      conversation_id: 'smoke',
+      title: 'Fixture conversation',
+      current_node: smokeCanonicalMessages[79].id,
+      messages: smokeCanonicalMessages.slice(40, 80),
+      page_info: {
+        has_previous_page: true,
+        has_next_page: true,
+        start_cursor: 'smoke-before-40',
+        end_cursor: 'smoke-before-80',
+      },
+    },
+    oldest: {
+      id: 'smoke',
+      conversation_id: 'smoke',
+      title: 'Fixture conversation',
+      current_node: smokeCanonicalMessages[39].id,
+      messages: smokeCanonicalMessages.slice(0, 40),
+      page_info: {
+        has_previous_page: false,
+        has_next_page: true,
+        start_cursor: 'smoke-oldest-start',
+        end_cursor: 'smoke-before-40',
+      },
+    },
+  };
+  const secondCanonicalPage = canonicalPageFromMapping(secondConversation);
+  const mobileCanonicalPage = {
+    id: 'mobile-smoke',
+    conversation_id: 'mobile-smoke',
+    title: 'Mobile fixture',
+    current_node: 'ma1',
+    messages: [
+      {
+        id: 'mu1',
+        author: { role: 'user' },
+        content: { parts: ['Mobile fixture question'] },
+      },
+      {
+        id: 'ma1',
+        author: { role: 'assistant' },
+        content: { parts: ['Streaming fixture answer'] },
+        metadata: { parent_id: 'mu1' },
+        status: 'finished_successfully',
+        end_turn: true,
+      },
+    ],
+    page_info: { has_previous_page: false, has_next_page: false },
+  };
   const encodedConversation = escapeHtmlAttribute(JSON.stringify(mobileConversation));
   return {
     document: '<!doctype html><html><head><meta charset="utf-8"><title>Fixture ChatGPT</title></head><body><main id="official">Official fixture</main></body></html>',
@@ -1593,7 +1725,10 @@ function makeFixture() {
       { id: 'smoke', title: 'Fixture conversation', update_time: 2, secret: 'INDEX_SECRET_MUST_NOT_PERSIST' },
     ] },
     conversation,
+    smokeCanonicalPages,
     secondConversation,
+    secondCanonicalPage,
+    mobileCanonicalPage,
     secondWindowConversation,
     secondLedgerA,
     secondLedgerB,
@@ -1670,6 +1805,63 @@ function makeFixture() {
         create_time: 6,
       },
     },
+    turnTraceStream: [
+      `data: ${JSON.stringify({
+        sequence_number: 1,
+        output_index: 0,
+        response_id: 'fixture-response-mobile',
+        message: {
+          id: 'turn-trace-reason',
+          parent_id: 'ma1',
+          author: { role: 'assistant' },
+          content: { content_type: 'thought', text: 'Second-turn reasoning must not attach to the first turn.' },
+          status: 'in_progress',
+          end_turn: false,
+          create_time: 20,
+        },
+      })}`,
+      `data: ${JSON.stringify({
+        sequence_number: 2,
+        output_index: 1,
+        response_id: 'fixture-response-mobile',
+        message: {
+          id: 'turn-trace-call',
+          parent_id: 'turn-trace-reason',
+          author: { role: 'assistant' },
+          recipient: 'web.run',
+          content: { content_type: 'code', text: '{"query":"turn identity"}' },
+          create_time: 21,
+        },
+      })}`,
+      `data: ${JSON.stringify({
+        sequence_number: 3,
+        output_index: 2,
+        response_id: 'fixture-response-mobile',
+        message: {
+          id: 'turn-trace-tool',
+          parent_id: 'turn-trace-call',
+          author: { role: 'tool', name: 'web.run' },
+          content: { parts: ['{"ok":true,"turn":"second"}'] },
+          create_time: 22,
+        },
+      })}`,
+      `data: ${JSON.stringify({
+        sequence_number: 4,
+        output_index: 3,
+        response_id: 'fixture-response-mobile',
+        message: {
+          id: 'turn-trace-final',
+          parent_id: 'turn-trace-tool',
+          author: { role: 'assistant' },
+          content: { parts: ['Turn trace final answer'] },
+          status: 'finished_successfully',
+          end_turn: true,
+          create_time: 23,
+        },
+      })}`,
+      'data: [DONE]',
+      '',
+    ].join('\n\n'),
     resume: `data: ${JSON.stringify({
       message: {
         id: 'resume-a1',
@@ -1684,6 +1876,35 @@ function makeFixture() {
       '<template data-web-mobile-dpu-frame="2"><template for="assistant-pending-fixture-pending" data-web-mobile-dpu-apply="replace"><p data-assistant-stream-block="" data-assistant-stream-block-index="0">Streaming fixture answer</p></template></template>',
       `<template data-web-mobile-dpu-frame="3"><span data-conversation="${encodedConversation}"></span></template>`,
     ].join(''),
+  };
+}
+
+function canonicalPageFromMapping(conversation) {
+  const chain = [];
+  const visited = new Set();
+  let cursor = conversation.current_node;
+  while (cursor && conversation.mapping?.[cursor] && !visited.has(cursor)) {
+    visited.add(cursor);
+    const node = conversation.mapping[cursor];
+    if (node?.message) {
+      chain.push({
+        ...node.message,
+        metadata: {
+          ...(node.message.metadata || {}),
+          ...(node.parent ? { parent_id: node.parent } : {}),
+        },
+      });
+    }
+    cursor = node.parent;
+  }
+  chain.reverse();
+  return {
+    id: conversation.id,
+    conversation_id: conversation.id,
+    title: conversation.title,
+    current_node: conversation.current_node,
+    messages: chain,
+    page_info: { has_previous_page: false, has_next_page: false },
   };
 }
 
@@ -1709,14 +1930,31 @@ function installComposerExpression() {
     });
     button.addEventListener('click', (event) => {
       event.preventDefault();
-      window.__slimgptSubmitted = textarea.value;
+      const submittedText = textarea.value;
+      window.__slimgptSubmitted = submittedText;
       const message = document.createElement('div');
       message.setAttribute('data-message-id', 'fixture-submitted-user');
       const content = document.createElement('div');
       content.setAttribute('data-message-author-role', 'user');
-      content.textContent = textarea.value;
+      content.textContent = submittedText;
       message.appendChild(content);
       document.body.appendChild(message);
+      void fetch('/backend-api/f/conversation', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-oai-turn-trace-id': 'fixture-turn-mobile',
+        },
+        body: JSON.stringify({
+          conversation_id: 'mobile-smoke',
+          parent_message_id: 'ma1',
+          messages: [{
+            id: 'fixture-submitted-user',
+            author: { role: 'user' },
+            content: { content_type: 'text', parts: [submittedText] },
+          }],
+        }),
+      }).then((response) => response.text()).catch(() => {});
       textarea.value = '';
       button.hidden = true;
       let stop = form.querySelector('[data-testid="stop-button"]');

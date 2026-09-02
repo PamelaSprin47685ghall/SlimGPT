@@ -52,6 +52,8 @@
   let conversationIndexSync = null;
   let lastConversationIndexSyncAt = 0;
   let lastConversationIndexSyncAttemptAt = 0;
+  let turnSessionCounter = 0;
+  let pendingNewTurnSession = null;
   let thinkingSync = Promise.resolve();
   let resumeGeneration = 0;
   let resumeSession = null;
@@ -65,6 +67,7 @@
   let executionIdleCandidateKey = null;
   const canonicalFetches = new Map();
   const pendingCanonicalIds = new Set();
+  const activeTurnSessions = new Map();
   const executionStates = new Map();
   const lastDomRunningAt = new Map();
   const lastExecutionStoppedAt = new Map();
@@ -99,6 +102,7 @@
   };
 
   const nextRequestId = (prefix) => `${prefix}-${Date.now().toString(36)}-${(++requestCounter).toString(36)}`;
+  const nextTurnSessionId = () => `turn-${Date.now().toString(36)}-${(++turnSessionCounter).toString(36)}`;
 
   installRenderSleepStyle();
   installFocusGuard();
@@ -316,6 +320,9 @@
           const oldest = seenText.keys().next().value;
           seenText.delete(oldest);
         }
+        const turnSession = executionStates.get(executionKey(conversationId))?.state === 'running'
+          ? activeTurnSessions.get(conversationId)
+          : null;
         emit({
           type: "page-capture",
           transport: "dom",
@@ -323,6 +330,21 @@
           requestId: `dom-${messageId}`,
           url: location.href,
           conversationId,
+          ...(turnSession?.turnId
+            ? { turnId: turnSession.turnId }
+            : {}),
+          ...(turnSession?.turnAliases?.length
+            ? { turnAliases: turnSession.turnAliases.slice() }
+            : {}),
+          ...(turnSession?.transportTurnId
+            ? { transportTurnId: turnSession.transportTurnId }
+            : {}),
+          ...(turnSession?.userMessageId
+            ? { turnUserMessageId: turnSession.userMessageId }
+            : {}),
+          ...(turnSession?.parentMessageId
+            ? { turnParentMessageId: turnSession.parentMessageId }
+            : {}),
           mimeType: "application/json",
           timestamp: Date.now(),
           data: JSON.stringify({
@@ -528,19 +550,28 @@
       const request = observedRequest(input, init);
       if (request) observeBackendRequest(request, upstreamFetch, fetchThis);
       const conversationScope = request ? snapshotConversationScope(request) : null;
-      const resumeSnapshot = request && isResumeRequest(request)
-        ? snapshotRequest(request, upstreamFetch, fetchThis, conversationScope)
-        : null;
       const submission = request && isConversationSubmission(request);
+      const turnScope = submission
+        ? snapshotSubmissionTurn(request, conversationScope)
+        : (request && isResumeRequest(request) ? snapshotActiveTurn(conversationScope) : null);
+      const resumeSnapshot = request && isResumeRequest(request)
+        ? snapshotRequest(request, upstreamFetch, fetchThis, conversationScope, turnScope)
+        : null;
 
       let response;
       try {
         response = await Reflect.apply(upstreamFetch, fetchThis, arguments);
       } catch (error) {
-        if (submission) settleSendConfirmation(false, "request-failed");
+        if (submission) {
+          settleSendConfirmation(false, "request-failed");
+          void releaseTurnSession(turnScope);
+        }
         throw error;
       }
-      if (submission) settleSendConfirmation(response.ok, response.ok ? "request-accepted" : `http-${response.status}`);
+      if (submission) {
+        settleSendConfirmation(response.ok, response.ok ? "request-accepted" : `http-${response.status}`);
+        if (!response.ok) void releaseTurnSession(turnScope);
+      }
       queueMicrotask(maybeMarkOfficialUiHydrated);
 
       const url = response.url || request?.url || (typeof input === "string" ? input : input?.url);
@@ -567,6 +598,7 @@
         status: response.status,
         mimeType,
         conversationScope,
+        turnScope,
         conversationRequest: Boolean(submission),
       };
 
@@ -639,6 +671,177 @@
     }
   }
 
+  async function snapshotSubmissionTurn(request, conversationScope) {
+    const session = {
+      sessionId: nextTurnSessionId(),
+      transportTurnId: request?.headers?.get?.("x-oai-turn-trace-id") || null,
+      turnId: null,
+      turnAliases: [],
+      turnExchangeId: null,
+      workingTurnId: null,
+      requestId: null,
+      turnTraceId: null,
+      conversationId: null,
+      userMessageId: null,
+      parentMessageId: null,
+      startedAt: Date.now(),
+    };
+    const [scope, identity] = await Promise.all([
+      conversationScope?.catch(() => ({ conversationId: null, conflicted: false })) ||
+        Promise.resolve({ conversationId: null, conflicted: false }),
+      readRequestTurnIdentity(request),
+    ]);
+    if (!scope?.conflicted && scope?.conversationId) session.conversationId = scope.conversationId;
+    if (identity?.userMessageId) session.userMessageId = identity.userMessageId;
+    if (identity?.parentMessageId) session.parentMessageId = identity.parentMessageId;
+    if (identity?.turnId) session.turnId = identity.turnId;
+    if (identity?.turnAliases?.length) session.turnAliases = identity.turnAliases;
+    if (identity?.turnExchangeId) session.turnExchangeId = identity.turnExchangeId;
+    if (identity?.workingTurnId) session.workingTurnId = identity.workingTurnId;
+    if (identity?.requestId) session.requestId = identity.requestId;
+    if (identity?.turnTraceId) session.turnTraceId = identity.turnTraceId;
+    if (!session.transportTurnId) session.transportTurnId = session.sessionId;
+    registerTurnSession(session);
+    return { ...session };
+  }
+
+  async function snapshotActiveTurn(conversationScope) {
+    const scope = await (conversationScope?.catch(() => ({ conversationId: null, conflicted: false })) ||
+      Promise.resolve({ conversationId: null, conflicted: false }));
+    if (scope?.conflicted) return null;
+    const conversationId = scope?.conversationId || null;
+    let session = conversationId ? activeTurnSessions.get(conversationId) : null;
+    if (!session && pendingNewTurnSession) {
+      if (conversationId) bindPendingTurnSession(conversationId);
+      session = conversationId ? activeTurnSessions.get(conversationId) : pendingNewTurnSession;
+    }
+    return session ? { ...session } : null;
+  }
+
+  async function readRequestTurnIdentity(request) {
+    if (!request || !["POST", "PUT", "PATCH"].includes(request.method.toUpperCase())) return null;
+    const declaredLength = Number(request.headers.get("content-length") || 0);
+    if (declaredLength > MAX_IDENTITY_BODY) return null;
+    try {
+      const text = await request.clone().text();
+      if (text.length > MAX_IDENTITY_BODY) return null;
+      return turnIdentityFromRequestBody(text);
+    } catch {
+      return null;
+    }
+  }
+
+  function turnIdentityFromRequestBody(body) {
+    let value = body;
+    if (typeof body === "string") {
+      const text = body.trim();
+      if (!text) return null;
+      try {
+        value = JSON.parse(text);
+      } catch {
+        return null;
+      }
+    }
+    if (!value || typeof value !== "object") return null;
+    const messages = Array.isArray(value.messages) ? value.messages : [];
+    const userMessage = [...messages].reverse().find((message) => message?.author?.role === "user") ||
+      (value.partial_query?.author?.role === "user" ? value.partial_query : null);
+    const userMessageId = userMessage?.id || value.user_message_id || value.userMessageId || null;
+    const parentMessageId = value.parent_message_id || value.parentMessageId || userMessage?.parent_id || null;
+    const metadata = userMessage?.metadata && typeof userMessage.metadata === "object"
+      ? userMessage.metadata
+      : {};
+    const turnExchangeId = firstTurnIdentityString(
+      metadata.turn_exchange_id,
+      metadata.turnExchangeId,
+      userMessage?.turn_exchange_id,
+      userMessage?.turnExchangeId,
+    );
+    const workingTurnId = firstTurnIdentityString(
+      metadata.working_turn_id,
+      metadata.workingTurnId,
+      userMessage?.working_turn_id,
+      userMessage?.workingTurnId,
+    );
+    const requestId = firstTurnIdentityString(
+      metadata.request_id,
+      metadata.requestId,
+      userMessage?.request_id,
+      userMessage?.requestId,
+    );
+    const turnTraceId = firstTurnIdentityString(
+      metadata.turn_trace_id,
+      metadata.turnTraceId,
+      userMessage?.turn_trace_id,
+      userMessage?.turnTraceId,
+    );
+    const turnAliases = uniqueTurnIdentityStrings([
+      turnExchangeId,
+      workingTurnId,
+      requestId,
+      turnTraceId,
+    ]);
+    return {
+      userMessageId: typeof userMessageId === "string" && userMessageId ? userMessageId : null,
+      parentMessageId: typeof parentMessageId === "string" && parentMessageId ? parentMessageId : null,
+      turnId: turnAliases[0] || null,
+      turnAliases,
+      turnExchangeId,
+      workingTurnId,
+      requestId,
+      turnTraceId,
+    };
+  }
+
+  function firstTurnIdentityString(...values) {
+    for (const value of values) {
+      if (typeof value === "string" && value.trim()) return value.trim();
+    }
+    return null;
+  }
+
+  function uniqueTurnIdentityStrings(values) {
+    const output = [];
+    const seen = new Set();
+    for (const value of values || []) {
+      if (typeof value !== "string") continue;
+      const normalized = value.trim();
+      if (!normalized || seen.has(normalized)) continue;
+      seen.add(normalized);
+      output.push(normalized);
+    }
+    return output;
+  }
+
+  function registerTurnSession(session) {
+    if (!session?.sessionId) return;
+    if (session.conversationId) {
+      activeTurnSessions.set(session.conversationId, session);
+      if (activeTurnSessions.size > MAX_EXECUTION_STATES) {
+        const oldest = activeTurnSessions.keys().next().value;
+        activeTurnSessions.delete(oldest);
+      }
+      return;
+    }
+    pendingNewTurnSession = session;
+  }
+
+  async function releaseTurnSession(turnScope) {
+    const session = await Promise.resolve(turnScope).catch(() => null);
+    if (!session?.sessionId) return;
+    if (session.conversationId && activeTurnSessions.get(session.conversationId)?.sessionId === session.sessionId) {
+      activeTurnSessions.delete(session.conversationId);
+    }
+    if (pendingNewTurnSession?.sessionId === session.sessionId) pendingNewTurnSession = null;
+  }
+
+  function bindPendingTurnSession(conversationId) {
+    if (!conversationId || !pendingNewTurnSession) return;
+    const session = { ...pendingNewTurnSession, conversationId };
+    pendingNewTurnSession = null;
+    activeTurnSessions.set(conversationId, session);
+  }
+
   function conversationIdFromRequestBody(body) {
     let value = body;
     if (typeof body === "string") {
@@ -664,13 +867,27 @@
   }
 
   async function resolveCaptureMeta(meta) {
-    const { conversationScope, ...captureMeta } = meta;
-    if (!conversationScope) return captureMeta;
-    const scope = await conversationScope.catch(() => ({ conversationId: null, conflicted: false }));
+    const { conversationScope, turnScope, ...captureMeta } = meta;
+    const scope = conversationScope
+      ? await conversationScope.catch(() => ({ conversationId: null, conflicted: false }))
+      : { conversationId: null, conflicted: false };
+    const turn = turnScope
+      ? await Promise.resolve(turnScope).catch(() => null)
+      : null;
     if (scope.conflicted) return { ...captureMeta, conversationIdConflict: true };
-    return scope.conversationId
+    const resolved = scope.conversationId
       ? { ...captureMeta, conversationId: scope.conversationId }
-      : captureMeta;
+      : { ...captureMeta };
+    if (turn?.turnId) resolved.turnId = turn.turnId;
+    if (turn?.turnAliases?.length) resolved.turnAliases = turn.turnAliases.slice();
+    if (turn?.transportTurnId) resolved.transportTurnId = turn.transportTurnId;
+    if (turn?.turnExchangeId) resolved.turnExchangeId = turn.turnExchangeId;
+    if (turn?.workingTurnId) resolved.workingTurnId = turn.workingTurnId;
+    if (turn?.requestId) resolved.turnRequestId = turn.requestId;
+    if (turn?.turnTraceId) resolved.turnTraceId = turn.turnTraceId;
+    if (turn?.userMessageId) resolved.turnUserMessageId = turn.userMessageId;
+    if (turn?.parentMessageId) resolved.turnParentMessageId = turn.parentMessageId;
+    return resolved;
   }
 
   function isResumeRequest(request) {
@@ -696,8 +913,8 @@
     backendSessionHeaders = new Headers(request.headers);
     if (request.headers.get("authorization")) {
       backendHeaders = new Headers(request.headers);
-      drainCanonicalFetches();
     }
+    drainCanonicalFetches();
     if (!lastConversationIndexSyncAt) requestConversationIndexSync();
   }
 
@@ -776,7 +993,7 @@
     return synced;
   }
 
-  function snapshotRequest(request, upstreamFetch, fetchThis, conversationScope) {
+  function snapshotRequest(request, upstreamFetch, fetchThis, conversationScope, turnScope = null) {
     const method = request.method.toUpperCase();
     const hasBody = method !== "GET" && method !== "HEAD" && request.body !== null;
     const bodyPromise = hasBody
@@ -799,6 +1016,7 @@
       upstreamFetch,
       fetchThis,
       conversationScope,
+      turnScope,
     };
   }
 
@@ -978,6 +1196,7 @@
         status: response.status,
         mimeType,
         conversationScope: session.snapshot.conversationScope,
+        turnScope: session.snapshot.turnScope,
         resume: true,
         replay: true,
         cancelSignal: controller.signal,
@@ -1082,6 +1301,7 @@
         disconnected: !sawDone,
         ...captureMeta,
       });
+      if (captureMeta.conversationId) queueCanonicalConversation(captureMeta.conversationId);
       cancelSignal?.removeEventListener("abort", cancelReader);
       reader.releaseLock();
       try {
@@ -1295,9 +1515,13 @@
           const conversationRequest = String(meta.method || "").toUpperCase() === "POST" &&
             url.origin === location.origin &&
             (url.pathname === "/backend-api/conversation" || url.pathname === "/backend-api/f/conversation");
+          const turnScope = conversationRequest
+            ? snapshotXhrSubmissionTurn(body, conversationScope)
+            : (url.pathname === RESUME_PATH ? snapshotActiveTurn(conversationScope) : null);
           observeXhrResponse(this, {
             ...meta,
             conversationScope,
+            turnScope,
             conversationRequest,
           });
         }
@@ -1305,6 +1529,40 @@
       };
       prototype.send = observedXhrSend;
     }
+  }
+
+  async function snapshotXhrSubmissionTurn(body, conversationScope) {
+    const session = {
+      sessionId: nextTurnSessionId(),
+      transportTurnId: null,
+      turnId: null,
+      turnAliases: [],
+      turnExchangeId: null,
+      workingTurnId: null,
+      requestId: null,
+      turnTraceId: null,
+      conversationId: null,
+      userMessageId: null,
+      parentMessageId: null,
+      startedAt: Date.now(),
+    };
+    const [scope, identity] = await Promise.all([
+      conversationScope?.catch(() => ({ conversationId: null, conflicted: false })) ||
+        Promise.resolve({ conversationId: null, conflicted: false }),
+      Promise.resolve(turnIdentityFromRequestBody(body)),
+    ]);
+    if (!scope?.conflicted && scope?.conversationId) session.conversationId = scope.conversationId;
+    if (identity?.userMessageId) session.userMessageId = identity.userMessageId;
+    if (identity?.parentMessageId) session.parentMessageId = identity.parentMessageId;
+    if (identity?.turnId) session.turnId = identity.turnId;
+    if (identity?.turnAliases?.length) session.turnAliases = identity.turnAliases;
+    if (identity?.turnExchangeId) session.turnExchangeId = identity.turnExchangeId;
+    if (identity?.workingTurnId) session.workingTurnId = identity.workingTurnId;
+    if (identity?.requestId) session.requestId = identity.requestId;
+    if (identity?.turnTraceId) session.turnTraceId = identity.turnTraceId;
+    session.transportTurnId = session.sessionId;
+    registerTurnSession(session);
+    return { ...session };
   }
 
   function observeXhrResponse(xhr, meta) {
@@ -1353,6 +1611,7 @@
         if (submission) {
           const ok = xhr.status >= 200 && xhr.status < 300;
           settleSendConfirmation(ok, ok ? "request-accepted" : `http-${xhr.status || 0}`);
+          if (!ok) void releaseTurnSession(meta.turnScope);
         }
       } catch {
         // Capture remains best-effort; send confirmation will time out.
@@ -1367,38 +1626,45 @@
   }
 
   function drainCanonicalFetches() {
-    if (!backendFetch || !backendHeaders) return;
+    if (!backendFetch || !(backendHeaders || backendSessionHeaders)) return;
     for (const conversationId of pendingCanonicalIds) {
       if (!canonicalFetches.has(conversationId)) void fetchCanonicalConversation(conversationId);
     }
   }
 
   async function fetchCanonicalConversation(conversationId) {
-    if (canonicalFetches.has(conversationId) || !backendFetch || !backendHeaders) return;
+    const sourceHeaders = backendHeaders || backendSessionHeaders;
+    if (canonicalFetches.has(conversationId) || !backendFetch || !sourceHeaders) return;
     const task = (async () => {
-      const headers = new Headers(backendHeaders);
+      const headers = new Headers(sourceHeaders);
       headers.delete("content-length");
       headers.delete("content-type");
       headers.set("accept", "application/json");
-      const url = new URL(`/backend-api/conversations/${encodeURIComponent(conversationId)}`, location.origin);
-      const response = await Reflect.apply(backendFetch, backendFetchThis, [
-        url.href,
-        {
-          method: "GET",
-          credentials: "include",
-          cache: "no-store",
-          headers,
-        },
-      ]);
-      if (!response.ok) return;
+      const pages = await fetchCanonicalConversationPages(conversationId, headers);
+      if (!pages.length) return;
       pendingCanonicalIds.delete(conversationId);
-      await captureBoundedResponse(response, {
-        requestId: nextRequestId("sync"),
-        url: response.url || url.href,
-        status: response.status,
-        mimeType: response.headers.get("content-type") || "application/json",
-        synchronized: true,
-      });
+      const ordered = pages.slice().reverse();
+      const syncId = nextRequestId("sync");
+      for (let index = 0; index < ordered.length; index += 1) {
+        const page = ordered[index];
+        emit({
+          type: "page-capture",
+          transport: "fetch",
+          phase: "complete",
+          requestId: `${syncId}-${index + 1}`,
+          url: page.url,
+          status: page.status,
+          mimeType: page.mimeType,
+          timestamp: Date.now(),
+          data: page.text,
+          conversationId,
+          synchronized: true,
+          canonicalSyncId: syncId,
+          canonicalPageIndex: index,
+          canonicalPageCount: ordered.length,
+          canonicalComplete: index === ordered.length - 1,
+        });
+      }
     })();
     canonicalFetches.set(conversationId, task);
     try {
@@ -1408,6 +1674,80 @@
     } finally {
       canonicalFetches.delete(conversationId);
     }
+  }
+
+  async function fetchCanonicalConversationPages(conversationId, headers) {
+    const pages = [];
+    const seenCursors = new Set();
+    let before = null;
+
+    for (let pageIndex = 0; pageIndex < 100; pageIndex += 1) {
+      const url = new URL(`/backend-api/conversations/${encodeURIComponent(conversationId)}`, location.origin);
+      url.searchParams.set("include_has_versions", "true");
+      url.searchParams.set("num_turns", "100");
+      if (before) url.searchParams.set("before", before);
+      const response = await Reflect.apply(backendFetch, backendFetchThis, [
+        url.href,
+        {
+          method: "GET",
+          credentials: "include",
+          cache: "no-store",
+          headers: new Headers(headers),
+        },
+      ]);
+      if (!response.ok) {
+        if (!pages.length) return fetchLegacyCanonicalConversation(conversationId, headers);
+        return [];
+      }
+      const text = await response.text();
+      if (!text || text.length > MAX_NON_STREAM_BODY) return [];
+      let value;
+      try { value = JSON.parse(text); } catch { return []; }
+      pages.push({
+        text,
+        url: response.url || url.href,
+        status: response.status,
+        mimeType: response.headers.get("content-type") || "application/json",
+      });
+
+      // Legacy/full tree responses are already complete in one request.
+      if (value?.mapping && value?.current_node) break;
+      const pageInfo = value?.page_info || value?.data?.page_info || null;
+      if (!pageInfo?.has_previous_page) break;
+      const cursor = String(pageInfo.start_cursor || "").trim();
+      if (!cursor || seenCursors.has(cursor)) return [];
+      seenCursors.add(cursor);
+      before = cursor;
+    }
+    return pages;
+  }
+
+  async function fetchLegacyCanonicalConversation(conversationId, headers) {
+    const url = new URL(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, location.origin);
+    const response = await Reflect.apply(backendFetch, backendFetchThis, [
+      url.href,
+      {
+        method: "GET",
+        credentials: "include",
+        cache: "no-store",
+        headers: new Headers(headers),
+      },
+    ]);
+    if (!response.ok) return [];
+    const text = await response.text();
+    if (!text || text.length > MAX_NON_STREAM_BODY) return [];
+    try {
+      const value = JSON.parse(text);
+      if (!value?.mapping || !value?.current_node) return [];
+    } catch {
+      return [];
+    }
+    return [{
+      text,
+      url: response.url || url.href,
+      status: response.status,
+      mimeType: response.headers.get("content-type") || "application/json",
+    }];
   }
 
   function installWebSocketObserver() {
@@ -1592,9 +1932,14 @@
         const conversationId = notification.conversationId;
         const stateValue = notificationExecutionState(notification);
         if (conversationId && stateValue === 'running') {
+          adoptNotificationTurnIdentity(conversationId, notification);
           emitExecutionState('running', 'ws-turn-running', conversationId, { phase: notification.type });
         } else if (conversationId && stateValue === 'stopped') {
           emitExecutionState('stopped', 'ws-turn-stopped', conversationId, { phase: notification.type });
+          const activeSession = activeTurnSessions.get(conversationId);
+          if (!activeSession || notificationMatchesTurnSession(notification, activeSession)) {
+            activeTurnSessions.delete(conversationId);
+          }
         }
         emit({
           type: "page-stream-status",
@@ -1628,13 +1973,81 @@
       const eventPayload = payload.payload && typeof payload.payload === "object"
         ? payload.payload
         : payload;
+      const metadata = eventPayload.metadata && typeof eventPayload.metadata === "object"
+        ? eventPayload.metadata
+        : {};
+      const turnExchangeId = firstTurnIdentityString(
+        eventPayload.turn_exchange_id,
+        eventPayload.turnExchangeId,
+        metadata.turn_exchange_id,
+        metadata.turnExchangeId,
+      );
+      const workingTurnId = firstTurnIdentityString(
+        eventPayload.working_turn_id,
+        eventPayload.workingTurnId,
+        metadata.working_turn_id,
+        metadata.workingTurnId,
+      );
+      const requestId = firstTurnIdentityString(
+        eventPayload.request_id,
+        eventPayload.requestId,
+        metadata.request_id,
+        metadata.requestId,
+      );
+      const turnTraceId = firstTurnIdentityString(
+        eventPayload.turn_trace_id,
+        eventPayload.turnTraceId,
+        metadata.turn_trace_id,
+        metadata.turnTraceId,
+      );
       notifications.push({
         type: String(payload.type || eventPayload.type || "conversation-update"),
         conversationId: eventPayload.conversation_id || eventPayload.conversationId || null,
         status: String(eventPayload.status || payload.status || ''),
+        turnExchangeId,
+        workingTurnId,
+        requestId,
+        turnTraceId,
+        turnAliases: uniqueTurnIdentityStrings([
+          turnExchangeId,
+          workingTurnId,
+          requestId,
+          turnTraceId,
+        ]),
       });
     }
     return notifications;
+  }
+
+  function adoptNotificationTurnIdentity(conversationId, notification) {
+    const session = activeTurnSessions.get(conversationId);
+    if (!session || !notification?.turnAliases?.length) return;
+    const existingAliases = uniqueTurnIdentityStrings(session.turnAliases || []);
+    if (
+      existingAliases.length &&
+      !existingAliases.some((alias) => notification.turnAliases.includes(alias))
+    ) {
+      return;
+    }
+    activeTurnSessions.set(conversationId, {
+      ...session,
+      turnId: session.turnId || notification.turnAliases[0],
+      turnAliases: uniqueTurnIdentityStrings([
+        ...existingAliases,
+        ...notification.turnAliases,
+      ]),
+      turnExchangeId: session.turnExchangeId || notification.turnExchangeId || null,
+      workingTurnId: session.workingTurnId || notification.workingTurnId || null,
+      requestId: session.requestId || notification.requestId || null,
+      turnTraceId: session.turnTraceId || notification.turnTraceId || null,
+    });
+  }
+
+  function notificationMatchesTurnSession(notification, session) {
+    const notificationAliases = uniqueTurnIdentityStrings(notification?.turnAliases || []);
+    const sessionAliases = uniqueTurnIdentityStrings(session?.turnAliases || []);
+    if (!notificationAliases.length || !sessionAliases.length) return true;
+    return notificationAliases.some((alias) => sessionAliases.includes(alias));
   }
 
   function notificationExecutionState(notification) {
@@ -1770,6 +2183,11 @@
       observedLocationHref = location.href;
       resetResumeSession();
     }
+    const conversationId = conversationIdFromUrl(location.href);
+    if (conversationId) {
+      bindPendingTurnSession(conversationId);
+      queueCanonicalConversation(conversationId);
+    }
     emit({ type: "page-location", url: location.href });
     scheduleExecutionStateScan(0);
   }
@@ -1846,6 +2264,7 @@
         return;
       case "navigate-conversation": {
         const route = payload.route === "uc" ? "uc" : "c";
+        if (payload.conversationId) queueCanonicalConversation(payload.conversationId);
         navigate(`/${route}/${encodeURIComponent(payload.conversationId || "")}`);
         return;
       }

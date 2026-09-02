@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  buildConversationRecordTurns,
   buildConversationRecordView,
   buildConversationView,
   contentToText,
@@ -19,6 +20,7 @@ import {
   ingestConversationMessage,
   ingestConversationPayload,
   mergeConversationPayload,
+  mergeConversationViewObservations,
   messageNodeToView,
   mergeProgressiveText,
   parseWebMobilePartialConversation,
@@ -59,6 +61,362 @@ test('conversation turns keep each user question with its following replies', ()
   assert.deepEqual(turns[0].replies.map((message) => message.text), ['answer one', 'tool detail']);
   assert.equal(turns[1].user.text, 'question two');
   assert.deepEqual(turns[1].replies.map((message) => message.text), ['answer two']);
+});
+
+test('explicit turn identity wins over misleading parent timing when attaching live output', () => {
+  let record = ingestConversationPayload(null, {
+    id: 'turn-identity',
+    current_node: 'a2',
+    mapping: {
+      u1: { id: 'u1', parent: null, children: ['a1'], message: { id: 'u1', author: { role: 'user' }, content: { parts: ['first'] } } },
+      a1: { id: 'a1', parent: 'u1', children: ['u2'], message: { id: 'a1', author: { role: 'assistant' }, content: { parts: ['first answer'] } } },
+      u2: { id: 'u2', parent: 'a1', children: ['a2'], message: { id: 'u2', author: { role: 'user' }, content: { parts: ['last question'] }, metadata: { turn_exchange_id: 'turn-last' } } },
+      a2: { id: 'a2', parent: 'u2', children: [], message: { id: 'a2', author: { role: 'assistant' }, content: { parts: ['last answer prefix'] } } },
+    },
+  });
+  record = ingestConversationMessage(record, {
+    id: 'reason-last',
+    parent_id: 'a1',
+    author: { role: 'assistant' },
+    content: { content_type: 'thought', text: 'belongs to the last turn' },
+    metadata: { turn_exchange_id: 'turn-last' },
+  }, {
+    observationOrdinal: 1,
+  });
+  record = ingestConversationMessage(record, {
+    id: 'tool-last',
+    parent_id: 'reason-last',
+    author: { role: 'assistant' },
+    recipient: 'web.run',
+    content: { content_type: 'code', text: '{"q":"last"}' },
+    metadata: { turn_exchange_id: 'turn-last' },
+  }, {
+    observationOrdinal: 2,
+  });
+
+  const turns = buildConversationRecordTurns(record);
+  assert.equal(turns.length, 2);
+  assert.deepEqual(turns[0].replies.map((item) => item.id), ['a1']);
+  assert.deepEqual(turns[1].replies.map((item) => item.id), ['a2', 'reason-last', 'tool-last']);
+});
+
+test('unassigned live output stays in a tail bucket instead of contaminating the first turn', () => {
+  let record = ingestConversationPayload(null, {
+    id: 'unassigned-tail',
+    current_node: 'a2',
+    mapping: {
+      u1: { id: 'u1', parent: null, children: ['a1'], message: { id: 'u1', author: { role: 'user' }, content: { parts: ['first'] } } },
+      a1: { id: 'a1', parent: 'u1', children: ['u2'], message: { id: 'a1', author: { role: 'assistant' }, content: { parts: ['first answer'] } } },
+      u2: { id: 'u2', parent: 'a1', children: ['a2'], message: { id: 'u2', author: { role: 'user' }, content: { parts: ['second'] } } },
+      a2: { id: 'a2', parent: 'u2', children: [], message: { id: 'a2', author: { role: 'assistant' }, content: { parts: ['second answer'] } } },
+    },
+  });
+  record = ingestConversationMessage(record, {
+    id: 'orphan-tool',
+    author: { role: 'tool', name: 'web.run' },
+    content: { parts: ['orphan result'] },
+  }, { observationOrdinal: 10 });
+
+  const turns = buildConversationRecordTurns(record);
+  assert.equal(turns.length, 3);
+  assert.deepEqual(turns[0].replies.map((item) => item.id), ['a1']);
+  assert.deepEqual(turns[1].replies.map((item) => item.id), ['a2']);
+  assert.equal(turns[2].user, null);
+  assert.deepEqual(turns[2].replies.map((item) => item.id), ['orphan-tool']);
+});
+
+test('a genuinely ambiguous parent without semantic identity stays unassigned', () => {
+  let record = ingestConversationPayload(null, {
+    id: 'ambiguous-parent', current_node: 'u2',
+    mapping: {
+      u1: { id: 'u1', parent: null, children: ['u2'], message: { id: 'u1', author: { role: 'user' }, content: { parts: ['first'] } } },
+      u2: { id: 'u2', parent: 'u1', children: [], message: { id: 'u2', author: { role: 'user' }, content: { parts: ['second'] } } },
+    },
+  });
+  record = ingestConversationMessage(record, {
+    id: 'shared-parent', author: { role: 'assistant' }, content: { parts: ['first-bound parent'] },
+  }, { turnUserMessageId: 'u1', responseId: 'response-one', phase: 'commentary', observationOrdinal: 1 });
+  record = ingestConversationMessage(record, {
+    id: 'shared-parent', author: { role: 'assistant' }, content: { parts: ['second-bound parent'] },
+  }, { turnUserMessageId: 'u2', responseId: 'response-two', phase: 'final', observationOrdinal: 2 });
+  record = ingestConversationMessage(record, {
+    id: 'ambiguous-child', parent_id: 'shared-parent', author: { role: 'tool', name: 'web.run' }, content: { parts: ['unknown owner'] },
+  }, { observationOrdinal: 3 });
+
+  const turns = buildConversationRecordTurns(record);
+  assert.equal(turns[0].replies.some((item) => item.id === 'ambiguous-child'), false);
+  assert.equal(turns[1].replies.some((item) => item.id === 'ambiguous-child'), false);
+  assert.equal(turns.at(-1).source, 'unassigned');
+  assert.deepEqual(turns.at(-1).replies.map((item) => item.id), ['ambiguous-child']);
+});
+
+test('partial canonical pages remain hidden until the full canonical sync is complete', () => {
+  let record = ingestConversationPayload(null, {
+    id: 'partial-hidden',
+    current_node: 'a2',
+    metadata: { source: 'optimized-conversation' },
+    mapping: {
+      u2: { id: 'u2', parent: null, children: ['a2'], message: { id: 'u2', author: { role: 'user' }, content: { parts: ['middle question'] } } },
+      a2: { id: 'a2', parent: 'u2', children: [], message: { id: 'a2', author: { role: 'assistant' }, content: { parts: ['middle answer'] } } },
+    },
+  }, { canonicalComplete: false });
+  const provisionalTurns = buildConversationRecordTurns(record);
+  assert.equal(provisionalTurns.length, 1);
+  assert.equal(provisionalTurns[0].user, null, 'an incomplete page must not invent a historical user turn');
+  assert.deepEqual(provisionalTurns[0].replies.map((reply) => reply.text), ['middle answer']);
+
+  record = ingestConversationPayload(record, {
+    id: 'partial-hidden',
+    current_node: 'a2',
+    mapping: {
+      u1: { id: 'u1', parent: null, children: ['a1'], message: { id: 'u1', author: { role: 'user' }, content: { parts: ['first question'] } } },
+      a1: { id: 'a1', parent: 'u1', children: ['u2'], message: { id: 'a1', author: { role: 'assistant' }, content: { parts: ['first answer'] } } },
+      u2: { id: 'u2', parent: 'a1', children: ['a2'], message: { id: 'u2', author: { role: 'user' }, content: { parts: ['middle question'] } } },
+      a2: { id: 'a2', parent: 'u2', children: [], message: { id: 'a2', author: { role: 'assistant' }, content: { parts: ['middle answer'] } } },
+    },
+  }, { canonicalComplete: true });
+  assert.deepEqual(buildConversationRecordTurns(record).map((turn) => turn.user.text), ['first question', 'middle question']);
+});
+
+test('paginated canonical pages reconnect an external parent across page boundaries', () => {
+  const oldest = findConversationPayload({
+    id: 'paged',
+    conversation_id: 'paged',
+    current_node: 'a1',
+    messages: [
+      { id: 'u1', author: { role: 'user' }, content: { parts: ['oldest question'] } },
+      { id: 'a1', author: { role: 'assistant' }, content: { parts: ['oldest answer'] }, metadata: { parent_id: 'u1' } },
+    ],
+  });
+  const newest = findConversationPayload({
+    id: 'paged',
+    conversation_id: 'paged',
+    current_node: 'a2',
+    messages: [
+      { id: 'u2', author: { role: 'user' }, content: { parts: ['newest question'] }, metadata: { parent_id: 'a1' } },
+      { id: 'a2', author: { role: 'assistant' }, content: { parts: ['newest answer'] }, metadata: { parent_id: 'u2' } },
+    ],
+  });
+  assert.equal(newest.mapping.u2.parent, 'a1', 'a parent outside the current page must not be erased');
+
+  let record = ingestConversationPayload(null, oldest, { canonicalComplete: false });
+  record = ingestConversationPayload(record, newest, { canonicalComplete: true });
+  const turns = buildConversationRecordTurns(record);
+  assert.deepEqual(turns.map((turn) => turn.user.text), ['oldest question', 'newest question']);
+  assert.deepEqual(turns[1].replies.map((reply) => reply.text), ['newest answer']);
+});
+
+test('three canonical pages preserve parent topology across both page boundaries', () => {
+  const oldest = findConversationPayload({
+    id: 'paged-three', conversation_id: 'paged-three', current_node: 'a1',
+    messages: [
+      { id: 'u1', author: { role: 'user' }, content: { parts: ['one'] } },
+      { id: 'a1', author: { role: 'assistant' }, content: { parts: ['answer one'] }, metadata: { parent_id: 'u1' } },
+    ],
+  });
+  const middle = findConversationPayload({
+    id: 'paged-three', conversation_id: 'paged-three', current_node: 'a2',
+    messages: [
+      { id: 'u2', author: { role: 'user' }, content: { parts: ['two'] }, metadata: { parent_id: 'a1' } },
+      { id: 'a2', author: { role: 'assistant' }, content: { parts: ['answer two'] }, metadata: { parent_id: 'u2' } },
+    ],
+  });
+  const newest = findConversationPayload({
+    id: 'paged-three', conversation_id: 'paged-three', current_node: 'a3',
+    messages: [
+      { id: 'u3', author: { role: 'user' }, content: { parts: ['three'] }, metadata: { parent_id: 'a2' } },
+      { id: 'a3', author: { role: 'assistant' }, content: { parts: ['answer three'] }, metadata: { parent_id: 'u3' } },
+    ],
+  });
+
+  let record = ingestConversationPayload(null, oldest, { canonicalComplete: false });
+  record = ingestConversationPayload(record, middle, { canonicalComplete: false });
+  record = ingestConversationPayload(record, newest, { canonicalComplete: true });
+  const turns = buildConversationRecordTurns(record);
+  assert.deepEqual(turns.map((turn) => turn.user?.text), ['one', 'two', 'three']);
+  assert.deepEqual(turns.map((turn) => turn.replies.at(-1)?.text), ['answer one', 'answer two', 'answer three']);
+});
+
+test('an incomplete newest canonical page never fabricates its page head as conversation history', () => {
+  const newestOnly = findConversationPayload({
+    id: 'paged-failed', conversation_id: 'paged-failed', current_node: 'a3',
+    messages: [
+      { id: 'u3', author: { role: 'user' }, content: { parts: ['page-local user'] }, metadata: { parent_id: 'a2' } },
+      { id: 'a3', author: { role: 'assistant' }, content: { parts: ['page-local answer'] }, metadata: { parent_id: 'u3' } },
+    ],
+  });
+  const record = ingestConversationPayload(null, newestOnly, { canonicalComplete: false });
+  const turns = buildConversationRecordTurns(record);
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0].user, null);
+  assert.deepEqual(turns[0].replies.map((reply) => reply.id), ['a3']);
+});
+
+test('reasoning commentary and final remain distinct output items even when message ids repeat', () => {
+  let record = ingestConversationPayload(null, {
+    id: 'same-message-items', current_node: 'u1',
+    mapping: {
+      u1: {
+        id: 'u1', parent: null, children: [],
+        message: { id: 'u1', author: { role: 'user' }, content: { parts: ['research'] }, metadata: { turn_exchange_id: 'turn-items' } },
+      },
+    },
+  });
+  const common = { responseId: 'response-items' };
+  record = ingestConversationMessage(record, {
+    id: 'shared-output', author: { role: 'assistant' },
+    content: { content_type: 'thought', text: 'reasoning item' },
+    metadata: { turn_exchange_id: 'turn-items' },
+  }, { ...common, phase: 'reasoning', outputIndex: 0, sequenceNumber: 9, observationOrdinal: 1 });
+  record = ingestConversationMessage(record, {
+    id: 'shared-output', author: { role: 'assistant' },
+    content: { content_type: 'text', parts: ['commentary item'] },
+    metadata: { turn_exchange_id: 'turn-items' },
+  }, { ...common, phase: 'commentary', outputIndex: 1, sequenceNumber: 3, observationOrdinal: 2 });
+  record = ingestConversationMessage(record, {
+    id: 'shared-output', author: { role: 'assistant' },
+    content: { content_type: 'text', parts: ['final item'] },
+    metadata: { turn_exchange_id: 'turn-items' },
+    status: 'finished_successfully', end_turn: true,
+  }, { ...common, phase: 'final', outputIndex: 2, sequenceNumber: 1, observationOrdinal: 3 });
+
+  const turns = buildConversationRecordTurns(record);
+  assert.equal(record.observations.length, 3);
+  assert.equal(new Set(record.observations.map((item) => item.observationKey)).size, 3);
+  assert.deepEqual(turns[0].replies.map((item) => item.phase), ['reasoning', 'commentary', 'final']);
+  assert.equal(turns[0].replies[0].thought, 'reasoning item');
+  assert.equal(turns[0].replies[2].text, 'final item');
+});
+
+test('multiple tool calls pair by explicit call id even when results arrive out of order', () => {
+  let record = ingestConversationPayload(null, {
+    id: 'parallel-tools', current_node: 'u1',
+    mapping: {
+      u1: { id: 'u1', parent: null, children: [], message: { id: 'u1', author: { role: 'user' }, content: { parts: ['parallel tools'] } } },
+    },
+  });
+  record = ingestConversationMessage(record, {
+    id: 'call-one', author: { role: 'assistant' },
+    tool_calls: [{ id: 'call-1', function: { name: 'web.run', arguments: '{"q":"one"}' } }], content: { parts: [] },
+  }, { turnUserMessageId: 'u1', responseId: 'response-tools', outputIndex: 0, observationOrdinal: 1 });
+  record = ingestConversationMessage(record, {
+    id: 'call-two', author: { role: 'assistant' },
+    tool_calls: [{ id: 'call-2', function: { name: 'web.run', arguments: '{"q":"two"}' } }], content: { parts: [] },
+  }, { responseId: 'response-tools', outputIndex: 1, observationOrdinal: 2 });
+  record = ingestConversationMessage(record, {
+    id: 'result-two', call_id: 'call-2', author: { role: 'tool', name: 'web.run' }, content: { parts: ['two result'] },
+  }, { responseId: 'response-tools', outputIndex: 3, observationOrdinal: 3 });
+  record = ingestConversationMessage(record, {
+    id: 'result-one', call_id: 'call-1', author: { role: 'tool', name: 'web.run' }, content: { parts: ['one result'] },
+  }, { responseId: 'response-tools', outputIndex: 2, observationOrdinal: 4 });
+
+  const replies = buildConversationRecordTurns(record)[0].replies;
+  assert.deepEqual(replies.map((item) => item.id), ['call-one', 'call-two', 'result-one', 'result-two']);
+  assert.equal(replies.find((item) => item.id === 'result-one').tool.callId, 'call-1');
+  assert.equal(replies.find((item) => item.id === 'result-two').tool.callId, 'call-2');
+});
+
+test('ownership converges when a response-linked tool result is observed before its turn anchor', () => {
+  let record = ingestConversationPayload(null, {
+    id: 'late-anchor', current_node: 'u1',
+    mapping: {
+      u1: { id: 'u1', parent: null, children: [], message: { id: 'u1', author: { role: 'user' }, content: { parts: ['late anchor'] } } },
+    },
+  });
+  record = ingestConversationMessage(record, {
+    id: 'early-result', call_id: 'call-late', author: { role: 'tool', name: 'web.run' }, content: { parts: ['arrived first'] },
+  }, { responseId: 'response-late-anchor', observationOrdinal: 1 });
+  record = ingestConversationMessage(record, {
+    id: 'late-call', author: { role: 'assistant' },
+    tool_calls: [{ id: 'call-late', function: { name: 'web.run', arguments: '{"q":"late"}' } }], content: { parts: [] },
+  }, { turnUserMessageId: 'u1', responseId: 'response-late-anchor', observationOrdinal: 2 });
+
+  const turns = buildConversationRecordTurns(record);
+  assert.equal(turns.length, 1);
+  assert.deepEqual(turns[0].replies.map((item) => item.id), ['late-call', 'early-result']);
+});
+
+test('a resumed transport segment continues the response-bound logical turn', () => {
+  let record = ingestConversationPayload(null, {
+    id: 'resume-turn', current_node: 'u1',
+    mapping: {
+      u1: { id: 'u1', parent: null, children: [], message: { id: 'u1', author: { role: 'user' }, content: { parts: ['continue'] } } },
+    },
+  });
+  record = ingestConversationMessage(record, {
+    id: 'initial-item', author: { role: 'assistant' }, content: { parts: ['initial segment'] },
+  }, {
+    turnUserMessageId: 'u1', responseId: 'response-resume', transportTurnId: 'transport-initial', outputIndex: 0,
+  });
+  record = ingestConversationMessage(record, {
+    id: 'resume-item', author: { role: 'assistant' }, content: { parts: ['resume segment'] },
+  }, {
+    responseId: 'response-resume', transportTurnId: 'transport-resume', outputIndex: 1,
+  });
+  const turns = buildConversationRecordTurns(record);
+  assert.equal(turns.length, 1);
+  assert.deepEqual(turns[0].replies.map((item) => item.id), ['initial-item', 'resume-item']);
+});
+
+test('transport session ids never leak ownership into the immediately following turn', () => {
+  let record = ingestConversationPayload(null, {
+    id: 'transport-isolation', current_node: 'u2',
+    mapping: {
+      u1: { id: 'u1', parent: null, children: ['u2'], message: { id: 'u1', author: { role: 'user' }, content: { parts: ['first'] } } },
+      u2: { id: 'u2', parent: 'u1', children: [], message: { id: 'u2', author: { role: 'user' }, content: { parts: ['second'] } } },
+    },
+  });
+  record = ingestConversationMessage(record, {
+    id: 'old-tool', author: { role: 'assistant' }, recipient: 'web.run', content: { text: '{"q":"old"}' },
+  }, { turnUserMessageId: 'u1', transportTurnId: 'transport-reused', responseId: 'old-response', outputIndex: 0 });
+  record = ingestConversationMessage(record, {
+    id: 'old-result', call_id: 'old-call', author: { role: 'tool', name: 'web.run' }, content: { parts: ['old result'] },
+  }, { turnUserMessageId: 'u1', transportTurnId: 'transport-reused', responseId: 'old-response', outputIndex: 1 });
+  record = ingestConversationMessage(record, {
+    id: 'new-final', author: { role: 'assistant' }, content: { parts: ['new answer'] },
+  }, { turnUserMessageId: 'u2', transportTurnId: 'transport-reused', responseId: 'new-response', outputIndex: 0 });
+
+  const turns = buildConversationRecordTurns(record);
+  assert.deepEqual(turns.map((turn) => turn.user?.id), ['u1', 'u2']);
+  assert.deepEqual(turns[0].replies.map((item) => item.id), ['old-tool', 'old-result']);
+  assert.deepEqual(turns[1].replies.map((item) => item.id), ['new-final']);
+});
+
+test('user_editable_context and model_editable_context never create visible empty turns', () => {
+  const record = ingestConversationPayload(null, {
+    id: 'internal-context',
+    current_node: 'final',
+    mapping: {
+      u1: {
+        id: 'u1', parent: null, children: ['ctx-user'],
+        message: { id: 'u1', author: { role: 'user' }, content: { content_type: 'text', parts: ['real question'] } },
+      },
+      'ctx-user': {
+        id: 'ctx-user', parent: 'u1', children: ['sys'],
+        message: { id: 'ctx-user', author: { role: 'user' }, content: { content_type: 'user_editable_context', parts: ['internal'] } },
+      },
+      sys: {
+        id: 'sys', parent: 'ctx-user', children: ['ctx-model'],
+        message: { id: 'sys', author: { role: 'system' }, content: { content_type: 'text', parts: ['system'] } },
+      },
+      'ctx-model': {
+        id: 'ctx-model', parent: 'sys', children: ['thought'],
+        message: { id: 'ctx-model', author: { role: 'assistant' }, content: { content_type: 'model_editable_context', parts: ['internal model context'] } },
+      },
+      thought: {
+        id: 'thought', parent: 'ctx-model', children: ['final'],
+        message: { id: 'thought', author: { role: 'assistant' }, content: { content_type: 'thought', text: 'reasoning' } },
+      },
+      final: {
+        id: 'final', parent: 'thought', children: [],
+        message: { id: 'final', author: { role: 'assistant' }, content: { content_type: 'text', parts: ['final answer'] } },
+      },
+    },
+  });
+  const turns = buildConversationRecordTurns(record);
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0].user.text, 'real question');
+  assert.deepEqual(turns[0].replies.map((reply) => reply.id), ['thought', 'final']);
 });
 
 test('transient thinking indicators stay after tool activity', () => {
@@ -172,6 +530,74 @@ test('message discovery coalesces repeated same-id reasoning updates inside one 
   assert.equal(extractThought(events[0].message), '先分析问题，再继续推理。');
 });
 
+test('message discovery preserves distinct protocol items that reuse one message id', () => {
+  const events = findMessageEvents({
+    conversation_id: 'same-id-events',
+    events: [
+      {
+        response_id: 'response-same-id', output_index: 0, phase: 'reasoning',
+        message: {
+          id: 'shared-message', author: { role: 'assistant' },
+          content: { content_type: 'thought', text: 'reasoning' },
+        },
+      },
+      {
+        response_id: 'response-same-id', output_index: 1, phase: 'commentary',
+        message: {
+          id: 'shared-message', author: { role: 'assistant' },
+          content: { content_type: 'text', parts: ['commentary'] },
+        },
+      },
+      {
+        response_id: 'response-same-id', output_index: 2, phase: 'final',
+        message: {
+          id: 'shared-message', author: { role: 'assistant' },
+          content: { content_type: 'text', parts: ['final'] },
+        },
+      },
+    ],
+  });
+  assert.equal(events.length, 3);
+  assert.deepEqual(events.map((event) => event.outputIndex), [0, 1, 2]);
+  assert.deepEqual(events.map((event) => event.phase), ['reasoning', 'commentary', 'final']);
+});
+
+test('legacy observation merge also refuses to collapse distinct same-id protocol items', () => {
+  const rows = mergeConversationViewObservations([], [
+    {
+      id: 'same-id', role: 'assistant', contentType: 'thought', thought: 'reasoning',
+      responseId: 'response-legacy', outputIndex: 0, phase: 'reasoning',
+    },
+    {
+      id: 'same-id', role: 'assistant', contentType: 'text', text: 'final',
+      responseId: 'response-legacy', outputIndex: 1, phase: 'final',
+    },
+  ]);
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows.map((row) => row.phase), ['reasoning', 'final']);
+});
+
+test('conflicting semantic aliases fail closed instead of falling back to a misleading parent', () => {
+  let record = ingestConversationPayload(null, {
+    id: 'semantic-conflict', current_node: 'a2',
+    mapping: {
+      u1: { id: 'u1', parent: null, children: ['a1'], message: { id: 'u1', author: { role: 'user' }, content: { parts: ['one'] }, metadata: { turn_exchange_id: 'turn-one' } } },
+      a1: { id: 'a1', parent: 'u1', children: ['u2'], message: { id: 'a1', author: { role: 'assistant' }, content: { parts: ['answer one'] } } },
+      u2: { id: 'u2', parent: 'a1', children: ['a2'], message: { id: 'u2', author: { role: 'user' }, content: { parts: ['two'] }, metadata: { turn_exchange_id: 'turn-two' } } },
+      a2: { id: 'a2', parent: 'u2', children: [], message: { id: 'a2', author: { role: 'assistant' }, content: { parts: ['answer two'] } } },
+    },
+  });
+  record = ingestConversationMessage(record, {
+    id: 'conflicted-live', parent_id: 'a1', author: { role: 'assistant' }, content: { parts: ['must stay unresolved'] },
+  }, { turnAliases: ['turn-one', 'turn-two'], observationOrdinal: 1 });
+
+  const turns = buildConversationRecordTurns(record);
+  assert.equal(turns[0].replies.some((item) => item.id === 'conflicted-live'), false);
+  assert.equal(turns[1].replies.some((item) => item.id === 'conflicted-live'), false);
+  assert.equal(turns.at(-1).source, 'unassigned');
+  assert.equal(turns.at(-1).replies[0].id, 'conflicted-live');
+});
+
 test('same-id streamed tool arguments accumulate instead of replacing earlier fragments', () => {
   let record = ingestConversationMessage(null, {
     id: 'tool-call-stream',
@@ -189,7 +615,7 @@ test('same-id streamed tool arguments accumulate instead of replacing earlier fr
   assert.equal(row.tool?.payload?.function?.arguments, '{"query":"SlimGPT","limit":3}');
 });
 
-test('conversation record keeps non-canonical tool observations across short canonical windows', () => {
+test('conversation record keeps non-canonical tool observations in protocol order across short canonical windows', () => {
   const basePayload = {
     id: 'record-c',
     current_node: 'a1',
@@ -211,15 +637,15 @@ test('conversation record keeps non-canonical tool observations across short can
     author: { role: 'assistant' },
     recipient: 'web.run',
     content: { text: '{"query":"one"}' },
-    create_time: 3,
-  });
+    create_time: 300,
+  }, { outputIndex: 0, sequenceNumber: 30, observationOrdinal: 1 });
   record = ingestConversationMessage(record, {
     id: 'tool-live-result-1',
     parent_id: 'tool-live-1',
     author: { role: 'tool', name: 'web.run' },
     content: { parts: ['{"ok":true}'] },
-    create_time: 4,
-  });
+    create_time: 100,
+  }, { outputIndex: 1, sequenceNumber: 10, observationOrdinal: 2 });
   record = ingestConversationPayload(record, {
     id: 'record-c',
     current_node: 'a2',
@@ -227,7 +653,13 @@ test('conversation record keeps non-canonical tool observations across short can
     mapping: {
       a2: {
         id: 'a2', parent: null, children: [],
-        message: { id: 'a2', author: { role: 'assistant' }, content: { parts: ['latest answer'] }, create_time: 5 },
+        message: {
+          id: 'a2',
+          author: { role: 'assistant' },
+          content: { parts: ['latest answer'] },
+          metadata: { output_index: 2, sequence_number: 20 },
+          create_time: 50,
+        },
       },
     },
   });
@@ -401,6 +833,19 @@ test('live streamed messages update in place', () => {
   const second = upsertLiveMessage(first, { id: 'm1', author: { role: 'assistant' }, content: { parts: ['hello'] } });
   assert.equal(second.length, 1);
   assert.equal(second[0].text, 'hello');
+});
+
+test('stable item identity merges progressive snapshots even when transport message ids change', () => {
+  let rows = upsertLiveMessage([], {
+    id: 'snapshot-a', author: { role: 'assistant' }, content: { parts: ['hel'] },
+  }, { itemId: 'item-stable', responseId: 'response-stable', outputIndex: 0 });
+  rows = upsertLiveMessage(rows, {
+    id: 'snapshot-b', author: { role: 'assistant' }, content: { parts: ['hello'] },
+  }, { itemId: 'item-stable', responseId: 'response-stable', outputIndex: 0 });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].id, 'snapshot-b');
+  assert.equal(rows[0].itemId, 'item-stable');
+  assert.equal(rows[0].text, 'hello');
 });
 
 test('tool calls and tool results are classified from message structure, not arbitrary JSON text', () => {

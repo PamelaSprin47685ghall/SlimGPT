@@ -296,7 +296,7 @@
             <MessageBubble message={activeTurn.user} {onBranch} />
           </section>
         {/if}
-        {#each activeTurn.replies as reply (reply.id || reply.nodeId)}
+        {#each activeTurn.replies as reply (reply.observationKey || reply.itemId || reply.id || reply.nodeId)}
           <section class={`turn-message turn-reply role-${reply?.role || 'unknown'}`}>
             <MessageBubble message={reply} {onBranch} />
           </section>

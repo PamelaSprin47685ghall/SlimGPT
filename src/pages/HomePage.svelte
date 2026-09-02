@@ -18,7 +18,8 @@ import {
   THINKING_LEVELS,
 } from '../lib/storage.js';
   import {
-    buildConversationRecordView,
+    bindConversationTurnUser,
+    buildConversationRecordTurns,
     buildConversationView,
     contentToText,
     consumeSse,
@@ -31,7 +32,6 @@ import {
     findMessageEvents,
     fingerprintCapture,
     getToolMessageInfo,
-    groupConversationTurns,
     hydrateConversationObservations,
     ingestConversationMessage,
     ingestConversationPayload,
@@ -67,6 +67,7 @@ import {
   let persistQueued = false;
   let sendTimer = null;
   let navigationTimer = null;
+  let observationOrdinal = 0;
   let userSettings = $state({ ...DEFAULT_SETTINGS });
   let thinkingLevelOverride = $state(null);
   let workStates = $state(new Map());
@@ -88,29 +89,21 @@ import {
   ));
   const currentMeta = $derived(currentConversationId ? conversationMap.get(currentConversationId) : null);
   const displayConversationId = $derived(currentConversationId);
-  const messages = $derived.by(() => {
+  const turns = $derived.by(() => {
     const id = displayConversationId;
     if (!id) return [];
     const record = conversationRecords.get(id) || null;
-    let rows = record ? buildConversationRecordView(record) : [];
-    if (pendingUser && pendingUser.conversationId === id) rows.push(pendingUser.message);
-    // De-duplicate by id while keeping order; guard against overlapping graph
-    // and independently observed versions of the same message.
-    const seen = new Set();
-    rows = rows.filter((row) => {
-      const key = row?.id || row?.nodeId;
-      if (key && seen.has(key)) return false;
-      if (key) seen.add(key);
-      return true;
-    });
-    return rows;
+    const pending = pendingUser?.conversationId === id ? pendingUser.message : null;
+    return buildConversationRecordTurns(record, pending);
   });
-  const turns = $derived(groupConversationTurns(messages));
+  const messages = $derived(turns.flatMap((turn) => [turn.user, ...(turn.replies || [])].filter(Boolean)));
   const liveConnected = $derived(status.bridgeReady && status.captureMode === 'page');
   const statusState = $derived(status.bridgeError ? 'error' : (liveConnected ? 'online' : 'offline'));
   const statusLabel = $derived(status.bridgeError ? '连接失败' : (liveConnected ? (status.takeover === false ? '已连接' : '已接管') : '连接中'));
-  const conversationPending = $derived(Boolean(currentConversationId && !currentHasRenderableContent));
-  const conversationTimedOut = $derived(Boolean(conversationPending && navigationTimedOutId === currentConversationId));
+  const conversationHistoryPending = $derived(Boolean(currentConversationId && !currentRecord?.canonicalComplete));
+  const conversationPending = $derived(Boolean(conversationHistoryPending && navigationTimedOutId !== currentConversationId));
+  const conversationBlockingLoad = $derived(Boolean(conversationHistoryPending && !messages.length));
+  const conversationTimedOut = $derived(Boolean(conversationHistoryPending && navigationTimedOutId === currentConversationId));
   const conversationWorkState = $derived(
     sendInFlight
       ? 'starting'
@@ -348,7 +341,7 @@ import {
         const scope = resolveCapturedConversation(capture, conversation.id);
         if (!scope.conflicted && scope.conversationId) {
           maybeActivateCapturedConversation(scope.conversationId, capture);
-          acceptConversationPayload(scope.conversationId, conversation);
+          acceptConversationPayload(scope.conversationId, conversation, capture);
         }
         return;
       }
@@ -372,7 +365,7 @@ import {
       const scope = resolveCapturedConversation(capture, conversationIdFromPayload(conversation));
       if (!scope.conflicted && scope.conversationId) {
         maybeActivateCapturedConversation(scope.conversationId, capture);
-        acceptConversationPayload(scope.conversationId, conversation);
+        acceptConversationPayload(scope.conversationId, conversation, capture);
       }
       return;
     }
@@ -398,20 +391,60 @@ import {
       if (scope.conflicted || !scope.conversationId) continue;
       const id = scope.conversationId;
       maybeActivateCapturedConversation(id, capture);
+      bindPendingTurnIdentity(id, capture);
+      const turnAliases = [...new Set([
+        ...(event.turnAliases || []),
+        ...(capture.turnAliases || []),
+      ].filter(Boolean))];
       const next = new Map(conversationRecords);
       next.set(id, ingestConversationMessage(next.get(id), event.message, {
         textMode: capture.transport === 'dom' ? 'snapshot' : 'progressive',
+        semanticTurnId: event.turnId || capture.turnId || null,
+        turnAliases,
+        transportTurnId: capture.transportTurnId || null,
+        turnUserMessageId: capture.turnUserMessageId || event.turnUserMessageId || null,
+        turnParentMessageId: capture.turnParentMessageId || event.turnParentMessageId || null,
+        captureId: capture.requestId || null,
+        captureTransport: capture.transport || null,
+        observationOrdinal: ++observationOrdinal,
+        sequenceNumber: event.sequenceNumber ?? null,
+        outputIndex: event.outputIndex ?? null,
+        responseId: event.responseId || null,
+        itemId: event.itemId || null,
+        callId: event.callId || null,
+        toolCallId: event.toolCallId || null,
+        phase: event.phase || null,
+        channel: event.channel || null,
+        eventType: event.eventType || null,
       }));
       conversationRecords = next;
       schedulePersist();
       updateConversationPreviewFromMessage(id, event.message);
       if (id === currentConversationId) {
-        if (hasRenderableConversationContent(id) && (loadingConversationId === id || navigationTimedOutId === id)) {
-          finishConversationLoading();
-        }
         reconcilePending(id, event.message);
       }
     }
+  }
+
+  function bindPendingTurnIdentity(id, capture) {
+    if (!pendingUser || !(capture?.turnId || capture?.transportTurnId || capture?.turnUserMessageId)) return;
+    if (pendingUser.conversationId && pendingUser.conversationId !== id) return;
+    pendingUser = {
+      ...pendingUser,
+      conversationId: pendingUser.conversationId || id,
+      turnId: capture.turnId || pendingUser.turnId || null,
+      turnAliases: capture.turnAliases || pendingUser.turnAliases || [],
+      transportTurnId: capture.transportTurnId || pendingUser.transportTurnId || null,
+      userMessageId: capture.turnUserMessageId || pendingUser.userMessageId || null,
+      message: {
+        ...pendingUser.message,
+        turnId: capture.turnId || pendingUser.message?.turnId || null,
+        turnAliases: capture.turnAliases || pendingUser.message?.turnAliases || [],
+        transportTurnId: capture.transportTurnId || pendingUser.message?.transportTurnId || null,
+        turnUserMessageId: capture.turnUserMessageId || pendingUser.message?.turnUserMessageId || null,
+        turnParentMessageId: capture.turnParentMessageId || pendingUser.message?.turnParentMessageId || null,
+      },
+    };
   }
 
   function resolveCapturedConversation(capture, explicitConversationId = null, explicitConflict = false) {
@@ -465,6 +498,7 @@ import {
   }
 
   function maybeActivateCapturedConversation(id, capture) {
+    bindPendingTurnIdentity(id, capture);
     if (id === currentConversationId) return;
     if (currentConversationId) return;
     if (
@@ -475,9 +509,11 @@ import {
     }
   }
 
-  function acceptConversationPayload(id, payload) {
+  function acceptConversationPayload(id, payload, capture = {}) {
     const nextRecords = new Map(conversationRecords);
-    const record = ingestConversationPayload(nextRecords.get(id), payload);
+    const record = ingestConversationPayload(nextRecords.get(id), payload, {
+      canonicalComplete: capture.canonicalComplete === true,
+    });
     const mergedPayload = record.payload;
     nextRecords.set(id, record);
 
@@ -514,7 +550,7 @@ import {
       model: details.model,
     }, previous));
     conversationMap = next;
-    if (loadingConversationId === id) finishConversationLoading();
+    if (record.canonicalComplete && loadingConversationId === id) finishConversationLoading();
     reconcilePendingAgainstPayload(id, mergedPayload);
     schedulePersist();
   }
@@ -615,13 +651,13 @@ import {
     clearTimeout(navigationTimer);
     navigationTimer = null;
     navigationTimedOutId = null;
-    if (!id || hasRenderableConversationContent(id)) {
+    if (!id || conversationRecords.get(id)?.canonicalComplete) {
       loadingConversationId = null;
       return;
     }
     loadingConversationId = id;
     navigationTimer = setTimeout(() => {
-      if (loadingConversationId !== id || hasRenderableConversationContent(id)) return;
+      if (loadingConversationId !== id || conversationRecords.get(id)?.canonicalComplete) return;
       loadingConversationId = null;
       navigationTimedOutId = id;
       navigationTimer = null;
@@ -775,7 +811,10 @@ import {
       return;
     }
     const text = rawMessage?.content?.parts?.filter((part) => typeof part === 'string').join('\n') || '';
-    if (text.trim() === pendingUser.text.trim()) pendingUser = null;
+    if (text.trim() === pendingUser.text.trim()) {
+      bindPendingTurnToUser(id, rawMessage.id);
+      pendingUser = null;
+    }
   }
 
   function reconcilePendingAgainstPayload(id, payload) {
@@ -784,10 +823,20 @@ import {
       if (node?.message?.author?.role !== 'user') continue;
       const text = (node.message.content?.parts || []).filter((part) => typeof part === 'string').join('\n');
       if (text.trim() === pendingUser.text.trim()) {
+        bindPendingTurnToUser(id, node.message.id || node.id);
         pendingUser = null;
         return;
       }
     }
+  }
+
+  function bindPendingTurnToUser(id, userMessageId) {
+    const turnId = pendingUser?.turnId || pendingUser?.message?.turnId;
+    if (!id || !turnId || !userMessageId) return;
+    const next = new Map(conversationRecords);
+    next.set(id, bindConversationTurnUser(next.get(id), turnId, userMessageId));
+    conversationRecords = next;
+    schedulePersist();
   }
 
   function setConversationWorkState(id, state) {
@@ -1055,7 +1104,7 @@ import {
             onActiveChange={(index) => activeTurnIndex = index}
             onBranch={stepBranch}
           />
-        {:else if !conversationPending}
+        {:else if !conversationHistoryPending}
           <div class="empty-state">
             <div class="empty-logo">S</div>
             <h2>更轻的 ChatGPT 界面</h2>
@@ -1063,15 +1112,19 @@ import {
           </div>
         {/if}
 
-        {#if conversationPending}
+        {#if conversationBlockingLoad}
           <div class="conversation-loading" role="status" aria-live="polite">
             <span class="conversation-loading-spinner" aria-hidden="true"></span>
             <strong>{conversationTimedOut ? '对话暂未加载' : '正在加载对话'}</strong>
-            <span>{conversationTimedOut ? '可重新点击侧栏中的该会话重试' : (currentMeta?.title || '正在同步 ChatGPT 会话…')}</span>
+            <span>{conversationTimedOut ? '完整历史尚未同步；可重新点击侧栏中的该会话重试' : (currentMeta?.title || '正在同步 ChatGPT 完整会话…')}</span>
+          </div>
+        {:else if conversationHistoryPending}
+          <div class="history-sync-notice" role="status" aria-live="polite">
+            {conversationTimedOut ? '完整历史同步暂未完成；当前仅显示已确认属于本轮的实时内容。' : '正在补齐完整历史；局部窗口不会被当作会话开头。'}
           </div>
         {/if}
 
-        {#if conversationWorkState === 'running' && !conversationPending}
+        {#if conversationWorkState === 'running' && !conversationBlockingLoad}
           <div class="work-indicator" role="status" aria-live="polite">
             <span class="work-indicator-spinner" aria-hidden="true"></span>
             <span>对话执行中：已观测到官方页面仍在生成或服务端 turn 尚未结束…</span>

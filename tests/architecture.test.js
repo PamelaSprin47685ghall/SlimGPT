@@ -76,3 +76,60 @@ test('page synchronization is event-driven instead of interval-polled', async ()
   assert.equal(source.includes('xhr.addEventListener("progress"'), true);
   assert.equal(source.includes('transport: "dom"'), true);
 });
+
+test('official slow stream consumers are terminated locally without redefining logical turn completion', async () => {
+  const mitm = await readFile('main-mitm.js', 'utf8');
+  const home = await readFile('src/pages/HomePage.svelte', 'utf8');
+  const cloneAt = mitm.indexOf('clone = response.clone()');
+  const divertAt = mitm.indexOf('return divertOfficialStream ? completeOfficialStream(response) : response');
+  assert.ok(cloneAt >= 0 && divertAt > cloneAt, 'SlimGPT must clone and own the real stream before terminating the official parser');
+  assert.ok(mitm.includes('new Response("data: [DONE]\\n\\n"'), 'the official consumer should receive a synthetic local terminal frame');
+  assert.ok(mitm.includes('event.stopImmediatePropagation()'), 'heavy official websocket conversation parsing should be cut off');
+  assert.ok(home.includes('[DONE] terminates this SSE segment only'), 'synthetic/transport DONE must not become logical turn completion');
+  assert.ok(mitm.includes("emitExecutionState('stopped', 'ws-turn-stopped'"), 'logical stop should follow the server conversation lifecycle');
+});
+
+test('generated and header turn traces stay transport-only while body metadata supplies semantic turn identity', async () => {
+  const source = await readFile('main-mitm.js', 'utf8');
+  assert.ok(source.includes('transportTurnId: request?.headers?.get?.("x-oai-turn-trace-id") || null'));
+  assert.ok(source.includes('session.transportTurnId = session.sessionId'));
+  assert.ok(source.includes('turnId: null'));
+  assert.ok(source.includes('metadata.turn_exchange_id'));
+  assert.ok(source.includes('metadata.turn_trace_id'));
+  assert.equal(source.includes('turnId: nextTurnSessionId()'), false);
+});
+
+test('intercepted turn sessions survive transport boundaries and clean up on server lifecycle completion', async () => {
+  const source = await readFile('main-mitm.js', 'utf8');
+  const captureStart = source.indexOf('async function captureReadableStream');
+  const captureEnd = source.indexOf('function isExecutionStreamUrl', captureStart);
+  const captureBlock = source.slice(captureStart, captureEnd);
+  assert.equal(captureBlock.includes('releaseTurnSession('), false, 'SSE completion must not release the logical turn session');
+  assert.ok(captureBlock.includes('queueCanonicalConversation(captureMeta.conversationId)'), 'stream close should event-drive canonical reconciliation');
+  assert.ok(source.includes('snapshotActiveTurn(conversationScope)'), 'resume requests must inherit the active logical turn');
+  assert.ok(source.includes("emitExecutionState('stopped', 'ws-turn-stopped'"));
+  assert.ok(source.includes('activeTurnSessions.delete(conversationId)'), 'server turn completion must release the active session');
+  assert.ok(source.includes('notificationMatchesTurnSession(notification, activeSession)'), 'a delayed stop notification must not delete a semantically different active turn');
+  assert.ok(source.includes('adoptNotificationTurnIdentity(conversationId, notification)'), 'server semantic turn aliases should enrich the active session for later resume');
+  assert.ok(source.includes('bindPendingTurnSession(conversationId)'), 'new-chat transport sessions must bind when the official route acquires its conversation id');
+});
+
+test('canonical pagination never publishes a partial history when an older cursor fails', async () => {
+  const source = await readFile('main-mitm.js', 'utf8');
+  const fetchStart = source.indexOf('async function fetchCanonicalConversationPages');
+  const fetchEnd = source.indexOf('async function fetchLegacyCanonicalConversation', fetchStart);
+  const fetchBlock = source.slice(fetchStart, fetchEnd);
+  assert.ok(fetchBlock.includes('if (!response.ok)'));
+  assert.ok(fetchBlock.includes('if (!pages.length) return fetchLegacyCanonicalConversation(conversationId, headers);'));
+  assert.ok(fetchBlock.includes('return [];'), 'a failed older page must discard the partial page chain');
+  assert.ok(fetchBlock.includes('if (!cursor || seenCursors.has(cursor)) return [];'), 'broken cursor chains must also remain incomplete');
+
+  const syncStart = source.indexOf('async function fetchCanonicalConversation(conversationId)');
+  const syncEnd = source.indexOf('async function fetchCanonicalConversationPages', syncStart);
+  const syncBlock = source.slice(syncStart, syncEnd);
+  const emptyGuard = syncBlock.indexOf('if (!pages.length) return;');
+  const publishAt = syncBlock.indexOf('canonicalComplete: index === ordered.length - 1');
+  const dequeueAt = syncBlock.indexOf('pendingCanonicalIds.delete(conversationId)');
+  assert.ok(emptyGuard >= 0 && publishAt > emptyGuard, 'canonical pages may only publish after a complete non-empty chain exists');
+  assert.ok(dequeueAt > emptyGuard, 'failed history must remain queued for a later event-driven retry');
+});
