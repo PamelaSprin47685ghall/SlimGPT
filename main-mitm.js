@@ -27,6 +27,10 @@
   const RESUME_PATH = "/backend-api/f/conversation/resume";
   const RECONNECT_STORM_WINDOW_MS = 15_000;
   const RECONNECT_STORM_LIMIT = 6;
+  const EXECUTION_DOM_SETTLE_MS = 220;
+  const EXECUTION_SUBMISSION_GRACE_MS = 1_200;
+  const NEW_CHAT_EXECUTION_KEY = "__slimgpt_new_chat__";
+  const MAX_EXECUTION_STATES = 256;
   const CONVERSATION_INDEX_PAGE_SIZE = 100;
   const MAX_SYNCED_CONVERSATIONS = 500;
   const CONVERSATION_INDEX_REFRESH_MS = 30_000;
@@ -55,8 +59,15 @@
   let conversationSocketState = null;
   let observedLocationHref = location.href;
   let preserveDomConversationOwnership = () => {};
+  let executionObserver = null;
+  let executionScanTimer = null;
+  let executionIdleTimer = null;
+  let executionIdleCandidateKey = null;
   const canonicalFetches = new Map();
   const pendingCanonicalIds = new Set();
+  const executionStates = new Map();
+  const lastDomRunningAt = new Map();
+  const lastExecutionStoppedAt = new Map();
   const observedFetchResponses = new WeakSet();
   const XHR_RESPONSE_OBSERVED = Symbol("slimgpt-xhr-response-observed");
   const WEBSOCKET_OBSERVED = Symbol("slimgpt-websocket-observed");
@@ -93,6 +104,7 @@
   installFocusGuard();
   installCompleteResponse();
   installDomMessageObserver();
+  installExecutionStateObserver();
   installBlockerObserver();
   scheduleInitialTakeover();
 
@@ -352,6 +364,162 @@
       clearTimeout(scanTimer);
       observer?.disconnect();
     }, { once: true });
+  }
+
+  function executionKey(conversationId) {
+    return conversationId || NEW_CHAT_EXECUTION_KEY;
+  }
+
+  function executionConversationIdFromUrl(rawUrl = location.href) {
+    return conversationIdFromUrl(rawUrl) || null;
+  }
+
+  function emitExecutionState(state, source, conversationId = executionConversationIdFromUrl(), extra = {}) {
+    if (!['running', 'stopped', 'unknown'].includes(state)) return;
+    const key = executionKey(conversationId);
+    const now = Date.now();
+    const previous = executionStates.get(key) || null;
+
+    if (state === 'stopped' && source === 'dom-composer-ready' && previous?.state === 'running') {
+      const domRunningAt = lastDomRunningAt.get(key) || 0;
+      const stoppedAt = lastExecutionStoppedAt.get(key) || 0;
+      const witnessedThisRun = domRunningAt > stoppedAt;
+      const submissionGrace = ['submission-accepted', 'sse-active'].includes(previous.source) &&
+        now - previous.observedAt < EXECUTION_SUBMISSION_GRACE_MS;
+      const authoritativeServerRun = previous.source === 'ws-turn-running' && !witnessedThisRun;
+      if (submissionGrace || authoritativeServerRun) {
+        scheduleExecutionStateScan(Math.max(EXECUTION_DOM_SETTLE_MS, EXECUTION_SUBMISSION_GRACE_MS - (now - previous.observedAt)));
+        return;
+      }
+    }
+
+    if (state === 'running' && source === 'dom-stop-control') lastDomRunningAt.set(key, now);
+    if (state === 'stopped') lastExecutionStoppedAt.set(key, now);
+
+    const next = {
+      state,
+      source,
+      observedAt: now,
+      conversationId,
+      url: location.href,
+    };
+    executionStates.set(key, next);
+    if (executionStates.size > MAX_EXECUTION_STATES) {
+      for (const candidateKey of executionStates.keys()) {
+        if (candidateKey === key) continue;
+        executionStates.delete(candidateKey);
+        lastDomRunningAt.delete(candidateKey);
+        lastExecutionStoppedAt.delete(candidateKey);
+        break;
+      }
+    }
+    if (previous?.state === state && previous?.source === source) return;
+    emit({
+      type: 'page-execution-state',
+      state,
+      source,
+      timestamp: now,
+      url: location.href,
+      ...(conversationId ? { conversationId } : {}),
+      ...extra,
+    });
+  }
+
+  function markExecutionUnknownIfActive(conversationId, source) {
+    const current = executionStates.get(executionKey(conversationId));
+    if (current?.state === 'running') emitExecutionState('unknown', source, conversationId);
+  }
+
+  function installExecutionStateObserver() {
+    const schedule = () => scheduleExecutionStateScan();
+    const mount = () => {
+      if (!document.documentElement || executionObserver) return;
+      executionObserver = new MutationObserver(schedule);
+      executionObserver.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['aria-label', 'aria-disabled', 'data-testid', 'data-composer-submit', 'disabled', 'hidden'],
+      });
+      scheduleExecutionStateScan(0);
+    };
+    if (document.documentElement) mount();
+    else new MutationObserver((_, observer) => {
+      if (!document.documentElement) return;
+      observer.disconnect();
+      mount();
+    }).observe(document, { childList: true, subtree: true });
+    addEventListener('popstate', () => scheduleExecutionStateScan(0));
+    addEventListener('pagehide', () => {
+      clearTimeout(executionScanTimer);
+      clearTimeout(executionIdleTimer);
+      executionObserver?.disconnect();
+      executionObserver = null;
+    }, { once: true });
+  }
+
+  function scheduleExecutionStateScan(delay = 45) {
+    clearTimeout(executionScanTimer);
+    executionScanTimer = setTimeout(() => {
+      executionScanTimer = null;
+      scanExecutionState();
+    }, Math.max(0, delay));
+  }
+
+  function scanExecutionState() {
+    const composer = findComposerElement();
+    if (!composer) return;
+    const conversationId = executionConversationIdFromUrl();
+    const key = executionKey(conversationId);
+    if (findExecutionStopControl(composer)) {
+      clearTimeout(executionIdleTimer);
+      executionIdleTimer = null;
+      executionIdleCandidateKey = null;
+      emitExecutionState('running', 'dom-stop-control', conversationId);
+      return;
+    }
+
+    if (executionIdleCandidateKey !== key) {
+      clearTimeout(executionIdleTimer);
+      executionIdleCandidateKey = key;
+      executionIdleTimer = setTimeout(() => {
+        executionIdleTimer = null;
+        executionIdleCandidateKey = null;
+        const currentComposer = findComposerElement();
+        if (!currentComposer) return;
+        const currentConversationId = executionConversationIdFromUrl();
+        if (executionKey(currentConversationId) !== key || findExecutionStopControl(currentComposer)) return;
+        emitExecutionState('stopped', 'dom-composer-ready', currentConversationId);
+      }, EXECUTION_DOM_SETTLE_MS);
+    }
+  }
+
+  function findExecutionStopControl(composer) {
+    const form = composer.closest?.('form');
+    const roots = [];
+    if (form) roots.push(form);
+    let ancestor = form || composer.parentElement;
+    for (let depth = 0; ancestor && ancestor !== document.body && depth < 3; depth += 1) {
+      if (!roots.includes(ancestor)) roots.push(ancestor);
+      ancestor = ancestor.parentElement;
+    }
+    if (!roots.length && composer.parentElement) roots.push(composer.parentElement);
+
+    for (const root of roots) {
+      for (const button of root.querySelectorAll?.('button') || []) {
+        if (!(button instanceof HTMLButtonElement)) continue;
+        if (button.hidden || button.getAttribute('aria-hidden') === 'true') continue;
+        const testId = String(button.getAttribute('data-testid') || '').trim();
+        const label = [
+          button.getAttribute('aria-label'),
+          button.getAttribute('title'),
+          button.textContent,
+        ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+        if (/^(?:stop|cancel)(?:[-_ ].*)?$/i.test(testId)) return button;
+        if (/^(?:stop(?: generating| generation| response| response generation| streaming| thinking)?|cancel(?: generation| response| streaming)?|停止(?:生成|回答|回复|思考)?|取消(?:生成|回答|回复|思考)?)[.!。…\s]*$/i.test(label)) return button;
+      }
+    }
+    return null;
   }
 
   function wrapFetch(upstreamFetch) {
@@ -709,13 +877,16 @@
         type: "page-stream-status",
         transport: "sse",
         phase: "complete",
-        state: "idle",
+        state: "connected",
         ...(conversationId && !conversationIdConflict ? { conversationId } : {}),
         timestamp: Date.now(),
       });
       return;
     }
     session.needsReconnect = true;
+    if (conversationId && !conversationIdConflict) {
+      markExecutionUnknownIfActive(conversationId, 'sse-disconnected');
+    }
     emit({
       type: "page-stream-status",
       transport: "sse",
@@ -867,6 +1038,9 @@
     const decoder = new TextDecoder();
     const { onClose, cancelSignal, ...unresolvedMeta } = meta;
     const captureMeta = await resolveCaptureMeta(unresolvedMeta);
+    if (captureMeta.conversationId && isExecutionStreamUrl(captureMeta.url)) {
+      emitExecutionState('running', 'sse-active', captureMeta.conversationId);
+    }
     const cancelReader = () => { void reader.cancel().catch(() => {}); };
     if (cancelSignal?.aborted) cancelReader();
     else cancelSignal?.addEventListener("abort", cancelReader, { once: true });
@@ -920,6 +1094,15 @@
       } catch {
         // Transport recovery must never escape into the observed request.
       }
+    }
+  }
+
+  function isExecutionStreamUrl(rawUrl) {
+    try {
+      const url = new URL(String(rawUrl || ''), location.href);
+      return url.origin === location.origin && /^\/backend-api\/(?:f\/)?conversation(?:\/resume)?$/.test(url.pathname);
+    } catch {
+      return false;
     }
   }
 
@@ -1378,6 +1561,11 @@
         url: publicUrl,
         timestamp: Date.now(),
       });
+      for (const [key, execution] of executionStates) {
+        if (execution?.state !== 'running' || execution?.source !== 'ws-turn-running') continue;
+        const conversationId = key === NEW_CHAT_EXECUTION_KEY ? null : key;
+        markExecutionUnknownIfActive(conversationId, 'websocket-disconnected');
+      }
       scheduleConversationSocketReconnect(state);
     });
 
@@ -1402,14 +1590,17 @@
       event.stopImmediatePropagation();
       for (const notification of notifications) {
         const conversationId = notification.conversationId;
-        const stateValue = /turn-(?:complete|completed|finished)$/.test(notification.type)
-          ? "idle"
-          : (/turn-(?:start|started|in-progress)$/.test(notification.type) ? "working" : null);
+        const stateValue = notificationExecutionState(notification);
+        if (conversationId && stateValue === 'running') {
+          emitExecutionState('running', 'ws-turn-running', conversationId, { phase: notification.type });
+        } else if (conversationId && stateValue === 'stopped') {
+          emitExecutionState('stopped', 'ws-turn-stopped', conversationId, { phase: notification.type });
+        }
         emit({
           type: "page-stream-status",
           transport: "websocket",
           phase: notification.type,
-          ...(stateValue ? { state: stateValue } : {}),
+          ...(stateValue ? { state: stateValue === 'running' ? 'working' : 'idle' } : {}),
           conversationId,
           timestamp: Date.now(),
         });
@@ -1440,9 +1631,23 @@
       notifications.push({
         type: String(payload.type || eventPayload.type || "conversation-update"),
         conversationId: eventPayload.conversation_id || eventPayload.conversationId || null,
+        status: String(eventPayload.status || payload.status || ''),
       });
     }
     return notifications;
+  }
+
+  function notificationExecutionState(notification) {
+    const type = String(notification?.type || '').toLowerCase().replace(/_/g, '-');
+    const status = String(notification?.status || '').toLowerCase().replace(/_/g, '-');
+    const combined = `${type} ${status}`;
+    if (/(?:turn|generation|response).*(?:complete|completed|finished|done|stopped|cancelled|canceled|failed)\b/.test(combined)) {
+      return 'stopped';
+    }
+    if (/(?:turn|generation|response).*(?:start|started|in-progress|running|resumed|resume)\b/.test(combined)) {
+      return 'running';
+    }
+    return null;
   }
 
   function scheduleConversationSocketReconnect(state = conversationSocketState) {
@@ -1566,6 +1771,7 @@
       resetResumeSession();
     }
     emit({ type: "page-location", url: location.href });
+    scheduleExecutionStateScan(0);
   }
 
   const nativePushState = history.pushState;
@@ -1907,6 +2113,7 @@
     const composer = findComposerElement();
     if (!composer || !hasReactBinding(composer)) return false;
     officialUiHydrated = true;
+    scheduleExecutionStateScan(0);
     if (renderSleepRequested && takeoverActive) scheduleRenderSleep(0);
     return true;
   }
@@ -2178,6 +2385,7 @@
     if (pendingSendConfirmation) pendingSendConfirmation.finish(false);
     return new Promise((resolve) => {
       let timer = null;
+      const conversationId = executionConversationIdFromUrl();
       const observer = new MutationObserver(() => {
         if (officialDomTextFor(submittedText)) finish(true);
         else if (findBlockingOfficialUi()) finish(false);
@@ -2188,10 +2396,15 @@
         clearTimeout(timer);
         observer.disconnect();
         if (pendingSendConfirmation === pending) pendingSendConfirmation = null;
+        if (confirmed) {
+          emitExecutionState('running', 'submission-accepted', conversationId);
+          scheduleExecutionStateScan(0);
+        }
         resolve(confirmed);
       };
       const pending = {
         submittedText,
+        conversationId,
         settled: false,
         acceptedReason: null,
         finish,

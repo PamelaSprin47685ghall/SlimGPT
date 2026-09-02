@@ -14,6 +14,7 @@ import {
   getToolMessageInfo,
   groupConversationTurns,
   hasNonTextExtras,
+  mergeConversationPayload,
   messageNodeToView,
   parseWebMobilePartialConversation,
   resolveConversationScope,
@@ -82,6 +83,64 @@ test('SSE parser preserves partial chunks', () => {
 test('payload/list discovery tolerates wrappers', () => {
   assert.equal(findConversationPayload({ data: { value: payload } }), payload);
   assert.equal(extractConversationItems({ data: { items: [{ id: 'c1', title: 'One', update_time: 2 }] } })[0].title, 'One');
+});
+
+test('partial conversation payloads extend cached history instead of replacing it', () => {
+  const partial = {
+    id: 'conv-1',
+    current_node: 'a4',
+    metadata: { source: 'web-mobile-partial' },
+    mapping: {
+      u3: {
+        id: 'u3',
+        parent: null,
+        children: ['a4'],
+        message: { id: 'm-u3', author: { role: 'user' }, content: { parts: ['new question'] } },
+      },
+      a4: {
+        id: 'a4',
+        parent: 'u3',
+        children: [],
+        message: { id: 'm-a4', author: { role: 'assistant' }, content: { parts: ['new answer'] } },
+      },
+    },
+  };
+
+  const merged = mergeConversationPayload(payload, partial);
+  assert.equal(merged.mapping.u3.parent, 'a2');
+  assert.ok(merged.mapping.a2.children.includes('u3'));
+  assert.equal(merged.current_node, 'a4');
+  assert.deepEqual(
+    buildConversationView(merged).map((message) => message.text),
+    ['hello', 'branch two', 'new question', 'new answer'],
+  );
+});
+
+test('late partial payloads cannot move the active conversation backwards or onto a stale branch', () => {
+  const stalePartial = {
+    id: 'conv-1',
+    current_node: 'a1',
+    metadata: { source: 'web-mobile-partial' },
+    mapping: {
+      u1: {
+        id: 'u1',
+        parent: null,
+        children: ['a1'],
+        message: { id: 'm-u1', author: { role: 'user' }, content: { parts: ['hello'] } },
+      },
+      a1: {
+        id: 'a1',
+        parent: 'u1',
+        children: [],
+        message: { id: 'm-a1', author: { role: 'assistant' }, content: { parts: ['branch one'] } },
+      },
+    },
+  };
+
+  const merged = mergeConversationPayload(payload, stalePartial);
+  assert.equal(merged.current_node, 'a2');
+  assert.deepEqual(buildConversationView(merged).map((message) => message.text), ['hello', 'branch two']);
+  assert.equal(merged.mapping.u1.parent, 'root');
 });
 
 test('message discovery carries the enclosing conversation identity into nested events', () => {

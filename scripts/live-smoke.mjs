@@ -215,6 +215,7 @@ async function runFixtureSmoke(browser, extensionId) {
     const state = await ui.evaluate(uiStateExpression());
     return state.title === 'Fixture conversation' && state.messages.includes('Fixture answer');
   });
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).sidebarWorkState === 'stopped');
   await waitFor(async () => (await ui.evaluate(uiStateExpression())).mathNodes > 0);
   const canonicalUi = await ui.evaluate(uiStateExpression());
   assert.equal(canonicalUi.highlightedString, '"ok"', 'incremental Markdown renderer must emit valid, escaped string tokens');
@@ -225,6 +226,7 @@ async function runFixtureSmoke(browser, extensionId) {
   assert.equal(canonicalUi.activeOverview, '60', 'a newly opened conversation should start at the latest turn');
   assert.ok(canonicalUi.modelLabel.toLowerCase().includes('gpt-5'), 'enhanced history must surface the captured model');
   assert.ok(canonicalUi.historyPreview.includes('Fixture answer'), 'enhanced history must surface the latest message preview');
+  assert.equal(canonicalUi.sidebarWorkState, 'stopped', 'an hydrated composer with no stop control is direct idle evidence');
   await sleep(700);
   const persistedIndex = await ui.evaluate(`JSON.parse(localStorage.getItem('slimgpt:conversation-index:v1') || '[]')`);
   assert.deepEqual(Object.keys(persistedIndex[0]).sort(), ['create_time', 'id', 'last', 'model', 'route', 'title', 'update_time']);
@@ -524,7 +526,26 @@ async function runFixtureSmoke(browser, extensionId) {
   await ui.evaluate(`document.querySelector('.sidebar-scrim')?.click()`);
   await waitFor(async () => !(await ui.evaluate(`document.querySelector('.sidebar-host')?.classList.contains('open') || false`)));
 
-  await ui.evaluate(`[...document.querySelectorAll('.mobile-navbar .button')].find((button) => button.textContent.includes('概览'))?.click()`);
+  await ui.evaluate(`(() => {
+    const button = [...document.querySelectorAll('.mobile-navbar .button')].find((node) => node.textContent.includes('概览'));
+    if (!button) return false;
+    button.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerId: 11, pointerType: 'touch', isPrimary: true, clientX: 360, clientY: 24 }));
+    button.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerId: 11, pointerType: 'touch', isPrimary: true, clientX: 320, clientY: 24 }));
+    return true;
+  })()`);
+  await sleep(80);
+  assert.equal(
+    await ui.evaluate(`document.querySelector('.overview-host')?.classList.contains('open') || false`),
+    false,
+    'a mobile swipe/drag across the overview control must not open the drawer',
+  );
+  await ui.evaluate(`(() => {
+    const button = [...document.querySelectorAll('.mobile-navbar .button')].find((node) => node.textContent.includes('概览'));
+    if (!button) return false;
+    button.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerId: 12, pointerType: 'touch', isPrimary: true, clientX: 350, clientY: 24 }));
+    button.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerId: 12, pointerType: 'touch', isPrimary: true, clientX: 352, clientY: 25 }));
+    return true;
+  })()`);
   await waitFor(async () => await ui.evaluate(`document.querySelector('.overview-host')?.classList.contains('open') || false`));
   assert.equal(await ui.evaluate(`document.querySelector('.sidebar-host')?.classList.contains('open') || false`), false);
   await ui.evaluate(`document.querySelector('.sidebar-scrim')?.click()`);
@@ -696,8 +717,33 @@ async function runFixtureSmoke(browser, extensionId) {
   await ui.evaluate(fillAndSubmitExpression(submittedText));
   await waitFor(async () => (await top.evaluate(`window.__slimgptSubmitted || ''`)) === submittedText);
   await waitFor(async () => (await ui.evaluate(uiStateExpression())).draft === '');
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).sidebarWorkState === 'running');
   const sendSuccess = await ui.evaluate(uiStateExpression());
   assert.equal(sendSuccess.composerStatus, '消息已发送（官方已确认）', 'composer success requires the page-world send confirmation, not just the click');
+  assert.equal(sendSuccess.sidebarWorkState, 'running', 'a visible official stop control must be treated as direct running evidence');
+
+  await top.evaluate(`fetch('/backend-api/messages/misleading-terminal').then((response) => response.json())`);
+  await sleep(180);
+  assert.equal(
+    (await ui.evaluate(uiStateExpression())).sidebarWorkState,
+    'running',
+    'a terminal-looking assistant message must not override direct running evidence',
+  );
+
+  await top.evaluate(`(() => {
+    const form = document.getElementById('fixture-composer');
+    form?.querySelector('[data-testid="stop-button"]')?.remove();
+    const send = form?.querySelector('[data-composer-submit]');
+    if (send) send.hidden = false;
+  })()`);
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).sidebarWorkState === 'stopped');
+  await top.evaluate(`fetch('/backend-api/messages/stale-running').then((response) => response.json())`);
+  await sleep(180);
+  assert.equal(
+    (await ui.evaluate(uiStateExpression())).sidebarWorkState,
+    'stopped',
+    'a stale in-progress assistant event must not resurrect a stopped turn',
+  );
 
   await top.evaluate(`(() => {
     window.__slimgptContinueClicks = 0;
@@ -1014,6 +1060,16 @@ async function runFixtureSmoke(browser, extensionId) {
   assert.equal(restoredSmokeState.messages.includes('Ambiguous stale answer'), false);
   assert.equal(restoredSmokeState.messages.includes('Conflicting stale answer'), false);
 
+  await top.evaluate(`fetch('/backend-api/messages/smoke-partial').then((response) => response.json())`);
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).overviewItems === 61);
+  await ui.evaluate(`document.querySelector('[data-overview-index="0"]')?.click()`);
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).messages.includes('Fixture user message 1'));
+  const historyAfterPartial = await ui.evaluate(uiStateExpression());
+  assert.equal(historyAfterPartial.overviewItems, 61, 'a short optimized payload must append to, not replace, cached history');
+  assert.ok(historyAfterPartial.messages.includes('Fixture user message 1'), 'oldest cached turns must remain reachable after a short payload arrives');
+  await ui.evaluate(`document.querySelector('[data-overview-index="60"]')?.click()`);
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).messages.includes('Partial tail answer'));
+
   const resumed = new Promise((resolve) => {
     fixture.onResumeRequest = (count) => {
       if (count >= 2) resolve(count);
@@ -1109,9 +1165,9 @@ async function runLiveSmoke(browser, extensionId) {
       await ui.evaluate(fillAndSubmitExpression(prompt));
       await waitFor(async () => (await ui.evaluate(uiStateExpression())).composerStatus === '消息已发送（官方已确认）', 10_000);
       await waitFor(async () => (await ui.evaluate(uiStateExpression())).assistant.includes(expect), 45_000);
-      // Event-driven contract: once the final stream event (finished status /
-      // end_turn) is captured, the work indicator must flip back to idle.
-      await waitFor(async () => (await ui.evaluate(uiStateExpression())).sidebarWorkState === 'idle', 45_000);
+      // Execution-state contract: stop only after a direct page/server
+      // lifecycle observation says the turn is no longer running.
+      await waitFor(async () => (await ui.evaluate(uiStateExpression())).sidebarWorkState === 'stopped', 45_000);
       uiState = await ui.evaluate(uiStateExpression());
     }
   } catch (error) {
@@ -1159,6 +1215,15 @@ async function fulfillFixtureRequest(client, event, fixture) {
   } else if (url.includes('/backend-api/conversation/second')) {
     body = JSON.stringify(fixture.secondConversation);
     contentType = 'application/json; charset=utf-8';
+    } else if (url.includes('/backend-api/messages/smoke-partial')) {
+      body = JSON.stringify(fixture.smokePartialConversation);
+      contentType = 'application/json; charset=utf-8';
+    } else if (url.includes('/backend-api/messages/misleading-terminal')) {
+      body = JSON.stringify(fixture.misleadingTerminalEvent);
+      contentType = 'application/json; charset=utf-8';
+    } else if (url.includes('/backend-api/messages/stale-running')) {
+      body = JSON.stringify(fixture.staleRunningEvent);
+      contentType = 'application/json; charset=utf-8';
     } else if (url.includes('/backend-api/messages/live-only')) {
       body = JSON.stringify(fixture.liveOnlyEvent);
       contentType = 'application/json; charset=utf-8';
@@ -1320,6 +1385,50 @@ function makeFixture() {
         create_time: 5,
       },
     },
+    smokePartialConversation: {
+      id: 'smoke',
+      conversation_id: 'smoke',
+      title: 'Fixture conversation',
+      current_node: 'smoke-partial-a1',
+      messages: [
+        {
+          id: 'smoke-partial-u1',
+          author: { role: 'user' },
+          content: { parts: ['Partial tail question'] },
+          status: 'finished_successfully',
+          end_turn: true,
+        },
+        {
+          id: 'smoke-partial-a1',
+          author: { role: 'assistant' },
+          content: { parts: ['Partial tail answer'] },
+          status: 'finished_successfully',
+          end_turn: true,
+        },
+      ],
+    },
+    misleadingTerminalEvent: {
+      conversation_id: 'mobile-smoke',
+      message: {
+        id: 'misleading-terminal-a1',
+        author: { role: 'assistant' },
+        content: { parts: ['Intermediate terminal-looking message'] },
+        status: 'finished_successfully',
+        end_turn: true,
+        create_time: 5.5,
+      },
+    },
+    staleRunningEvent: {
+      conversation_id: 'mobile-smoke',
+      message: {
+        id: 'stale-running-a1',
+        author: { role: 'assistant' },
+        content: { parts: ['Late stale in-progress message'] },
+        status: 'in_progress',
+        end_turn: false,
+        create_time: 5.6,
+      },
+    },
     unknownContentEvent: {
       conversation_id: 'live-only',
       message: {
@@ -1379,6 +1488,17 @@ function installComposerExpression() {
       message.appendChild(content);
       document.body.appendChild(message);
       textarea.value = '';
+      button.hidden = true;
+      let stop = form.querySelector('[data-testid="stop-button"]');
+      if (!stop) {
+        stop = document.createElement('button');
+        stop.type = 'button';
+        stop.setAttribute('data-testid', 'stop-button');
+        stop.setAttribute('aria-label', 'Stop generating');
+        stop.textContent = 'Stop generating';
+        stop.style.cssText = 'display:block;width:100px;height:40px';
+        form.appendChild(stop);
+      }
     });
     form.addEventListener('submit', (event) => event.preventDefault());
     form.append(textarea, button);

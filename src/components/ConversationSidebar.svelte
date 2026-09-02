@@ -7,14 +7,21 @@
     statusLabel = '未连接',
     statusState = 'offline',
     captures = 0,
-    workState = 'idle',
+    workState = 'unknown',
     onShowOfficial = () => {},
     onExportMarkdown = () => {},
     onNewChat = () => {},
     onSelect = () => {},
   } = $props();
 
-  const workLabel = $derived(workState === 'working' ? '对话进行中' : '对话已停止');
+  const workLabel = $derived(
+    workState === 'running'
+      ? '对话执行中'
+      : (workState === 'starting'
+          ? '正在提交'
+          : (workState === 'stopped' ? '对话已停止' : '状态未知'))
+  );
+  const activelyWorking = $derived(workState === 'running' || workState === 'starting');
 
   let query = $state('');
   let filtered = $derived.by(() => {
@@ -55,7 +62,7 @@
   </div>
 
   <div class="conversation-work-state" data-state={workState} role="status">
-    <span class="work-dot" class:working={workState === 'working'} aria-hidden="true"></span>
+    <span class="work-dot" class:working={activelyWorking} aria-hidden="true"></span>
     <span>{workLabel}</span>
   </div>
 

@@ -58,7 +58,8 @@ html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; backg
 .status-pill.error { color: #cf6258; border-color: #8c413b; }
 
 .conversation-work-state { display: flex; align-items: center; gap: 8px; margin: 10px 16px 0; padding: 7px 10px; border: 1px solid var(--slim-line); border-radius: 10px; font-size: 11px; color: var(--slim-muted); }
-.conversation-work-state .work-dot { width: 8px; height: 8px; border-radius: 999px; background: #4caf7d; flex: none; }
+.conversation-work-state .work-dot { width: 8px; height: 8px; border-radius: 999px; background: #7f8792; flex: none; }
+.conversation-work-state[data-state="stopped"] .work-dot { background: #4caf7d; }
 .conversation-work-state .work-dot.working { background: #e0a63c; animation: slimgpt-work-pulse 1.1s ease-in-out infinite; }
 @keyframes slimgpt-work-pulse {
   0%, 100% { opacity: 1; }
@@ -153,8 +154,9 @@ html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; backg
 .desktop-chat-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 0 20px; border-bottom: 1px solid var(--slim-line); }
 .header-actions { display: flex; align-items: center; gap: 10px; flex: none; }
 .header-work-state { display: inline-flex; align-items: center; gap: 6px; color: var(--slim-muted); font-size: 11px; }
-.header-work-state[data-state="working"] { color: #e8c98a; }
-.header-work-state .work-dot { width: 7px; height: 7px; border-radius: 999px; background: #4caf7d; }
+.header-work-state[data-state="running"], .header-work-state[data-state="starting"] { color: #e8c98a; }
+.header-work-state .work-dot { width: 7px; height: 7px; border-radius: 999px; background: #7f8792; }
+.header-work-state[data-state="stopped"] .work-dot { background: #4caf7d; }
 .header-work-state .work-dot.working { background: #e0a63c; animation: slimgpt-work-pulse 1.1s ease-in-out infinite; }
 .header-title-group { display: grid; min-width: 0; }
 .header-title-group strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13.5px; }
@@ -631,12 +633,13 @@ html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; backg
   .composer-shell, .composer-status, .composer-hint { max-width: 1240px; }
 }
 
-@media (max-width: 960px) {
+@media (max-width: 960px), (hover: none) and (pointer: coarse) {
   .slimgpt-page .page-content { padding-top: var(--f7-navbar-height, 48px) !important; }
   .mobile-navbar { display: block; position: absolute; top: 0; left: 0; width: 100%; z-index: 5000; }
   .mobile-title { display: inline-flex; align-items: center; gap: 7px; max-width: 50vw; overflow: hidden; white-space: nowrap; font-size: 13.5px; font-weight: 650; }
   .mobile-title > span:first-child { overflow: hidden; text-overflow: ellipsis; }
-  .mobile-work-state { width: 7px; height: 7px; border-radius: 999px; background: #4caf7d; flex: none; }
+  .mobile-work-state { width: 7px; height: 7px; border-radius: 999px; background: #7f8792; flex: none; }
+  .mobile-work-state[data-state="stopped"] { background: #4caf7d; }
   .mobile-work-state.working { background: #e0a63c; animation: slimgpt-work-pulse 1.1s ease-in-out infinite; }
   .app-shell { display: block; height: 100%; position: relative; overflow: hidden; }
   .sidebar-host {

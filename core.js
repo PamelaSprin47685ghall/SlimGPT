@@ -140,6 +140,155 @@ export function findConversationPayload(value, depth = 0) {
   return null;
 }
 
+export function mergeConversationPayload(previous, incoming) {
+  if (!previous?.mapping || typeof previous.mapping !== "object") return incoming;
+  if (!incoming?.mapping || typeof incoming.mapping !== "object") return previous;
+
+  const previousIds = new Set(Object.keys(previous.mapping));
+  const incomingIds = Object.keys(incoming.mapping);
+  const mapping = {};
+
+  for (const [id, node] of Object.entries(previous.mapping)) {
+    mapping[id] = cloneConversationNode(node, id);
+  }
+  for (const [id, node] of Object.entries(incoming.mapping)) {
+    mapping[id] = mergeConversationNode(mapping[id], node, id);
+  }
+
+  const incomingRoots = incomingIds.filter((id) => {
+    const parent = incoming.mapping[id]?.parent;
+    return !parent || !incoming.mapping[parent];
+  });
+  const overlapsPrevious = incomingIds.some((id) => previousIds.has(id));
+  if (!overlapsPrevious && previous.current_node && mapping[previous.current_node] && incomingRoots.length === 1) {
+    const rootId = incomingRoots[0];
+    const root = mapping[rootId];
+    if (root && rootId !== previous.current_node && !root.parent) {
+      root.parent = previous.current_node;
+      addConversationChild(mapping[previous.current_node], rootId);
+    }
+  }
+
+  for (const node of Object.values(mapping)) {
+    if (node?.parent && mapping[node.parent]) addConversationChild(mapping[node.parent], node.id);
+  }
+
+  const currentNode = selectMergedConversationCurrentNode(previous, incoming, mapping);
+  return {
+    ...previous,
+    ...incoming,
+    metadata: {
+      ...(previous.metadata || {}),
+      ...(incoming.metadata || {}),
+    },
+    mapping,
+    current_node: currentNode,
+  };
+}
+
+function cloneConversationNode(node, fallbackId) {
+  if (!node || typeof node !== "object") {
+    return { id: fallbackId, parent: null, children: [] };
+  }
+  return {
+    ...node,
+    id: node.id || fallbackId,
+    children: Array.isArray(node.children) ? [...new Set(node.children.filter(Boolean))] : [],
+    message: node.message ? cloneConversationMessage(node.message) : node.message,
+  };
+}
+
+function mergeConversationNode(previous, incoming, fallbackId) {
+  if (!previous) return cloneConversationNode(incoming, fallbackId);
+  if (!incoming || typeof incoming !== "object") return previous;
+  const parent = incoming.parent || previous.parent || null;
+  const children = [...new Set([
+    ...(Array.isArray(previous.children) ? previous.children : []),
+    ...(Array.isArray(incoming.children) ? incoming.children : []),
+  ].filter(Boolean))];
+  return {
+    ...previous,
+    ...incoming,
+    id: incoming.id || previous.id || fallbackId,
+    parent,
+    children,
+    message: mergeConversationMessage(previous.message, incoming.message),
+  };
+}
+
+function cloneConversationMessage(message) {
+  if (!message || typeof message !== "object") return message;
+  return {
+    ...message,
+    author: message.author && typeof message.author === "object" ? { ...message.author } : message.author,
+    content: message.content && typeof message.content === "object" ? { ...message.content } : message.content,
+    metadata: message.metadata && typeof message.metadata === "object" ? { ...message.metadata } : message.metadata,
+  };
+}
+
+function mergeConversationMessage(previous, incoming) {
+  if (!previous || typeof previous !== "object") return cloneConversationMessage(incoming);
+  if (!incoming || typeof incoming !== "object") return cloneConversationMessage(previous);
+
+  const previousFinished = isFinishedConversationMessage(previous);
+  const incomingFinished = isFinishedConversationMessage(incoming);
+  const preservePreviousBody = previousFinished && !incomingFinished;
+  return {
+    ...previous,
+    ...incoming,
+    author: {
+      ...(previous.author || {}),
+      ...(incoming.author || {}),
+    },
+    content: preservePreviousBody
+      ? previous.content
+      : (incoming.content ?? previous.content),
+    status: preservePreviousBody ? previous.status : (incoming.status ?? previous.status),
+    end_turn: preservePreviousBody ? previous.end_turn : (incoming.end_turn ?? previous.end_turn),
+    metadata: {
+      ...(previous.metadata || {}),
+      ...(incoming.metadata || {}),
+    },
+  };
+}
+
+function isFinishedConversationMessage(message) {
+  const status = String(message?.status || "").toLowerCase();
+  return message?.end_turn === true || status === "finished_successfully" || status === "finished" || status === "failed";
+}
+
+function addConversationChild(node, childId) {
+  if (!node || !childId) return;
+  const children = Array.isArray(node.children) ? node.children : [];
+  if (!children.includes(childId)) node.children = [...children, childId];
+}
+
+function selectMergedConversationCurrentNode(previous, incoming, mapping) {
+  const previousCurrent = mapping[previous.current_node] ? previous.current_node : null;
+  const incomingCurrent = mapping[incoming.current_node] ? incoming.current_node : null;
+  if (!previousCurrent) return incomingCurrent;
+  if (!incomingCurrent) return previousCurrent;
+  if (previousCurrent === incomingCurrent) return previousCurrent;
+  if (isConversationAncestor(mapping, incomingCurrent, previousCurrent)) return previousCurrent;
+  if (isConversationAncestor(mapping, previousCurrent, incomingCurrent)) return incomingCurrent;
+
+  const source = String(incoming.metadata?.source || "");
+  if (source === "web-mobile-partial" || source === "optimized-conversation") return previousCurrent;
+  return incomingCurrent;
+}
+
+function isConversationAncestor(mapping, ancestorId, descendantId) {
+  if (!ancestorId || !descendantId || ancestorId === descendantId) return ancestorId === descendantId;
+  const seen = new Set();
+  let current = descendantId;
+  while (current && mapping[current] && !seen.has(current)) {
+    if (current === ancestorId) return true;
+    seen.add(current);
+    current = mapping[current].parent || null;
+  }
+  return false;
+}
+
 function optimizedConversationToCanonical(value) {
   const mapping = {};
   let previousId = null;
@@ -173,6 +322,10 @@ function optimizedConversationToCanonical(value) {
     conversation_id: conversationId || value.id,
     mapping,
     current_node: currentNode,
+    metadata: {
+      ...(rest.metadata || {}),
+      source: rest.metadata?.source || "optimized-conversation",
+    },
   };
 }
 

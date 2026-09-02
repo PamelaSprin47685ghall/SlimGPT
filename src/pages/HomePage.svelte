@@ -22,6 +22,7 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     fingerprintCapture,
     getToolMessageInfo,
     groupConversationTurns,
+    mergeConversationPayload,
     parseJson,
     parseWebMobilePartialConversation,
     resolveConversationScope,
@@ -48,6 +49,7 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
   let pendingCommandConversationId = null;
   let sidebarOpen = $state(false);
   let overviewOpen = $state(false);
+  let overviewPointerIntent = null;
   let activeTurnIndex = $state(0);
   let saveTimer = null;
   let sendTimer = null;
@@ -55,7 +57,7 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
   let userSettings = $state({ ...DEFAULT_SETTINGS });
   let thinkingLevelOverride = $state(null);
   let workStates = $state(new Map());
-  let newChatWorkState = $state('idle');
+  let newChatWorkState = $state('unknown');
   const MAX_CAPTURE_BUFFER = 20 * 1024 * 1024;
   const MAX_CACHED_PAYLOADS = 24;
   const sseBuffers = new Map();
@@ -105,9 +107,11 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
   const conversationTimedOut = $derived(Boolean(conversationPending && navigationTimedOutId === currentConversationId));
   const conversationWorkState = $derived(
     sendInFlight
-      ? 'working'
-      : (currentConversationId ? (workStates.get(currentConversationId) || 'idle') : newChatWorkState)
+      ? 'starting'
+      : (currentConversationId ? (workStates.get(currentConversationId) || 'unknown') : newChatWorkState)
   );
+  const conversationWorkLabel = $derived(workStateLabel(conversationWorkState));
+  const conversationActivelyWorking = $derived(conversationWorkState === 'running' || conversationWorkState === 'starting');
   const conversationThinkingDepth = $derived.by(() => {
     const payload = currentConversationId ? payloads.get(currentConversationId) : null;
     return payload ? conversationThinkingLevel(payload) : null;
@@ -212,16 +216,13 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     else if (message.type === 'takeover-state') {
       status = { ...status, takeover: message.active };
     }
-    else if (message.type === 'page-stream-status') {
+    else if (message.type === 'page-execution-state') {
       const { conversationId, conflicted } = resolveConversationScope(
         message.conversationId,
-        conversationIdFromUrl(message.url || ''),
+        message.conversationId ? null : conversationIdFromUrl(message.url || ''),
       );
-      if (!conflicted && conversationId && message.state === 'working') {
-        setConversationWorkState(conversationId, 'working');
-      }
-      else if (!conflicted && conversationId && message.state === 'idle') {
-        setConversationWorkState(conversationId, 'idle');
+      if (!conflicted && ['running', 'stopped', 'unknown'].includes(message.state)) {
+        setConversationWorkState(conversationId, message.state);
       }
     }
     else if (message.type === 'page-location') handlePageLocation(message.url);
@@ -258,19 +259,13 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
 
       for (const frame of frames) {
         if (frame.data === '[DONE]') {
-          const scope = resolveCapturedConversation(capture);
-          if (!scope.conflicted && scope.conversationId) {
-            setConversationWorkState(scope.conversationId, 'idle');
-          }
+          // [DONE] terminates this SSE segment only. It is not evidence that
+          // the conversation turn has stopped; async/tool work may continue.
         } else if (frame.json) {
           processStructured(frame.json, capture);
         }
       }
       if (capture.phase === 'complete') {
-        const scope = resolveCapturedConversation(capture);
-        if (capture.graceful && !scope.conflicted && scope.conversationId) {
-          setConversationWorkState(scope.conversationId, 'idle');
-        }
         releaseCaptureScope(capture);
       }
       return;
@@ -361,7 +356,6 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
       const next = new Map(liveMessages);
       next.set(id, upsertLiveMessage(next.get(id) || [], event.message));
       liveMessages = next;
-      updateWorkStateFromMessage(id, event.message);
       updateConversationPreviewFromMessage(id, event.message);
       if (id === currentConversationId) {
         if (hasRenderableConversationContent(id) && (loadingConversationId === id || navigationTimedOutId === id)) {
@@ -437,10 +431,12 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     const nextPayloads = new Map(payloads);
     const nextTerminals = new Map(terminals);
     const nextLive = new Map(liveMessages);
-    
-    nextPayloads.set(id, payload);
-    nextTerminals.set(id, payload.current_node);
-    nextLive.set(id, []);
+
+    const previousPayload = nextPayloads.get(id) || null;
+    const mergedPayload = previousPayload ? mergeConversationPayload(previousPayload, payload) : payload;
+    nextPayloads.set(id, mergedPayload);
+    nextTerminals.set(id, mergedPayload.current_node);
+    nextLive.set(id, retainLiveMessagesBeyondPayload(nextLive.get(id) || [], mergedPayload));
 
     // Evict oldest cached conversation trees if exceeding limit.
     while (nextPayloads.size > MAX_CACHED_PAYLOADS) {
@@ -459,20 +455,19 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     payloads = nextPayloads;
     terminals = nextTerminals;
     liveMessages = nextLive;
-    updateWorkStateFromPayload(id, payload);
     const next = new Map(conversationMap);
     const previous = next.get(id) || {};
-    const details = conversationDetailsFromPayload(payload, previous);
+    const details = conversationDetailsFromPayload(mergedPayload, previous);
     const pagePath = (() => {
       try { return new URL(status.pageUrl || 'https://chatgpt.com/').pathname; } catch { return ''; }
     })();
     const pageConversationId = conversationIdFromUrl(status.pageUrl || '');
     next.set(id, normalizeConversationMeta({
       id,
-      title: payload.title || previous.title || 'Untitled',
-      create_time: payload.create_time || previous.create_time,
-      update_time: payload.update_time || Date.now() / 1000,
-      route: payload.metadata?.source === 'web-mobile-partial' ||
+      title: mergedPayload.title || previous.title || 'Untitled',
+      create_time: mergedPayload.create_time || previous.create_time,
+      update_time: mergedPayload.update_time || Date.now() / 1000,
+      route: mergedPayload.metadata?.source === 'web-mobile-partial' ||
         (pageConversationId === id && pagePath.startsWith('/uc/'))
         ? 'uc'
         : (previous.route || 'c'),
@@ -481,8 +476,26 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     }, previous));
     conversationMap = next;
     if (loadingConversationId === id) finishConversationLoading();
-    reconcilePendingAgainstPayload(id, payload);
+    reconcilePendingAgainstPayload(id, mergedPayload);
     schedulePersist();
+  }
+
+  function retainLiveMessagesBeyondPayload(live, payload) {
+    if (!Array.isArray(live) || !live.length || !payload?.mapping) return live || [];
+    const canonicalByMessageId = new Map();
+    for (const node of Object.values(payload.mapping)) {
+      const message = node?.message;
+      if (message?.id) canonicalByMessageId.set(message.id, message);
+    }
+    return live.filter((item) => {
+      const canonical = canonicalByMessageId.get(item?.id);
+      if (!canonical) return true;
+      const canonicalText = contentToText(canonical.content, canonical.metadata || {});
+      const canonicalFinished = canonical.end_turn === true ||
+        ['finished_successfully', 'finished', 'failed'].includes(String(canonical.status || ''));
+      if (canonicalFinished) return false;
+      return String(item?.text || '').length > String(canonicalText || '').length;
+    });
   }
 
   function handlePageLocation(url) {
@@ -536,7 +549,7 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     }
     setCurrentConversation(null);
     thinkingLevelOverride = null;
-    newChatWorkState = 'idle';
+    newChatWorkState = 'unknown';
     finishConversationLoading();
     pendingUser = null;
     sidebarOpen = false;
@@ -549,6 +562,7 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
   function setCurrentConversation(id, { migrateDraft = false } = {}) {
     const nextId = id || null;
     if (nextId === currentConversationId) return;
+    closeMobilePanels();
     const previousId = currentConversationId;
     if (migrateDraft) {
       draftsByConversation.delete(previousId);
@@ -573,9 +587,9 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     if (currentConversationId === null) {
       setCurrentConversation(id, { migrateDraft: true });
     }
-    if (newChatWorkState === 'working') {
-      setConversationWorkState(id, 'working');
-      newChatWorkState = 'idle';
+    if (newChatWorkState !== 'unknown') {
+      setConversationWorkState(id, newChatWorkState);
+      newChatWorkState = 'unknown';
     }
   }
 
@@ -669,7 +683,6 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
         pending: true,
       },
     };
-    setConversationWorkState(currentConversationId, 'working');
     if (currentConversationId) updateConversationPreview(currentConversationId, text, '');
     transport.send({
       type: 'send-message',
@@ -686,7 +699,7 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
       pendingCommandConversationId = null;
       sendInFlight = false;
       if (pendingUser?.commandId === commandId) pendingUser = null;
-      setConversationWorkState(timedOutConversationId, 'idle');
+      setConversationWorkState(timedOutConversationId, 'unknown');
       setComposerStatus('官方输入框未确认提交；内容仍保留，请检查官方界面后手动决定是否重试', true);
     }, 14_000);
     setComposerStatus('正在通过 ChatGPT 页面发送；断线后不会自动重发');
@@ -703,7 +716,8 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     pendingCommandConversationId = null;
     if (!message.ok) {
       pendingUser = null;
-      setConversationWorkState(submittedConversationId, 'idle');
+      if (message.error === 'send-in-progress') setConversationWorkState(submittedConversationId, 'running');
+      else if (message.error === 'send-unconfirmed') setConversationWorkState(submittedConversationId, 'unknown');
       const details = {
         'composer-not-found': '找不到官方输入框：请检查当前 ChatGPT 页面是否已登录或页面结构是否变化',
         'composer-rejected-input': '官方输入框没有接受这段文字；内容仍保留，未发送',
@@ -757,6 +771,7 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
   }
 
   function setConversationWorkState(id, state) {
+    if (!['running', 'stopped', 'unknown'].includes(state)) return;
     if (!id) {
       newChatWorkState = state;
       return;
@@ -765,28 +780,11 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     workStates = new Map(workStates).set(id, state);
   }
 
-  function updateWorkStateFromMessage(id, message) {
-    const role = message?.author?.role || message?.role;
-    if (role !== 'assistant') return;
-    const statusValue = String(message?.status || '');
-    if (message?.end_turn === true || statusValue === 'finished_successfully' || statusValue === 'finished' || statusValue === 'failed') {
-      setConversationWorkState(id, 'idle');
-      return;
-    }
-    if (message?.end_turn === false || statusValue === 'in_progress' || statusValue === 'thinking' || statusValue === 'live') {
-      setConversationWorkState(id, 'working');
-    }
-  }
-
-  function updateWorkStateFromPayload(id, payload) {
-    const rows = buildConversationView(payload, payload?.current_node);
-    const assistant = [...rows].reverse().find((message) => message?.role === 'assistant');
-    if (!assistant) return;
-    updateWorkStateFromMessage(id, {
-      role: assistant.role,
-      status: assistant.status,
-      end_turn: assistant.endTurn,
-    });
+  function workStateLabel(state) {
+    if (state === 'running') return '执行中';
+    if (state === 'starting') return '提交中';
+    if (state === 'stopped') return '已停止';
+    return '状态未知';
   }
 
   function stepBranch(nodeId, delta) {
@@ -884,6 +882,40 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     if (overviewOpen) sidebarOpen = false;
   }
 
+  function beginOverviewPointer(event) {
+    if (event.isPrimary === false) return;
+    overviewPointerIntent = {
+      pointerId: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      startedAt: performance.now(),
+    };
+  }
+
+  function finishOverviewPointer(event) {
+    const intent = overviewPointerIntent;
+    overviewPointerIntent = null;
+    if (!intent || intent.pointerId !== event.pointerId) return;
+    const moved = Math.hypot(event.clientX - intent.x, event.clientY - intent.y);
+    const elapsed = performance.now() - intent.startedAt;
+    if (moved > 10 || elapsed > 900) return;
+    event.preventDefault();
+    event.stopPropagation();
+    toggleOverview();
+  }
+
+  function cancelOverviewPointer() {
+    overviewPointerIntent = null;
+  }
+
+  function handleOverviewClick(event) {
+    // Pointer activation is handled on pointerup so a swipe/drag ending over
+    // the navbar cannot synthesize an accidental drawer-open click. Preserve
+    // trusted keyboard activation (Enter/Space), but ignore scripted clicks.
+    event.preventDefault();
+    if (event.isTrusted && event.detail === 0) toggleOverview();
+  }
+
   function closeMobilePanels() {
     sidebarOpen = false;
     overviewOpen = false;
@@ -899,14 +931,24 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
       <span>{currentMeta?.title || 'SlimGPT'}</span>
       <span
         class="mobile-work-state"
-        class:working={conversationWorkState === 'working'}
+        class:working={conversationActivelyWorking}
+        data-state={conversationWorkState}
         role="status"
-        aria-label={conversationWorkState === 'working' ? '对话工作中' : '对话已停止'}
-        title={conversationWorkState === 'working' ? '工作中' : '已停止'}
+        aria-label={`对话状态：${conversationWorkLabel}`}
+        title={conversationWorkLabel}
       ></span>
     </div>
     <NavRight>
-      <Button small onClick={toggleOverview}>概览</Button>
+      <button
+        type="button"
+        class="button button-small mobile-overview-button"
+        aria-expanded={overviewOpen}
+        aria-controls="slimgpt-mobile-overview"
+        onpointerdown={beginOverviewPointer}
+        onpointerup={finishOverviewPointer}
+        onpointercancel={cancelOverviewPointer}
+        onclick={handleOverviewClick}
+      >概览</button>
     </NavRight>
   </Navbar>
 
@@ -934,8 +976,8 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
         </div>
         <div class="header-actions">
           <span class="header-work-state" data-state={conversationWorkState} role="status">
-            <span class="work-dot" class:working={conversationWorkState === 'working'} aria-hidden="true"></span>
-            {conversationWorkState === 'working' ? '工作中' : '已停止'}
+            <span class="work-dot" class:working={conversationActivelyWorking} aria-hidden="true"></span>
+            {conversationWorkLabel}
           </span>
           <Button small onClick={() => transport.openOfficial(currentConversationId)}>暂时显示官方界面</Button>
         </div>
@@ -966,10 +1008,10 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
           </div>
         {/if}
 
-        {#if conversationWorkState === 'working' && !conversationPending}
+        {#if conversationWorkState === 'running' && !conversationPending}
           <div class="work-indicator" role="status" aria-live="polite">
             <span class="work-indicator-spinner" aria-hidden="true"></span>
-            <span>对话进行中：正在生成或等待官方页面返回…</span>
+            <span>对话执行中：已观测到官方页面仍在生成或服务端 turn 尚未结束…</span>
           </div>
         {/if}
       </section>
@@ -987,7 +1029,7 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
       />
     </main>
 
-    <div class:open={overviewOpen} class="overview-host">
+    <div id="slimgpt-mobile-overview" class:open={overviewOpen} class="overview-host">
       <MessageOverview
         {turns}
         activeIndex={activeTurnIndex}
