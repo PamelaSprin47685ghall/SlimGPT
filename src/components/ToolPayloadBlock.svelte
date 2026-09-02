@@ -34,7 +34,9 @@
 <div class="tool-payload-block" data-tool-kind={tool?.kind || ''}>
   <div class="tool-code-header">
     <span class="tool-code-language">TOML</span>
-    <span class="tool-code-name">{tool?.name || 'tool'}</span>
+    <span class="tool-code-name" title={tool?.title || tool?.name || 'tool'}>
+      {tool?.name || 'tool'}{tool?.title ? ` · ${tool.title}` : ''}
+    </span>
     <button type="button" class:copied class="tool-code-copy" onclick={copyToml}>
       {copied ? '已复制' : '复制 TOML'}
     </button>

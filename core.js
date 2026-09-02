@@ -391,29 +391,48 @@ function isTransientThinkingMessage(message) {
   return message?.status === "in_progress" || message?.status === "thinking" || message?.status === "live";
 }
 
+export function isAsyncReasoningMessage(message) {
+  if (!message || typeof message !== "object") return false;
+  const metadata = message.metadata || {};
+  return Boolean(
+    metadata.initial_text ||
+    metadata.finished_text ||
+    (metadata.async_source && metadata.cot_version)
+  );
+}
+
 export function messageNodeToView(node, mapping) {
   const message = node.message || {};
   const siblings = node.parent && mapping[node.parent]?.children
     ? mapping[node.parent].children.filter((id) => mapping[id]?.message)
     : [node.id];
   const siblingIndex = Math.max(0, siblings.indexOf(node.id));
+  const metadata = message.metadata || {};
+  const isAsyncReasoning = isAsyncReasoningMessage(message);
   const thought = extractThought(message);
   const tool = getToolMessageInfo(message);
-  const text = contentToText(message.content);
-  const status = message.status || (message.metadata?.is_error ? "failed" : null);
-  const error = status === "failed" || Boolean(message.metadata?.is_error) || Boolean(message.metadata?.error);
-  const metadata = message.metadata || {};
+  const text = contentToText(message.content, metadata);
+  const status = message.status || (metadata.is_error ? "failed" : null);
+  const error = status === "failed" || Boolean(metadata.is_error) || Boolean(metadata.error);
   const model = metadata.model_slug || metadata.default_model_slug || metadata.model || null;
   const reasoningEffort = metadata.thinking_effort || metadata.reasoning_effort || metadata.reasoning_effort_level || null;
   const thinkingLevel = metadata.thinking_level ? getThinkingLevel(metadata.thinking_level) : (reasoningEffort ? getThinkingLevel(reasoningEffort) : null);
+  const durationSec = metadata.finished_duration_sec ?? null;
+  const thinkingDuration = formatThinkingDuration(durationSec, metadata.reasoning_start_time, metadata.reasoning_end_time, metadata);
+
+  const ct = String(message.content?.content_type || "");
+  const isSpinner = ct === "tether_browsing_display" && !message.content?.result && !message.content?.summary;
+
+  const role = isAsyncReasoning ? "assistant" : (message.author?.role || "unknown");
 
   return {
     id: message.id || node.id,
     nodeId: node.id,
-    role: message.author?.role || "unknown",
+    role,
     name: message.author?.name || null,
     text,
     thought,
+    thinkingDuration,
     createTime: message.create_time || null,
     status,
     error,
@@ -426,7 +445,7 @@ export function messageNodeToView(node, mapping) {
     model,
     reasoningEffort,
     thinkingLevel,
-    unrecognized: !text && !thought && !tool && hasNonTextExtras(message),
+    unrecognized: !text && !thought && !tool && !isSpinner && hasNonTextExtras(message),
     isThinking: (status === "in_progress" || status === "thinking") && !text && !tool && !hasNonTextExtras(message),
   };
 }
@@ -434,34 +453,81 @@ export function messageNodeToView(node, mapping) {
 export function extractThought(message) {
   if (!message || typeof message !== "object") return null;
   const metadata = message.metadata || {};
-  if (typeof metadata.thought === "string" && metadata.thought.trim()) {
-    return metadata.thought.trim();
-  }
-  if (typeof metadata.reasoning === "string" && metadata.reasoning.trim()) {
-    return metadata.reasoning.trim();
-  }
-  if (typeof metadata.reasoning_content === "string" && metadata.reasoning_content.trim()) {
-    return metadata.reasoning_content.trim();
-  }
-  const content = message.content;
-  if (content && typeof content === "object") {
-    if (content.content_type === "thought") {
-      const text = typeof content.text === "string" ? content.text : (Array.isArray(content.parts) ? content.parts.map(partToThoughtText).filter(Boolean).join("\n") : "");
-      return text.trim() || null;
+
+  if (isAsyncReasoningMessage(message)) {
+    const content = message.content;
+    if (content && Array.isArray(content.parts)) {
+      const parts = content.parts.map(partToThoughtText).filter(Boolean);
+      if (parts.length) return parts.join("\n\n").trim();
     }
-    if (Array.isArray(content.parts)) {
-      const thoughtParts = [];
-      for (const part of content.parts) {
-        if (part && typeof part === "object") {
-          if (part.content_type === "thought" || part.thought) {
-            const t = partToThoughtText(part);
-            if (t && t.trim()) thoughtParts.push(t.trim());
-          }
+    if (typeof content?.text === "string" && content.text.trim()) {
+      return content.text.trim();
+    }
+    if (metadata.finished_text && metadata.finished_text !== "已完成推理") {
+      return metadata.finished_text;
+    }
+    if (metadata.initial_text) {
+      return metadata.initial_text;
+    }
+    return null;
+  }
+
+  for (const key of ["thought", "reasoning", "reasoning_content"]) {
+    if (typeof metadata[key] === "string" && metadata[key].trim()) {
+      return metadata[key].trim();
+    }
+  }
+
+  const content = message.content;
+  if (!content || typeof content !== "object") return null;
+
+  const contentType = String(content.content_type || "");
+
+  if (contentType === "thought" || contentType === "thoughts") {
+    if (Array.isArray(content.thoughts)) {
+      const parts = [];
+      for (const item of content.thoughts) {
+        if (!item || typeof item !== "object") continue;
+        const body = typeof item.content === "string" ? item.content.trim() : "";
+        const summary = typeof item.summary === "string" ? item.summary.trim() : "";
+        if (summary && body) {
+          parts.push(`> **${summary}**\n\n${body}`);
+        } else if (body) {
+          parts.push(body);
+        } else if (summary) {
+          parts.push(`> **${summary}**`);
         }
       }
-      if (thoughtParts.length) return thoughtParts.join("\n\n");
+      if (parts.length) return parts.join("\n\n");
+    }
+
+    if (typeof content.text === "string" && content.text.trim()) {
+      return content.text.trim();
+    }
+    if (Array.isArray(content.parts)) {
+      const parts = content.parts.map(partToThoughtText).filter(Boolean);
+      if (parts.length) return parts.join("\n\n");
     }
   }
+
+  if (contentType === "reasoning_recap") {
+    const recap = typeof content.content === "string" ? content.content.trim() : "";
+    if (recap) return `⏱️ ${recap}`;
+  }
+
+  if (Array.isArray(content.parts)) {
+    const thoughtParts = [];
+    for (const part of content.parts) {
+      if (part && typeof part === "object") {
+        if (part.content_type === "thought" || part.content_type === "thoughts" || part.thought) {
+          const t = partToThoughtText(part);
+          if (t && t.trim()) thoughtParts.push(t.trim());
+        }
+      }
+    }
+    if (thoughtParts.length) return thoughtParts.join("\n\n");
+  }
+
   return null;
 }
 
@@ -471,11 +537,14 @@ function partToThoughtText(part) {
   if (typeof part.thought === "string") return part.thought;
   if (typeof part.text === "string") return part.text;
   if (typeof part.content === "string") return part.content;
+  if (typeof part.summary === "string") return `> **${part.summary}**`;
   return "";
 }
 
 export function getToolMessageInfo(message) {
   if (!message || typeof message !== "object") return null;
+  if (isAsyncReasoningMessage(message)) return null;
+
   const role = message.author?.role || "unknown";
   const content = message.content && typeof message.content === "object" ? message.content : {};
   const metadata = message.metadata && typeof message.metadata === "object" ? message.metadata : {};
@@ -522,9 +591,12 @@ export function getToolMessageInfo(message) {
     recipient,
   ) || "tool";
 
+  const title = (metadata.reasoning_title || "").trim() || null;
+
   return {
     kind,
     name,
+    title,
     recipient: recipient || null,
     contentType: contentType || null,
     payload: extractToolPayload(message, toolCalls),
@@ -534,18 +606,43 @@ export function getToolMessageInfo(message) {
 function extractToolPayload(message, toolCalls) {
   if (toolCalls?.length) return toolCalls.length === 1 ? toolCalls[0] : { calls: toolCalls };
   const content = message.content;
+  const metadata = message.metadata || {};
+
+  if (Array.isArray(metadata.search_result_groups) && metadata.search_result_groups.length) {
+    return {
+      queries: metadata.search_queries || undefined,
+      results: metadata.search_result_groups,
+    };
+  }
+
+  if (Array.isArray(metadata.inline_cot_expandable_content?.search_result_groups)) {
+    return {
+      results: metadata.inline_cot_expandable_content.search_result_groups,
+    };
+  }
+
+  if (metadata.aggregate_result && typeof metadata.aggregate_result === "object") {
+    if (content?.text) {
+      return content.text;
+    }
+    return metadata.aggregate_result;
+  }
+
   if (content == null) return "";
   if (typeof content !== "object") return content;
-  if (content.result != null) return content.result;
-  if (content.text != null) return content.text;
+  if (content.result != null && content.result !== "") return content.result;
+  if (content.text != null && content.text !== "") return content.text;
+
   if (Array.isArray(content.parts)) {
-    if (content.parts.length === 1) return content.parts[0];
-    return { parts: content.parts };
+    const validParts = content.parts.filter((p) => p !== "" && p != null);
+    if (validParts.length === 1) return validParts[0];
+    if (validParts.length > 1) return { parts: validParts };
   }
+
   const payload = {};
   for (const [key, value] of Object.entries(content)) {
     if (["content_type", "language", "response_format_name"].includes(key)) continue;
-    payload[key] = value;
+    if (value !== "" && value != null) payload[key] = value;
   }
   return Object.keys(payload).length ? payload : "";
 }
@@ -557,22 +654,44 @@ function firstNonEmptyString(...values) {
   return "";
 }
 
-export function contentToText(content) {
-  if (!content) return "";
-  if (typeof content === "string") return content;
-  if (typeof content.text === "string") return content.text;
-  if (Array.isArray(content.parts)) {
-    return content.parts.map(partToText).filter(Boolean).join("\n");
+export function contentToText(content, metadata = {}) {
+  if (metadata && (metadata.initial_text || metadata.finished_text || (metadata.async_source && metadata.cot_version))) {
+    return "";
   }
-  if (content.result != null) return typeof content.result === "string" ? content.result : JSON.stringify(content.result, null, 2);
-  return "";
+
+  let text = "";
+  if (content) {
+    if (typeof content === "string") text = content;
+    else if (typeof content.text === "string") text = content.text;
+    else if (Array.isArray(content.parts)) {
+      text = content.parts.map(partToText).filter(Boolean).join("\n");
+    } else if (content.result != null) {
+      text = typeof content.result === "string" ? content.result : JSON.stringify(content.result, null, 2);
+    }
+  }
+
+  if (Array.isArray(metadata?.attachments) && metadata.attachments.length) {
+    const attachmentLabels = metadata.attachments.map(formatAttachmentBadge).filter(Boolean);
+    if (attachmentLabels.length) {
+      const attachBlock = attachmentLabels.join("\n");
+      text = text.trim() ? `${text}\n\n${attachBlock}` : attachBlock;
+    }
+  }
+
+  text = cleanCitationMarkers(text);
+  return text;
 }
 
 function partToText(part) {
   if (typeof part === "string") return part;
   if (typeof part === "number" || typeof part === "boolean") return String(part);
   if (!part || typeof part !== "object") return "";
-  if (part.content_type === "thought" || part.thought) return "";
+  if (part.content_type === "thought" || part.content_type === "thoughts" || part.thought) return "";
+  if (part.content_type === "image_asset_pointer") {
+    const mime = part.mime_type || "image";
+    const dim = part.width && part.height ? ` (${part.width}×${part.height})` : "";
+    return `🖼️ [图片: ${mime}${dim}]`;
+  }
   if (typeof part.text === "string" && part.text.trim()) return part.text;
   if (typeof part.transcript === "string" && part.transcript.trim()) return part.transcript;
   if (Array.isArray(part.parts)) return part.parts.map(partToText).filter(Boolean).join("\n");
@@ -585,18 +704,72 @@ function partToText(part) {
 
 function attachmentLabel(pointer) {
   if (!pointer) return "";
-  if (typeof pointer === "string") return `[Attachment: ${pointer}]`;
+  if (typeof pointer === "string") return `📎 [附件: ${pointer}]`;
   if (typeof pointer !== "object") return "";
   const id = pointer.asset_pointer || pointer.id || pointer.dalle_token || null;
   if (!id) return "";
   const kind = pointer.content_type ? ` (${pointer.content_type})` : "";
-  return `[Attachment: ${String(id).slice(0, 96)}${kind}]`;
+  return `📎 [附件: ${String(id).slice(0, 96)}${kind}]`;
+}
+
+function formatAttachmentBadge(att) {
+  if (!att || typeof att !== "object") return "";
+  const name = att.name || "file";
+  const sizeStr = formatFileSize(att.size);
+  return `📎 **[附件: ${name}${sizeStr ? ` (${sizeStr})` : ""}]**`;
+}
+
+function formatFileSize(bytes) {
+  if (typeof bytes !== "number" || bytes <= 0) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+export function cleanCitationMarkers(text) {
+  if (!text || typeof text !== "string") return text;
+  return text
+    .replace(/[\uE200\uE202\uE201\uE203]cite[\uE200\uE202\uE201\uE203][^\uE201]*[\uE201]?/g, "")
+    .replace(/[\uE200\uE202\uE201\uE203]filecite[\uE200\uE202\uE201\uE203][^\uE201]*[\uE201]?/g, "")
+    .replace(/cite[^]*/g, "")
+    .replace(/filecite[^]*/g, "")
+    .replace(/[^]*/g, "");
+}
+
+export function formatThinkingDuration(durationSec, startTime, endTime, metadata = {}) {
+  let sec = typeof durationSec === "number" && Number.isFinite(durationSec) ? durationSec : null;
+  if (sec == null && typeof startTime === "number" && typeof endTime === "number" && endTime >= startTime) {
+    sec = Math.round(endTime - startTime);
+  }
+  if (sec == null && typeof metadata?.finished_text === "string") {
+    const match = metadata.finished_text.match(/(?:思考了|Worked for)\s*([\dsmh分秒\s]+)/i);
+    if (match) return match[1].trim();
+  }
+  if (sec == null || sec <= 0) return null;
+  if (sec < 60) return `${sec} 秒`;
+  const mins = Math.floor(sec / 60);
+  const remainSec = sec % 60;
+  return remainSec > 0 ? `${mins} 分 ${remainSec} 秒` : `${mins} 分钟`;
 }
 
 export function hasNonTextExtras(message) {
   const content = message?.content;
   if (!content || typeof content !== "object") return false;
   const contentType = String(content.content_type || "");
+
+  const knownTypes = [
+    "text",
+    "thought",
+    "thoughts",
+    "reasoning_recap",
+    "code",
+    "execution_output",
+    "multimodal_text",
+    "tether_browsing_display",
+    "tether_quote",
+    "audio_transcript",
+  ];
+
   if (Array.isArray(content.parts)) {
     let renderedText = false;
     let sawExtras = false;
@@ -606,7 +779,7 @@ export function hasNonTextExtras(message) {
         continue;
       }
       if (!part || typeof part !== "object") continue;
-      if (part.content_type === "thought" || part.thought) continue;
+      if (part.content_type === "thought" || part.content_type === "thoughts" || part.thought) continue;
       if (typeof part.text === "string" && part.text.trim()) {
         renderedText = true;
         continue;
@@ -619,17 +792,19 @@ export function hasNonTextExtras(message) {
         renderedText = true;
         continue;
       }
-      if (part.asset_pointer || part.audio || part.image || part.upload_status || part.content_type) sawExtras = true;
+      if (part.asset_pointer || part.audio || part.image || part.upload_status || (part.content_type && part.content_type !== "text")) {
+        sawExtras = true;
+      }
     }
     if (renderedText) return false;
     if (sawExtras) return true;
-    // All-text parts (including empty strings) are just an empty message —
-    // unless the top-level content_type itself is non-text, which stays
-    // visible as unrecognized content below.
-    if (["text", "thought"].includes(contentType) || !contentType) return false;
+    if (knownTypes.includes(contentType) || !contentType) return false;
   }
+
   const selfRendered = typeof content.transcript === "string" && content.transcript.trim();
-  if (contentType && !["text", "thought"].includes(contentType) && content.text == null && content.result == null && !selfRendered) return true;
+  if (contentType && !knownTypes.includes(contentType) && content.text == null && content.result == null && !selfRendered) {
+    return true;
+  }
   if (Array.isArray(content.files) && content.files.length) return true;
   return false;
 }
@@ -671,23 +846,31 @@ function descendToLeaf(mapping, start) {
 
 export function upsertLiveMessage(messages, rawMessage) {
   if (!rawMessage?.id) return messages;
+  const metadata = rawMessage.metadata || {};
+  const isAsyncReasoning = isAsyncReasoningMessage(rawMessage);
   const thought = extractThought(rawMessage);
   const tool = getToolMessageInfo(rawMessage);
-  const text = contentToText(rawMessage.content);
-  const status = rawMessage.status || (rawMessage.metadata?.is_error ? "failed" : null);
-  const error = status === "failed" || Boolean(rawMessage.metadata?.is_error) || Boolean(rawMessage.metadata?.error);
-  const metadata = rawMessage.metadata || {};
+  const text = contentToText(rawMessage.content, metadata);
+  const status = rawMessage.status || (metadata.is_error ? "failed" : null);
+  const error = status === "failed" || Boolean(metadata.is_error) || Boolean(metadata.error);
   const model = metadata.model_slug || metadata.default_model_slug || metadata.model || null;
   const reasoningEffort = metadata.thinking_effort || metadata.reasoning_effort || metadata.reasoning_effort_level || null;
   const thinkingLevel = metadata.thinking_level ? getThinkingLevel(metadata.thinking_level) : (reasoningEffort ? getThinkingLevel(reasoningEffort) : null);
+  const durationSec = metadata.finished_duration_sec ?? null;
+  const thinkingDuration = formatThinkingDuration(durationSec, metadata.reasoning_start_time, metadata.reasoning_end_time, metadata);
+
+  const ct = String(rawMessage.content?.content_type || "");
+  const isSpinner = ct === "tether_browsing_display" && !rawMessage.content?.result && !rawMessage.content?.summary;
+  const role = isAsyncReasoning ? "assistant" : (rawMessage.author?.role || "assistant");
 
   const item = {
     id: rawMessage.id,
     nodeId: rawMessage.id,
-    role: rawMessage.author?.role || "assistant",
+    role,
     name: rawMessage.author?.name || null,
     text,
     thought,
+    thinkingDuration,
     createTime: rawMessage.create_time || null,
     status,
     error,
@@ -701,7 +884,7 @@ export function upsertLiveMessage(messages, rawMessage) {
     reasoningEffort,
     thinkingLevel,
     conversationId: null,
-    unrecognized: !text && !thought && !tool && hasNonTextExtras(rawMessage),
+    unrecognized: !text && !thought && !tool && !isSpinner && hasNonTextExtras(rawMessage),
     isThinking: (status === "in_progress" || status === "thinking") && !text && !tool && !hasNonTextExtras(rawMessage),
     live: true,
   };
@@ -723,9 +906,11 @@ export function upsertLiveMessage(messages, rawMessage) {
     error: item.error || previous.error || false,
     name: item.name || previous.name || null,
     thought: item.thought || previous.thought || null,
+    thinkingDuration: item.thinkingDuration || previous.thinkingDuration || null,
     text: item.text || previous.text || "",
     model: item.model || previous.model || null,
     reasoningEffort: item.reasoningEffort || previous.reasoningEffort || null,
+    thinkingLevel: item.thinkingLevel || previous.thinkingLevel || null,
     metadata: Object.keys(item.metadata || {}).length ? item.metadata : (previous.metadata || {}),
     tool: item.tool || previous.tool || null,
     isThinking: finished(previous) ? false : item.isThinking,

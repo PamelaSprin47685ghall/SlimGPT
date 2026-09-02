@@ -143,6 +143,9 @@
 
         {#if message?.tool}
           <code class="tool-message-name">{message.tool.name}</code>
+          {#if message.tool.title}
+            <span class="tool-message-title" title={message.tool.title}>{message.tool.title}</span>
+          {/if}
         {/if}
 
         {#if isError}
@@ -194,6 +197,9 @@
           >
             <span class="thought-icon">💭</span>
             <span class="thought-title">思考过程</span>
+            {#if message?.thinkingDuration}
+              <span class="thought-duration">（用时 {message.thinkingDuration}）</span>
+            {/if}
             <span class="thought-toggle">{thoughtOpen ? '收起 ▲' : '展开 ▼'}</span>
           </button>
           {#if thoughtOpen}

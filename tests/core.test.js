@@ -379,3 +379,177 @@ test('getThinkingLevel resolves 5-level thinking slider from instant to pro', ()
   assert.equal(pro.id, 'pro');
   assert.equal(pro.level, 5);
 });
+
+test('extractThought extracts plural thoughts and reasoning_recap from real ChatGPT responses', () => {
+  const pluralThoughts = extractThought({
+    author: { role: 'assistant' },
+    content: {
+      content_type: 'thoughts',
+      thoughts: [
+        {
+          summary: 'Designing automatic management',
+          content: 'Focusing on integrating TriAttention with unified KV manager.',
+          finished: true,
+        },
+        {
+          summary: 'Protected shared context',
+          content: '',
+          finished: true,
+        },
+      ],
+    },
+  });
+  assert.ok(pluralThoughts.includes('Designing automatic management'));
+  assert.ok(pluralThoughts.includes('Focusing on integrating TriAttention'));
+  assert.ok(pluralThoughts.includes('Protected shared context'));
+
+  const recap = extractThought({
+    author: { role: 'assistant' },
+    content: {
+      content_type: 'reasoning_recap',
+      content: 'Worked for 8m 33s',
+    },
+  });
+  assert.equal(recap, '⏱️ Worked for 8m 33s');
+});
+
+test('getToolMessageInfo extracts search result groups and reasoning titles', () => {
+  const searchResult = getToolMessageInfo({
+    author: { role: 'tool', name: 'web.run' },
+    content: {
+      content_type: 'text',
+      parts: [''],
+    },
+    metadata: {
+      reasoning_title: 'Searching the web',
+      search_queries: ['llama.cpp kv cache'],
+      search_result_groups: [
+        {
+          type: 'search_result_group',
+          domain: 'github.com',
+          entries: [
+            { title: 'llama.cpp KV cache', url: 'https://github.com/ggml-org/llama.cpp' },
+          ],
+        },
+      ],
+    },
+  });
+  assert.equal(searchResult.kind, 'tool-result');
+  assert.equal(searchResult.name, 'web.run');
+  assert.equal(searchResult.title, 'Searching the web');
+  assert.deepEqual(searchResult.payload.queries, ['llama.cpp kv cache']);
+  assert.equal(searchResult.payload.results.length, 1);
+});
+
+test('contentToText formats user attachments and cleans citation markers', () => {
+  const userWithAttachment = messageNodeToView({
+    id: 'u-attach',
+    message: {
+      id: 'u-attach',
+      author: { role: 'user' },
+      content: { content_type: 'text', parts: [''] },
+      metadata: {
+        attachments: [
+          { name: 'config.json', size: 2048, mime_type: 'application/json' },
+        ],
+      },
+    },
+  }, { 'u-attach': { id: 'u-attach' } });
+
+  assert.ok(userWithAttachment.text.includes('config.json'));
+  assert.ok(userWithAttachment.text.includes('2.0 KB'));
+  assert.equal(userWithAttachment.unrecognized, false);
+
+  const textWithCitations = messageNodeToView({
+    id: 'a-cite',
+    message: {
+      id: 'a-cite',
+      author: { role: 'assistant' },
+      content: {
+        content_type: 'text',
+        parts: ['According to research\uE200cite\uE202turn0search0\uE201, this holds true.'],
+      },
+    },
+  }, { 'a-cite': { id: 'a-cite' } });
+
+  assert.equal(textWithCitations.text, 'According to research, this holds true.');
+});
+
+test('messageNodeToView formats thinking duration and image asset pointer', () => {
+  const imageMsg = messageNodeToView({
+    id: 'm-img',
+    message: {
+      id: 'm-img',
+      author: { role: 'user' },
+      content: {
+        content_type: 'multimodal_text',
+        parts: [
+          { content_type: 'image_asset_pointer', mime_type: 'image/png', width: 800, height: 600 },
+        ],
+      },
+    },
+  }, { 'm-img': { id: 'm-img' } });
+
+  assert.ok(imageMsg.text.includes('800×600'));
+  assert.equal(imageMsg.unrecognized, false);
+
+  const durationView = messageNodeToView({
+    id: 'm-duration',
+    message: {
+      id: 'm-duration',
+      author: { role: 'assistant' },
+      content: { content_type: 'thoughts', thoughts: [{ summary: 'Step 1', content: 'Details' }] },
+      metadata: { finished_duration_sec: 125 },
+    },
+  }, { 'm-duration': { id: 'm-duration' } });
+
+  assert.equal(durationView.thinkingDuration, '2 分 5 秒');
+  assert.equal(durationView.unrecognized, false);
+});
+
+test('messageNodeToView classifies async reasoning worker messages as thinking rather than tool results', () => {
+  const asyncReasoningNode = messageNodeToView({
+    id: 'fab65083-1892-405f-ab6e-8473f6d4a839',
+    message: {
+      id: 'fab65083-1892-405f-ab6e-8473f6d4a839',
+      author: { role: 'tool', name: 'a8km123' },
+      content: { content_type: 'text', parts: [''] },
+      status: 'in_progress',
+      weight: 0,
+      metadata: {
+        initial_text: '正在推理',
+        finished_text: '已完成推理',
+        async_source: 'saserver-switzerlandwest-prod.fck9d:bon-user-vbaIGW9qbtKceRtsx4Fk2F13:EU',
+        cot_version: 'v5',
+      },
+    },
+  }, { 'fab65083-1892-405f-ab6e-8473f6d4a839': { id: 'fab65083-1892-405f-ab6e-8473f6d4a839' } });
+
+  assert.equal(asyncReasoningNode.tool, null, 'async reasoning worker is not an external tool');
+  assert.equal(asyncReasoningNode.role, 'assistant');
+  assert.equal(asyncReasoningNode.isThinking, true);
+  assert.equal(asyncReasoningNode.thought, '正在推理');
+
+  const finishedAsyncTrace = messageNodeToView({
+    id: '6fb2a1d5-2148-49d4-a886-94424f0ada8f',
+    message: {
+      id: '6fb2a1d5-2148-49d4-a886-94424f0ada8f',
+      author: { role: 'tool', name: 'a8km123' },
+      content: { content_type: 'text', parts: ['**查找网页资料**\n\n正在检索信息。'] },
+      status: 'finished_successfully',
+      weight: 0,
+      metadata: {
+        initial_text: '正在推理',
+        finished_text: '思考了 18m 19s',
+        async_source: 'saserver-switzerlandwest-prod.fck9d:bon-user-vbaIGW9qbtKceRtsx4Fk2F13:EU',
+        cot_version: 'v5',
+      },
+    },
+  }, { '6fb2a1d5-2148-49d4-a886-94424f0ada8f': { id: '6fb2a1d5-2148-49d4-a886-94424f0ada8f' } });
+
+  assert.equal(finishedAsyncTrace.tool, null);
+  assert.equal(finishedAsyncTrace.role, 'assistant');
+  assert.equal(finishedAsyncTrace.isThinking, false);
+  assert.ok(finishedAsyncTrace.thought.includes('查找网页资料'));
+  assert.equal(finishedAsyncTrace.thinkingDuration, '18m 19s');
+});
