@@ -27,6 +27,10 @@
   const RESUME_PATH = "/backend-api/f/conversation/resume";
   const RECONNECT_STORM_WINDOW_MS = 15_000;
   const RECONNECT_STORM_LIMIT = 6;
+  const CONVERSATION_INDEX_PAGE_SIZE = 100;
+  const MAX_SYNCED_CONVERSATIONS = 500;
+  const CONVERSATION_INDEX_REFRESH_MS = 30_000;
+  const CONVERSATION_INDEX_RETRY_MS = 5_000;
   let requestCounter = 0;
   let resleepTimer = null;
   let sendInFlight = false;
@@ -40,6 +44,10 @@
   let backendFetch = null;
   let backendFetchThis = null;
   let backendHeaders = null;
+  let backendSessionHeaders = null;
+  let conversationIndexSync = null;
+  let lastConversationIndexSyncAt = 0;
+  let lastConversationIndexSyncAttemptAt = 0;
   let thinkingSync = Promise.resolve();
   let resumeGeneration = 0;
   let resumeSession = null;
@@ -95,6 +103,7 @@
   const resumeDisconnectedTransports = () => {
     reconnectResumeIfNeeded();
     reconnectConversationSocketIfNeeded();
+    requestConversationIndexSync();
   };
   addEventListener("focus", resumeDisconnectedTransports);
   addEventListener("online", resumeDisconnectedTransports);
@@ -516,10 +525,87 @@
     if (!url || url.origin !== location.origin || !url.pathname.startsWith("/backend-api/")) return;
     backendFetch = upstreamFetch;
     backendFetchThis = fetchThis;
+    backendSessionHeaders = new Headers(request.headers);
     if (request.headers.get("authorization")) {
       backendHeaders = new Headers(request.headers);
       drainCanonicalFetches();
     }
+    if (!lastConversationIndexSyncAt) requestConversationIndexSync();
+  }
+
+  function requestConversationIndexSync() {
+    const sourceHeaders = backendHeaders || backendSessionHeaders;
+    const now = Date.now();
+    if (!backendFetch || !sourceHeaders || conversationIndexSync) return;
+    if (now - lastConversationIndexSyncAt < CONVERSATION_INDEX_REFRESH_MS) return;
+    if (now - lastConversationIndexSyncAttemptAt < CONVERSATION_INDEX_RETRY_MS) return;
+    lastConversationIndexSyncAttemptAt = now;
+    conversationIndexSync = syncConversationIndex(new Headers(sourceHeaders))
+      .then((synced) => {
+        if (synced) lastConversationIndexSyncAt = Date.now();
+      })
+      .catch(() => {})
+      .finally(() => {
+        conversationIndexSync = null;
+      });
+  }
+
+  async function syncConversationIndex(sourceHeaders) {
+    const headers = new Headers(sourceHeaders);
+    headers.delete("content-length");
+    headers.delete("content-type");
+    headers.set("accept", "application/json");
+
+    let offset = 0;
+    let synced = false;
+    const seenPages = new Set();
+    while (offset < MAX_SYNCED_CONVERSATIONS) {
+      const limit = Math.min(CONVERSATION_INDEX_PAGE_SIZE, MAX_SYNCED_CONVERSATIONS - offset);
+      const url = new URL("/backend-api/conversations", location.origin);
+      url.searchParams.set("offset", String(offset));
+      url.searchParams.set("limit", String(limit));
+      url.searchParams.set("order", "updated");
+
+      const response = await Reflect.apply(observedFetch, window, [
+        url.href,
+        {
+          method: "GET",
+          credentials: "include",
+          cache: "no-store",
+          headers,
+        },
+      ]);
+      if (!response.ok) return synced;
+
+      const text = await response.text();
+      if (text.length > MAX_NON_STREAM_BODY) return synced;
+      synced = true;
+
+      let value;
+      try {
+        value = JSON.parse(text);
+      } catch {
+        return synced;
+      }
+      const items = Array.isArray(value?.items)
+        ? value.items
+        : (Array.isArray(value?.data?.items) ? value.data.items : []);
+      if (!items.length) return synced;
+
+      const firstId = items[0]?.id || '';
+      const lastId = items[items.length - 1]?.id || '';
+      const pageSignature = `${items.length}:${firstId}:${lastId}`;
+      if (seenPages.has(pageSignature)) return synced;
+      seenPages.add(pageSignature);
+
+      offset += items.length;
+      const rawTotal = value?.total ?? value?.data?.total;
+      const total = rawTotal == null ? Number.NaN : Number(rawTotal);
+      if (Number.isFinite(total) && offset >= total) return synced;
+      const hasMore = value?.has_more ?? value?.hasMore ?? value?.data?.has_more ?? value?.data?.hasMore;
+      if (hasMore === false) return synced;
+    }
+    return synced;
   }
 
   function snapshotRequest(request, upstreamFetch, fetchThis, conversationScope) {

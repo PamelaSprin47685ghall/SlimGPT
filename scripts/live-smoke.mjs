@@ -202,10 +202,15 @@ async function runFixtureSmoke(browser, extensionId) {
   await top.evaluate(`(() => {
     history.replaceState(history.state, '', '/c/smoke');
     return Promise.all([
-      fetch('/backend-api/conversations?offset=0').then((response) => response.json()),
+      fetch('/backend-api/me').then((response) => response.json()),
       fetch('/backend-api/conversation/smoke').then((response) => response.json())
     ]);
   })()`);
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).conversations === 3);
+  assert.ok(
+    (fixture.conversationListRequests || 0) >= 1,
+    'an authenticated backend request must trigger proactive cloud conversation-index sync',
+  );
   await waitFor(async () => {
     const state = await ui.evaluate(uiStateExpression());
     return state.title === 'Fixture conversation' && state.messages.includes('Fixture answer');
@@ -1144,7 +1149,11 @@ async function fulfillFixtureRequest(client, event, fixture) {
     await sleep(650);
     body = JSON.stringify(fixture.delayedScopedEvent);
     contentType = 'application/json; charset=utf-8';
+  } else if (new URL(url).pathname === '/backend-api/me') {
+    body = JSON.stringify({ id: 'fixture-user' });
+    contentType = 'application/json; charset=utf-8';
   } else if (url.includes('/backend-api/conversations')) {
+    fixture.conversationListRequests = (fixture.conversationListRequests || 0) + 1;
     body = JSON.stringify(fixture.list);
     contentType = 'application/json; charset=utf-8';
   } else if (url.includes('/backend-api/conversation/second')) {
