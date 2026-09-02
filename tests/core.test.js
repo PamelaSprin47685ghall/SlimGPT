@@ -9,12 +9,14 @@ import {
   extractModelsList,
   extractThought,
   findConversationPayload,
+  findMessageEvents,
   getThinkingLevel,
   getToolMessageInfo,
   groupConversationTurns,
   hasNonTextExtras,
   messageNodeToView,
   parseWebMobilePartialConversation,
+  resolveConversationScope,
   stepConversationBranch,
   upsertLiveMessage,
 } from '../core.js';
@@ -82,11 +84,89 @@ test('payload/list discovery tolerates wrappers', () => {
   assert.equal(extractConversationItems({ data: { items: [{ id: 'c1', title: 'One', update_time: 2 }] } })[0].title, 'One');
 });
 
+test('message discovery carries the enclosing conversation identity into nested events', () => {
+  const [event] = findMessageEvents({
+    conversation_id: 'conversation-a',
+    payload: {
+      update: {
+        message: {
+          id: 'assistant-a',
+          author: { role: 'assistant' },
+          content: { parts: ['only A'] },
+        },
+      },
+    },
+  });
+
+  assert.equal(event.conversationId, 'conversation-a');
+  assert.equal(event.conversationIdConflict, false);
+});
+
+test('message discovery marks conflicting nested conversation identities unsafe', () => {
+  const [event] = findMessageEvents({
+    conversation_id: 'conversation-a',
+    payload: {
+      conversation_id: 'conversation-b',
+      message: {
+        id: 'assistant-conflict',
+        author: { role: 'assistant' },
+        content: { parts: ['must be dropped'] },
+      },
+    },
+  });
+
+  assert.equal(event.conversationId, null);
+  assert.equal(event.conversationIdConflict, true);
+});
+
+test('message discovery never deduplicates across conversation boundaries', () => {
+  const events = findMessageEvents([
+    {
+      conversation_id: 'conversation-a',
+      message: {
+        id: 'shared-message-id',
+        author: { role: 'assistant' },
+        content: { parts: ['A'] },
+      },
+    },
+    {
+      conversation_id: 'conversation-b',
+      message: {
+        id: 'shared-message-id',
+        author: { role: 'assistant' },
+        content: { parts: ['B'] },
+      },
+    },
+  ]);
+
+  assert.deepEqual(events.map((event) => event.conversationId), [
+    'conversation-a',
+    'conversation-b',
+  ]);
+});
+
+test('conversation scope resolution fails closed when identity signals disagree', () => {
+  assert.deepEqual(resolveConversationScope('conversation-a', 'conversation-a'), {
+    conversationId: 'conversation-a',
+    conflicted: false,
+  });
+  assert.deepEqual(resolveConversationScope('conversation-a', 'conversation-b'), {
+    conversationId: null,
+    conflicted: true,
+  });
+  assert.deepEqual(resolveConversationScope(null, ''), {
+    conversationId: null,
+    conflicted: false,
+  });
+});
+
 test('conversation id parser supports UI and API URLs', () => {
   assert.equal(conversationIdFromUrl('https://chatgpt.com/c/abc-123'), 'abc-123');
   assert.equal(conversationIdFromUrl('https://chatgpt.com/uc/anon-123'), 'anon-123');
   assert.equal(conversationIdFromUrl('https://chatgpt.com/backend-api/conversation/xyz'), 'xyz');
   assert.equal(conversationIdFromUrl('https://chatgpt.com/backend-api/conversations/xyz'), 'xyz');
+  assert.equal(conversationIdFromUrl('https://chatgpt.com/backend-api/f/conversation/resume'), null);
+  assert.equal(conversationIdFromUrl('https://chatgpt.com/unauth-mweb/conversation/updates'), null);
 });
 
 test('web-mobile partial HTML becomes a canonical conversation graph', () => {

@@ -24,6 +24,7 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     groupConversationTurns,
     parseJson,
     parseWebMobilePartialConversation,
+    resolveConversationScope,
     stepConversationBranch,
     upsertLiveMessage,
   } from '../../core.js';
@@ -44,6 +45,7 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
   let draft = $state('');
   let sendInFlight = $state(false);
   let pendingCommandId = null;
+  let pendingCommandConversationId = null;
   let sidebarOpen = $state(false);
   let overviewOpen = $state(false);
   let activeTurnIndex = $state(0);
@@ -58,6 +60,9 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
   const MAX_CACHED_PAYLOADS = 24;
   const sseBuffers = new Map();
   const xhrBuffers = new Map();
+  const captureConversationIds = new Map();
+  const conflictedCaptureIds = new Set();
+  const draftsByConversation = new Map();
   const recentFingerprints = new Map();
 
   const conversations = $derived([...conversationMap.values()].sort((a, b) => (Number(b.update_time) || 0) - (Number(a.update_time) || 0)));
@@ -162,6 +167,8 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
       clearTimeout(navigationTimer);
       sseBuffers.clear();
       xhrBuffers.clear();
+      captureConversationIds.clear();
+      conflictedCaptureIds.clear();
     };
   });
 
@@ -206,9 +213,16 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
       status = { ...status, takeover: message.active };
     }
     else if (message.type === 'page-stream-status') {
-      const id = message.conversationId || currentConversationId;
-      if (message.state === 'working') setConversationWorkState(id, 'working');
-      else if (message.state === 'idle') setConversationWorkState(id, 'idle');
+      const { conversationId, conflicted } = resolveConversationScope(
+        message.conversationId,
+        conversationIdFromUrl(message.url || ''),
+      );
+      if (!conflicted && conversationId && message.state === 'working') {
+        setConversationWorkState(conversationId, 'working');
+      }
+      else if (!conflicted && conversationId && message.state === 'idle') {
+        setConversationWorkState(conversationId, 'idle');
+      }
     }
     else if (message.type === 'page-location') handlePageLocation(message.url);
     else if (message.type === 'canonical-capture') handleCapture(message);
@@ -239,20 +253,25 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     if (isEventStream) {
       const key = capture.requestId || capture.url || 'sse';
       const { rest, frames } = consumeSse(sseBuffers.get(key) || '', text, capture.phase === 'complete');
-      if (capture.phase === 'complete') {
-        sseBuffers.delete(key);
-        if (capture.graceful) {
-          setConversationWorkState(conversationIdFromUrl(capture.url || '') || currentConversationId, 'idle');
-        }
-      } else {
-        sseBuffers.set(key, rest);
-      }
+      if (capture.phase === 'complete') sseBuffers.delete(key);
+      else sseBuffers.set(key, rest);
+
       for (const frame of frames) {
         if (frame.data === '[DONE]') {
-          setConversationWorkState(conversationIdFromUrl(capture.url || '') || currentConversationId, 'idle');
+          const scope = resolveCapturedConversation(capture);
+          if (!scope.conflicted && scope.conversationId) {
+            setConversationWorkState(scope.conversationId, 'idle');
+          }
         } else if (frame.json) {
-          processStructured(frame.json, capture.url || '');
+          processStructured(frame.json, capture);
         }
+      }
+      if (capture.phase === 'complete') {
+        const scope = resolveCapturedConversation(capture);
+        if (capture.graceful && !scope.conflicted && scope.conversationId) {
+          setConversationWorkState(scope.conversationId, 'idle');
+        }
+        releaseCaptureScope(capture);
       }
       return;
     }
@@ -262,6 +281,7 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
       const combined = `${xhrBuffers.get(key) || ''}${text}`;
       if (combined.length > MAX_CAPTURE_BUFFER) {
         xhrBuffers.delete(key);
+        releaseCaptureScope(capture);
         setComposerStatus('一个过大的页面响应已跳过，避免 SlimGPT 占用过多内存', true);
         return;
       }
@@ -270,40 +290,50 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
         return;
       }
       xhrBuffers.delete(key);
-      processCaptureText(combined, capture.url || '', capture.transport, capture.mimeType);
+      processCaptureText(combined, capture);
+      releaseCaptureScope(capture);
       return;
     }
 
-    processCaptureText(text, capture.url || '', capture.transport, capture.mimeType);
+    processCaptureText(text, capture);
   }
 
-  function processCaptureText(text, url, transport, mimeType = '') {
+  function processCaptureText(text, capture) {
     if (
-      String(mimeType).includes('text/vnd.openai.web-mobile-partial+html') ||
+      String(capture.mimeType || '').includes('text/vnd.openai.web-mobile-partial+html') ||
       text.includes('data-web-mobile-dpu-frame')
     ) {
       const conversation = parseWebMobilePartialConversation(text);
       if (conversation?.id) {
-        acceptConversationPayload(conversation.id, conversation);
+        const scope = resolveCapturedConversation(capture, conversation.id);
+        if (!scope.conflicted && scope.conversationId) {
+          maybeActivateCapturedConversation(scope.conversationId, capture);
+          acceptConversationPayload(scope.conversationId, conversation);
+        }
         return;
       }
     }
 
     const json = parseJson(text);
     if (json) {
-      processStructured(json, url);
+      processStructured(json, capture);
       return;
     }
-    if (transport === 'websocket' || text.includes('data:')) {
-      for (const frame of consumeSse('', text, true).frames) if (frame.json) processStructured(frame.json, url);
+    if (capture.transport === 'websocket' || text.includes('data:')) {
+      for (const frame of consumeSse('', text, true).frames) {
+        if (frame.json) processStructured(frame.json, capture);
+      }
     }
   }
 
-  function processStructured(value, url) {
+  function processStructured(value, capture) {
     const conversation = findConversationPayload(value);
     if (conversation) {
-      const id = conversationIdFromPayload(conversation, url) || currentConversationId;
-      if (id) acceptConversationPayload(id, conversation);
+      const scope = resolveCapturedConversation(capture, conversationIdFromPayload(conversation));
+      if (!scope.conflicted && scope.conversationId) {
+        maybeActivateCapturedConversation(scope.conversationId, capture);
+        acceptConversationPayload(scope.conversationId, conversation);
+      }
       return;
     }
 
@@ -316,11 +346,18 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
       }
       conversationMap = next;
       schedulePersist();
+      return;
     }
 
     for (const event of findMessageEvents(value)) {
-      const id = event.conversationId || conversationIdFromUrl(url) || currentConversationId;
-      if (!id) continue;
+      const scope = resolveCapturedConversation(
+        capture,
+        event.conversationId,
+        event.conversationIdConflict,
+      );
+      if (scope.conflicted || !scope.conversationId) continue;
+      const id = scope.conversationId;
+      maybeActivateCapturedConversation(id, capture);
       const next = new Map(liveMessages);
       next.set(id, upsertLiveMessage(next.get(id) || [], event.message));
       liveMessages = next;
@@ -330,8 +367,69 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
         if (hasRenderableConversationContent(id) && (loadingConversationId === id || navigationTimedOutId === id)) {
           finishConversationLoading();
         }
-        reconcilePending(event.message);
+        reconcilePending(id, event.message);
       }
+    }
+  }
+
+  function resolveCapturedConversation(capture, explicitConversationId = null, explicitConflict = false) {
+    const key = persistentCaptureKey(capture);
+    if (
+      explicitConflict ||
+      capture.conversationIdConflict ||
+      (key && conflictedCaptureIds.has(key))
+    ) {
+      if (key) conflictedCaptureIds.add(key);
+      return { conversationId: null, conflicted: true };
+    }
+
+    const urlConversationId = capture.conversationId
+      ? null
+      : conversationIdFromUrl(capture.url || '');
+    const scope = resolveConversationScope(
+      explicitConversationId,
+      capture.conversationId,
+      urlConversationId,
+      key ? captureConversationIds.get(key) : null,
+    );
+    if (scope.conflicted) {
+      if (key) {
+        captureConversationIds.delete(key);
+        conflictedCaptureIds.add(key);
+      }
+      return scope;
+    }
+    if (scope.conversationId && key) {
+      captureConversationIds.set(key, scope.conversationId);
+      if (captureConversationIds.size > 128) {
+        const oldestKey = captureConversationIds.keys().next().value;
+        captureConversationIds.delete(oldestKey);
+        conflictedCaptureIds.delete(oldestKey);
+      }
+    }
+    return scope;
+  }
+
+  function persistentCaptureKey(capture) {
+    if (!capture?.requestId || !['sse', 'xhr'].includes(capture.transport)) return null;
+    return `${capture.transport}:${capture.requestId}`;
+  }
+
+  function releaseCaptureScope(capture) {
+    const key = persistentCaptureKey(capture);
+    if (!key) return;
+    captureConversationIds.delete(key);
+    conflictedCaptureIds.delete(key);
+  }
+
+  function maybeActivateCapturedConversation(id, capture) {
+    if (id === currentConversationId) return;
+    if (currentConversationId) return;
+    if (
+      capture.conversationRequest === true &&
+      pendingUser?.conversationId === null
+    ) {
+      bindPendingConversation(id);
     }
   }
 
@@ -344,26 +442,23 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     nextTerminals.set(id, payload.current_node);
     nextLive.set(id, []);
 
-    // Evict oldest cached conversation trees if exceeding limit
+    // Evict oldest cached conversation trees if exceeding limit.
     while (nextPayloads.size > MAX_CACHED_PAYLOADS) {
-      const oldestId = nextPayloads.keys().next().value;
-      if (oldestId === id || oldestId === currentConversationId) break;
-      nextPayloads.delete(oldestId);
-      nextTerminals.delete(oldestId);
-      nextLive.delete(oldestId);
+      let evictedId = null;
+      for (const candidateId of nextPayloads.keys()) {
+        if (candidateId === id || candidateId === currentConversationId) continue;
+        evictedId = candidateId;
+        break;
+      }
+      if (!evictedId) break;
+      nextPayloads.delete(evictedId);
+      nextTerminals.delete(evictedId);
+      nextLive.delete(evictedId);
     }
 
     payloads = nextPayloads;
     terminals = nextTerminals;
     liveMessages = nextLive;
-    const pageConversationId = conversationIdFromUrl(status.pageUrl || '');
-    if (id === currentConversationId || id === pageConversationId || (!currentConversationId && !pageConversationId)) {
-      if (!currentConversationId && newChatWorkState === 'working') {
-        setConversationWorkState(id, 'working');
-        newChatWorkState = 'idle';
-      }
-      currentConversationId = id;
-    }
     updateWorkStateFromPayload(id, payload);
     const next = new Map(conversationMap);
     const previous = next.get(id) || {};
@@ -371,18 +466,22 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     const pagePath = (() => {
       try { return new URL(status.pageUrl || 'https://chatgpt.com/').pathname; } catch { return ''; }
     })();
+    const pageConversationId = conversationIdFromUrl(status.pageUrl || '');
     next.set(id, normalizeConversationMeta({
       id,
       title: payload.title || previous.title || 'Untitled',
       create_time: payload.create_time || previous.create_time,
       update_time: payload.update_time || Date.now() / 1000,
-      route: payload.metadata?.source === 'web-mobile-partial' || pagePath.startsWith('/uc/') ? 'uc' : (previous.route || 'c'),
+      route: payload.metadata?.source === 'web-mobile-partial' ||
+        (pageConversationId === id && pagePath.startsWith('/uc/'))
+        ? 'uc'
+        : (previous.route || 'c'),
       last: details.last,
       model: details.model,
     }, previous));
     conversationMap = next;
     if (loadingConversationId === id) finishConversationLoading();
-    reconcilePendingAgainstPayload(payload);
+    reconcilePendingAgainstPayload(id, payload);
     schedulePersist();
   }
 
@@ -392,13 +491,17 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     const id = conversationIdFromUrl(url);
     if (id) {
       if (id !== currentConversationId) {
-        currentConversationId = id;
+        if (pendingUser?.conversationId === null && currentConversationId === null) {
+          bindPendingConversation(id);
+        } else {
+          setCurrentConversation(id);
+        }
         thinkingLevelOverride = null;
         startConversationLoading(id);
       }
     }
     else if (url.startsWith('https://chatgpt.com/')) {
-      currentConversationId = null;
+      setCurrentConversation(null);
       thinkingLevelOverride = null;
       finishConversationLoading();
     }
@@ -414,7 +517,7 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
       overviewOpen = false;
       return;
     }
-    currentConversationId = id;
+    setCurrentConversation(id);
     thinkingLevelOverride = null;
     startConversationLoading(id);
     sidebarOpen = false;
@@ -431,7 +534,7 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
       setComposerStatus('当前消息仍在提交，请等待确认后再新建对话', true);
       return;
     }
-    currentConversationId = null;
+    setCurrentConversation(null);
     thinkingLevelOverride = null;
     newChatWorkState = 'idle';
     finishConversationLoading();
@@ -440,6 +543,39 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     overviewOpen = false;
     if (transport.supportsLiveChat) {
       transport.send({ type: 'new-chat', thinkingLevel: userSettings.thinkingLevel });
+    }
+  }
+
+  function setCurrentConversation(id, { migrateDraft = false } = {}) {
+    const nextId = id || null;
+    if (nextId === currentConversationId) return;
+    const previousId = currentConversationId;
+    if (migrateDraft) {
+      draftsByConversation.delete(previousId);
+      currentConversationId = nextId;
+      draftsByConversation.set(nextId, draft);
+      return;
+    }
+    draftsByConversation.set(previousId, draft);
+    currentConversationId = nextId;
+    draft = draftsByConversation.get(nextId) || '';
+  }
+
+  function bindPendingConversation(id) {
+    if (!id || pendingUser?.conversationId !== null) return;
+    pendingUser = { ...pendingUser, conversationId: id };
+    if (
+      pendingCommandId === pendingUser.commandId &&
+      pendingCommandConversationId === null
+    ) {
+      pendingCommandConversationId = id;
+    }
+    if (currentConversationId === null) {
+      setCurrentConversation(id, { migrateDraft: true });
+    }
+    if (newChatWorkState === 'working') {
+      setConversationWorkState(id, 'working');
+      newChatWorkState = 'idle';
     }
   }
 
@@ -513,7 +649,9 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     const levelObj = THINKING_LEVELS.find((item) => item.level === thinkingLevel) || THINKING_LEVELS[2];
     sendInFlight = true;
     pendingCommandId = commandId;
+    pendingCommandConversationId = currentConversationId;
     pendingUser = {
+      commandId,
       conversationId: currentConversationId,
       text,
       message: {
@@ -543,24 +681,29 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
     clearTimeout(sendTimer);
     sendTimer = setTimeout(() => {
       if (pendingCommandId !== commandId) return;
+      const timedOutConversationId = pendingCommandConversationId;
       pendingCommandId = null;
+      pendingCommandConversationId = null;
       sendInFlight = false;
-      pendingUser = null;
-      setConversationWorkState(currentConversationId, 'idle');
+      if (pendingUser?.commandId === commandId) pendingUser = null;
+      setConversationWorkState(timedOutConversationId, 'idle');
       setComposerStatus('官方输入框未确认提交；内容仍保留，请检查官方界面后手动决定是否重试', true);
     }, 14_000);
     setComposerStatus('正在通过 ChatGPT 页面发送；断线后不会自动重发');
   }
 
   function handleComposerResult(message) {
-    if (message.commandId && pendingCommandId && message.commandId !== pendingCommandId) return;
+    if (!pendingCommandId || message.commandId !== pendingCommandId) return;
+    const submitted = pendingUser;
+    const submittedConversationId = pendingCommandConversationId;
     clearTimeout(sendTimer);
     sendTimer = null;
     sendInFlight = false;
     pendingCommandId = null;
+    pendingCommandConversationId = null;
     if (!message.ok) {
       pendingUser = null;
-      setConversationWorkState(currentConversationId, 'idle');
+      setConversationWorkState(submittedConversationId, 'idle');
       const details = {
         'composer-not-found': '找不到官方输入框：请检查当前 ChatGPT 页面是否已登录或页面结构是否变化',
         'composer-rejected-input': '官方输入框没有接受这段文字；内容仍保留，未发送',
@@ -573,18 +716,36 @@ import { loadConversationIndex, saveConversationIndex, loadUserSettings, saveUse
       setComposerStatus(detail, true);
       return;
     }
-    if (pendingUser && draft.trim() === pendingUser.text.trim()) draft = '';
+    if (submitted) {
+      const submittedText = submitted.text.trim();
+      if (
+        currentConversationId === submitted.conversationId &&
+        draft.trim() === submittedText
+      ) {
+        draft = '';
+      }
+      const storedDraft = draftsByConversation.get(submitted.conversationId);
+      if (typeof storedDraft === 'string' && storedDraft.trim() === submittedText) {
+        draftsByConversation.set(submitted.conversationId, '');
+      }
+    }
     setComposerStatus('消息已发送（官方已确认）');
   }
 
-  function reconcilePending(rawMessage) {
-    if (!pendingUser || rawMessage?.author?.role !== 'user') return;
+  function reconcilePending(id, rawMessage) {
+    if (
+      !pendingUser ||
+      pendingUser.conversationId !== id ||
+      rawMessage?.author?.role !== 'user'
+    ) {
+      return;
+    }
     const text = rawMessage?.content?.parts?.filter((part) => typeof part === 'string').join('\n') || '';
     if (text.trim() === pendingUser.text.trim()) pendingUser = null;
   }
 
-  function reconcilePendingAgainstPayload(payload) {
-    if (!pendingUser || !payload?.mapping) return;
+  function reconcilePendingAgainstPayload(id, payload) {
+    if (!pendingUser || pendingUser.conversationId !== id || !payload?.mapping) return;
     for (const node of Object.values(payload.mapping)) {
       if (node?.message?.author?.role !== 'user') continue;
       const text = (node.message.content?.parts || []).filter((part) => typeof part === 'string').join('\n');

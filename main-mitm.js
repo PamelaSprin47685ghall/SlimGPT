@@ -16,6 +16,7 @@
   const SLEEP_STYLE_ID = "slimgpt-render-sleep-style";
   const SLEEP_ATTR = "data-slimgpt-render-sleep";
   const MAX_NON_STREAM_BODY = 20 * 1024 * 1024;
+  const MAX_IDENTITY_BODY = 1024 * 1024;
   const INITIAL_SHELL_READY_TIMEOUT = 15_000;
   const COMPOSER_WAKE_TIMEOUT = 2_500;
   const SEND_CONTROL_TIMEOUT = 1_500;
@@ -45,6 +46,7 @@
   let conversationSocketGeneration = 0;
   let conversationSocketState = null;
   let observedLocationHref = location.href;
+  let preserveDomConversationOwnership = () => {};
   const canonicalFetches = new Map();
   const pendingCanonicalIds = new Set();
   const observedFetchResponses = new WeakSet();
@@ -248,8 +250,19 @@
     let observer = null;
     let scanTimer = null;
     const seenText = new Map();
-    const messageOwners = new Map();
+    const messageOwners = new WeakMap();
     const MAX_SEEN_MESSAGES = 120;
+
+    preserveDomConversationOwnership = (conversationId) => {
+      if (!conversationId) return;
+      const nodes = document.querySelectorAll('[data-message-author-role]');
+      for (let index = Math.max(0, nodes.length - 30); index < nodes.length; index += 1) {
+        const roleNode = nodes[index];
+        const messageRoot = roleNode.closest('[data-message-id]') || roleNode.querySelector?.('[data-message-id]');
+        const ownerNode = messageRoot || roleNode;
+        if (!messageOwners.has(ownerNode)) messageOwners.set(ownerNode, conversationId);
+      }
+    };
 
     const schedule = () => {
       if (scanTimer) return;
@@ -271,15 +284,16 @@
         const messageRoot = roleNode.closest('[data-message-id]') || roleNode.querySelector?.('[data-message-id]');
         const messageId = messageRoot?.getAttribute?.('data-message-id') || roleNode.getAttribute('data-message-id');
         if (!messageId) continue;
-        const conversationId = messageOwners.get(messageId) || pageConversationId;
-        if (!messageOwners.has(messageId)) messageOwners.set(messageId, conversationId);
+        const ownerNode = messageRoot || roleNode;
+        const conversationId = messageOwners.get(ownerNode) || pageConversationId;
+        if (!messageOwners.has(ownerNode)) messageOwners.set(ownerNode, conversationId);
         const text = String(roleNode.textContent || '').replace(/\u00a0/g, ' ').trim();
-        if (!text || seenText.get(messageId) === text) continue;
-        seenText.set(messageId, text);
+        const seenKey = `${conversationId}\u0000${messageId}`;
+        if (!text || seenText.get(seenKey) === text) continue;
+        seenText.set(seenKey, text);
         if (seenText.size > MAX_SEEN_MESSAGES) {
           const oldest = seenText.keys().next().value;
           seenText.delete(oldest);
-          messageOwners.delete(oldest);
         }
         emit({
           type: "page-capture",
@@ -287,6 +301,7 @@
           phase: "message",
           requestId: `dom-${messageId}`,
           url: location.href,
+          conversationId,
           mimeType: "application/json",
           timestamp: Date.now(),
           data: JSON.stringify({
@@ -335,8 +350,9 @@
       const fetchThis = this;
       const request = observedRequest(input, init);
       if (request) observeBackendRequest(request, upstreamFetch, fetchThis);
+      const conversationScope = request ? snapshotConversationScope(request) : null;
       const resumeSnapshot = request && isResumeRequest(request)
-        ? snapshotRequest(request, upstreamFetch, fetchThis)
+        ? snapshotRequest(request, upstreamFetch, fetchThis, conversationScope)
         : null;
       const submission = request && isConversationSubmission(request);
 
@@ -368,21 +384,19 @@
       const divertResume = Boolean(resumeSnapshot && divertOfficialStream);
       let resumeGenerationForCapture = null;
       if (divertResume) resumeGenerationForCapture = adoptResumeRequest(resumeSnapshot);
+      const captureMeta = {
+        requestId,
+        url,
+        status: response.status,
+        mimeType,
+        conversationScope,
+        conversationRequest: Boolean(submission),
+      };
 
       if (mimeType.includes("text/vnd.openai.web-mobile-partial+html") && clone.body) {
-        void captureWebMobileStream(clone.body, {
-          requestId,
-          url,
-          status: response.status,
-          mimeType,
-        });
+        void captureWebMobileStream(clone.body, captureMeta);
       } else if (mimeType.includes("text/event-stream") && clone.body) {
-        const streamMeta = {
-          requestId,
-          url,
-          status: response.status,
-          mimeType,
-        };
+        const streamMeta = { ...captureMeta };
         if (divertResume) {
           streamMeta.resume = true;
           streamMeta.cancelSignal = resumeSession?.generation === resumeGenerationForCapture
@@ -394,12 +408,7 @@
       } else {
         const declaredLength = Number(response.headers.get("content-length") || 0);
         if (!declaredLength || declaredLength <= MAX_NON_STREAM_BODY) {
-          void captureBoundedResponse(clone, {
-            requestId,
-            url,
-            status: response.status,
-            mimeType,
-          });
+          void captureBoundedResponse(clone, captureMeta);
         }
       }
 
@@ -422,6 +431,69 @@
     } catch {
       return null;
     }
+  }
+
+  function snapshotConversationScope(request) {
+    const urlConversationId = conversationIdFromUrl(request?.url);
+    const bodyConversationId = isConversationSubmission(request) || isResumeRequest(request)
+      ? readRequestConversationId(request)
+      : Promise.resolve(null);
+    return bodyConversationId.then((bodyId) => {
+      if (bodyId && urlConversationId && bodyId !== urlConversationId) {
+        return { conversationId: null, conflicted: true };
+      }
+      return {
+        conversationId: bodyId || urlConversationId,
+        conflicted: false,
+      };
+    });
+  }
+
+  async function readRequestConversationId(request) {
+    if (!request || !["POST", "PUT", "PATCH"].includes(request.method.toUpperCase())) return null;
+    const declaredLength = Number(request.headers.get("content-length") || 0);
+    if (declaredLength > MAX_IDENTITY_BODY) return null;
+    try {
+      const text = await request.clone().text();
+      if (text.length > MAX_IDENTITY_BODY) return null;
+      return conversationIdFromRequestBody(text);
+    } catch {
+      return null;
+    }
+  }
+
+  function conversationIdFromRequestBody(body) {
+    let value = body;
+    if (typeof body === "string") {
+      const text = body.trim();
+      if (!text) return null;
+      try {
+        value = JSON.parse(text);
+      } catch {
+        try {
+          return new URLSearchParams(text).get("conversation_id") ||
+            new URLSearchParams(text).get("conversationId") ||
+            null;
+        } catch {
+          return null;
+        }
+      }
+    } else if (body instanceof URLSearchParams || body instanceof FormData) {
+      const field = body.get("conversation_id") || body.get("conversationId");
+      return typeof field === "string" && field.trim() ? field.trim() : null;
+    }
+    const direct = value?.conversation_id || value?.conversationId;
+    return typeof direct === "string" && direct.trim() ? direct.trim() : null;
+  }
+
+  async function resolveCaptureMeta(meta) {
+    const { conversationScope, ...captureMeta } = meta;
+    if (!conversationScope) return captureMeta;
+    const scope = await conversationScope.catch(() => ({ conversationId: null, conflicted: false }));
+    if (scope.conflicted) return { ...captureMeta, conversationIdConflict: true };
+    return scope.conversationId
+      ? { ...captureMeta, conversationId: scope.conversationId }
+      : captureMeta;
   }
 
   function isResumeRequest(request) {
@@ -450,7 +522,7 @@
     }
   }
 
-  function snapshotRequest(request, upstreamFetch, fetchThis) {
+  function snapshotRequest(request, upstreamFetch, fetchThis, conversationScope) {
     const method = request.method.toUpperCase();
     const hasBody = method !== "GET" && method !== "HEAD" && request.body !== null;
     const bodyPromise = hasBody
@@ -472,7 +544,7 @@
       bodyPromise,
       upstreamFetch,
       fetchThis,
-      conversationId: conversationIdFromLocation(),
+      conversationScope,
     };
   }
 
@@ -536,7 +608,12 @@
     return generation;
   }
 
-  function handleResumeStreamClose(generation, { sawDone, error }) {
+  function handleResumeStreamClose(generation, {
+    sawDone,
+    error,
+    conversationId,
+    conversationIdConflict,
+  }) {
     const session = resumeSession;
     if (!session || session.generation !== generation) return;
     session.controller = null;
@@ -547,7 +624,7 @@
         transport: "sse",
         phase: "complete",
         state: "idle",
-        conversationId: session.snapshot.conversationId || conversationIdFromLocation(),
+        ...(conversationId && !conversationIdConflict ? { conversationId } : {}),
         timestamp: Date.now(),
       });
       return;
@@ -559,7 +636,7 @@
       phase: "closed",
       state: "disconnected",
       error: Boolean(error),
-      conversationId: session.snapshot.conversationId || conversationIdFromLocation(),
+      ...(conversationId && !conversationIdConflict ? { conversationId } : {}),
       timestamp: Date.now(),
     });
     scheduleResumeReconnect(session);
@@ -626,12 +703,16 @@
       if (!response.ok || !response.body || !mimeType.includes("text/event-stream")) {
         throw new Error(`resume-http-${response.status}`);
       }
+      const resolvedScope = await session.snapshot.conversationScope
+        .catch(() => ({ conversationId: null, conflicted: false }));
       emit({
         type: "page-stream-status",
         transport: "sse",
         phase: "connected",
         state: "connected",
-        conversationId: session.snapshot.conversationId || conversationIdFromLocation(),
+        ...(!resolvedScope.conflicted && resolvedScope.conversationId
+          ? { conversationId: resolvedScope.conversationId }
+          : {}),
         timestamp: Date.now(),
       });
       await captureReadableStream(response.body, {
@@ -639,6 +720,7 @@
         url: response.url || session.snapshot.url,
         status: response.status,
         mimeType,
+        conversationScope: session.snapshot.conversationScope,
         resume: true,
         replay: true,
         cancelSignal: controller.signal,
@@ -654,7 +736,6 @@
         phase: "closed",
         state: "disconnected",
         error: true,
-        conversationId: session.snapshot.conversationId || conversationIdFromLocation(),
         timestamp: Date.now(),
       });
       scheduleResumeReconnect(session);
@@ -698,7 +779,8 @@
   async function captureReadableStream(stream, meta) {
     const reader = stream.getReader();
     const decoder = new TextDecoder();
-    const { onClose, cancelSignal, ...captureMeta } = meta;
+    const { onClose, cancelSignal, ...unresolvedMeta } = meta;
+    const captureMeta = await resolveCaptureMeta(unresolvedMeta);
     const cancelReader = () => { void reader.cancel().catch(() => {}); };
     if (cancelSignal?.aborted) cancelReader();
     else cancelSignal?.addEventListener("abort", cancelReader, { once: true });
@@ -743,7 +825,12 @@
       cancelSignal?.removeEventListener("abort", cancelReader);
       reader.releaseLock();
       try {
-        onClose?.({ sawDone, error: readError });
+        onClose?.({
+          sawDone,
+          error: readError,
+          conversationId: captureMeta.conversationId || null,
+          conversationIdConflict: Boolean(captureMeta.conversationIdConflict),
+        });
       } catch {
         // Transport recovery must never escape into the observed request.
       }
@@ -753,6 +840,7 @@
   async function captureWebMobileStream(stream, meta) {
     const reader = stream.getReader();
     const decoder = new TextDecoder();
+    const captureMeta = await resolveCaptureMeta(meta);
     let source = "";
     let bytes = 0;
     let lastLiveText = "";
@@ -774,14 +862,14 @@
           const snapshot = extractWebMobileLiveSnapshot(source);
           if (snapshot?.text && snapshot.text !== lastLiveText) {
             lastLiveText = snapshot.text;
-            emitWebMobileLiveMessage(snapshot, meta);
+            emitWebMobileLiveMessage(snapshot, captureMeta);
           }
         }
       }
       const tail = decoder.decode();
       if (tail) source += tail;
       const safeConversation = extractWebMobileConversationMarkup(source);
-      if (safeConversation) emitCompletedFetch(safeConversation, meta);
+      if (safeConversation) emitCompletedFetch(safeConversation, captureMeta);
     } catch {
       // Observation must never break the product request.
     } finally {
@@ -841,10 +929,11 @@
   }
 
   async function captureBoundedResponse(response, meta) {
+    const captureMeta = await resolveCaptureMeta(meta);
     if (!response.body) {
       try {
         const data = await response.text();
-        if (data.length <= MAX_NON_STREAM_BODY) emitCompletedFetch(data, meta);
+        if (data.length <= MAX_NON_STREAM_BODY) emitCompletedFetch(data, captureMeta);
       } catch {
         // Observation must never break the product request.
       }
@@ -869,7 +958,7 @@
       }
       const tail = decoder.decode();
       if (tail) parts.push(tail);
-      emitCompletedFetch(parts.join(""), meta);
+      emitCompletedFetch(parts.join(""), captureMeta);
     } catch {
       // Observation must never break the product request.
     } finally {
@@ -913,11 +1002,35 @@
 
     if (prototype.send !== observedXhrSend) {
       const upstreamSend = prototype.send;
-      observedXhrSend = function slimgptSend() {
+      observedXhrSend = function slimgptSend(body) {
         const meta = this.__slimgptMeta;
         if (meta && interesting(meta.url) && !this[XHR_RESPONSE_OBSERVED]) {
           this[XHR_RESPONSE_OBSERVED] = true;
-          observeXhrResponse(this, meta);
+          const url = new URL(meta.url, location.href);
+          const urlConversationId = conversationIdFromUrl(url.href);
+          const bodyCanDeclareConversation = String(meta.method || "").toUpperCase() === "POST" &&
+            (url.pathname === "/backend-api/conversation" ||
+              url.pathname === "/backend-api/f/conversation" ||
+              url.pathname === RESUME_PATH);
+          const bodyConversationId = bodyCanDeclareConversation
+            ? conversationIdFromRequestBody(body)
+            : null;
+          const conversationScope = Promise.resolve(
+            bodyConversationId && urlConversationId && bodyConversationId !== urlConversationId
+              ? { conversationId: null, conflicted: true }
+              : {
+                  conversationId: bodyConversationId || urlConversationId,
+                  conflicted: false,
+                },
+          );
+          const conversationRequest = String(meta.method || "").toUpperCase() === "POST" &&
+            url.origin === location.origin &&
+            (url.pathname === "/backend-api/conversation" || url.pathname === "/backend-api/f/conversation");
+          observeXhrResponse(this, {
+            ...meta,
+            conversationScope,
+            conversationRequest,
+          });
         }
         return Reflect.apply(upstreamSend, this, arguments);
       };
@@ -927,10 +1040,12 @@
 
   function observeXhrResponse(xhr, meta) {
     const requestId = nextRequestId("xhr");
+    const captureMetaPromise = resolveCaptureMeta(meta);
     let sentLength = 0;
     let captureDisabled = false;
-    const capture = (phase) => {
+    const capture = async (phase) => {
       try {
+        const captureMeta = await captureMetaPromise;
         if (captureDisabled) return;
         if (xhr.responseType && xhr.responseType !== "text") return;
         const text = xhr.responseText || "";
@@ -952,6 +1067,7 @@
           phase,
           timestamp: Date.now(),
           data: delta,
+          ...captureMeta,
         });
       } catch {
         // Cross-origin/responseType access can throw; ignore observation only.
@@ -1343,12 +1459,23 @@
     }
   }
 
-  function conversationIdFromLocation() {
-    return location.pathname.match(/\/(?:c|uc)\/([^/?#]+)/)?.[1] || null;
+  function conversationIdFromUrl(rawUrl) {
+    try {
+      const url = new URL(String(rawUrl || ""), location.href);
+      const routeId = url.pathname.match(/\/(?:c|uc)\/([^/?#]+)/)?.[1];
+      if (routeId) return routeId;
+      const apiId = url.pathname.match(/^\/backend-api\/(?:f\/)?conversations?\/([^/?#]+)\/?$/)?.[1];
+      return apiId && !["prepare", "resume", "runtime"].includes(apiId)
+        ? apiId
+        : null;
+    } catch {
+      return null;
+    }
   }
 
   function emitLocation() {
     if (location.href !== observedLocationHref) {
+      preserveDomConversationOwnership(conversationIdFromUrl(observedLocationHref));
       observedLocationHref = location.href;
       resetResumeSession();
     }
@@ -1357,12 +1484,14 @@
 
   const nativePushState = history.pushState;
   history.pushState = function slimgptPushState() {
+    preserveDomConversationOwnership(conversationIdFromUrl(location.href));
     const result = nativePushState.apply(this, arguments);
     queueMicrotask(emitLocation);
     return result;
   };
   const nativeReplaceState = history.replaceState;
   history.replaceState = function slimgptReplaceState() {
+    preserveDomConversationOwnership(conversationIdFromUrl(location.href));
     const result = nativeReplaceState.apply(this, arguments);
     queueMicrotask(emitLocation);
     return result;

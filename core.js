@@ -272,31 +272,62 @@ function formatDefaultModelTitle(slug) {
   return map[slug] || slug;
 }
 
-export function findMessageEvents(value, depth = 0, output = []) {
-  if (!value || typeof value !== "object" || depth > 6) return output;
+export function findMessageEvents(value) {
+  const output = [];
+  collectMessageEvents(value, 0, { conversationId: null, conflicted: false }, output);
+  return dedupeMessageEvents(output);
+}
+
+function collectMessageEvents(value, depth, inheritedScope, output) {
+  if (!value || typeof value !== "object" || depth > 6) return;
+  const directConversationId = value.conversation_id || value.conversationId || null;
+  const scope = mergeConversationScope(inheritedScope, directConversationId);
+
   if (looksLikeMessage(value.message)) {
+    const messageScope = mergeConversationScope(
+      scope,
+      value.message.conversation_id || value.message.conversationId || null,
+    );
     output.push({
       message: value.message,
-      conversationId: value.conversation_id || value.conversationId || null,
+      conversationId: messageScope.conversationId,
+      conversationIdConflict: messageScope.conflicted,
     });
   }
   if (looksLikeMessage(value) && (value.author || value.content)) {
-    output.push({ message: value, conversationId: null });
-    return output;
+    output.push({
+      message: value,
+      conversationId: scope.conversationId,
+      conversationIdConflict: scope.conflicted,
+    });
+    return;
   }
   for (const child of Object.values(value)) {
     if (!child || typeof child !== "object") continue;
-    findMessageEvents(child, depth + 1, output);
+    collectMessageEvents(child, depth + 1, scope, output);
   }
-  return dedupeMessageEvents(output);
+}
+
+function mergeConversationScope(scope, candidate) {
+  if (scope.conflicted || typeof candidate !== "string" || !candidate.trim()) return scope;
+  const conversationId = candidate.trim();
+  if (scope.conversationId && scope.conversationId !== conversationId) {
+    return { conversationId: null, conflicted: true };
+  }
+  return scope.conversationId === conversationId
+    ? scope
+    : { conversationId, conflicted: false };
 }
 
 function dedupeMessageEvents(events) {
   const seen = new Set();
-  return events.filter(({ message }) => {
+  return events.filter(({ message, conversationId, conversationIdConflict }) => {
     const id = message?.id;
-    if (!id || seen.has(id)) return false;
-    seen.add(id);
+    if (!id) return false;
+    const scope = conversationIdConflict ? "conflict" : (conversationId || "unscoped");
+    const key = `${scope}\u0000${id}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
     return true;
   });
 }
@@ -311,14 +342,27 @@ export function conversationIdFromPayload(payload, fallbackUrl = "") {
   return conversationIdFromUrl(fallbackUrl);
 }
 
+export function resolveConversationScope(...candidates) {
+  let conversationId = null;
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string" || !candidate.trim()) continue;
+    const normalized = candidate.trim();
+    if (conversationId && conversationId !== normalized) {
+      return { conversationId: null, conflicted: true };
+    }
+    conversationId = normalized;
+  }
+  return { conversationId, conflicted: false };
+}
+
 export function conversationIdFromUrl(url) {
   if (typeof url !== "string") return null;
   try {
     const parsed = new URL(url, "https://chatgpt.com/");
     const routeMatch = parsed.pathname.match(/\/(?:c|uc)\/([^/?#]+)/);
     if (routeMatch) return routeMatch[1];
-    const apiMatch = parsed.pathname.match(/\/conversations?\/([^/?#]+)/);
-    if (apiMatch) return apiMatch[1];
+    const apiMatch = parsed.pathname.match(/^\/backend-api\/(?:f\/)?conversations?\/([^/?#]+)\/?$/);
+    if (apiMatch && !["prepare", "resume", "runtime"].includes(apiMatch[1])) return apiMatch[1];
   } catch {
     // Ignore malformed URLs from transient capture records.
   }
@@ -940,6 +984,8 @@ export function fingerprintCapture(capture, text) {
   return [
     capture?.url || "",
     capture?.transport || "",
+    capture?.conversationId || "",
+    capture?.conversationIdConflict ? "conflict" : "",
     body.length,
     body.slice(0, 96),
     body.slice(-96),

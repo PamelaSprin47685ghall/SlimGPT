@@ -199,10 +199,13 @@ async function runFixtureSmoke(browser, extensionId) {
     textarea.dispatchEvent(new Event('input', { bubbles: true }));
   })()`);
 
-  await top.evaluate(`Promise.all([
-    fetch('/backend-api/conversations?offset=0').then((response) => response.json()),
-    fetch('/backend-api/conversation/smoke').then((response) => response.json())
-  ])`);
+  await top.evaluate(`(() => {
+    history.replaceState(history.state, '', '/c/smoke');
+    return Promise.all([
+      fetch('/backend-api/conversations?offset=0').then((response) => response.json()),
+      fetch('/backend-api/conversation/smoke').then((response) => response.json())
+    ]);
+  })()`);
   await waitFor(async () => {
     const state = await ui.evaluate(uiStateExpression());
     return state.title === 'Fixture conversation' && state.messages.includes('Fixture answer');
@@ -774,6 +777,14 @@ async function runFixtureSmoke(browser, extensionId) {
     });
     return window.__slimgptNavigationDocumentToken;
   })()`);
+  await top.evaluate(`(() => {
+    fetch('/backend-api/f/conversation', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ conversation_id: 'smoke' }),
+    }).then((response) => response.json()).catch(() => {});
+    return true;
+  })()`);
   await ui.evaluate(`[...document.querySelectorAll('.conversation-item')]
     .find((button) => button.textContent.includes('Second conversation'))?.click()`);
   await waitFor(async () => {
@@ -789,6 +800,7 @@ async function runFixtureSmoke(browser, extensionId) {
       loading: !!document.querySelector('.conversation-loading'),
       loadingText: document.querySelector('.conversation-loading')?.innerText?.replace(/\\s+/g, ' ').trim() || '',
       composerDisabled: document.querySelector('.composer-shell textarea')?.disabled || false,
+      draft: document.querySelector('.composer-shell textarea')?.value || '',
       mountedCards: document.querySelectorAll('.message-card').length,
     }))()`),
   };
@@ -798,6 +810,7 @@ async function runFixtureSmoke(browser, extensionId) {
   assert.equal(navigationLoading.top.sleep, '1', 'official UI must remain render-slept behind the stable takeover frame');
   assert.equal(navigationLoading.ui.loading, true, 'right pane must show a loading state before target payload arrives');
   assert.equal(navigationLoading.ui.composerDisabled, true, 'composer must be disabled while the target conversation is loading');
+  assert.equal(navigationLoading.ui.draft, '', 'drafts must be isolated per conversation instead of following navigation');
   assert.equal(navigationLoading.ui.mountedCards, 0, 'previous conversation must disappear as soon as navigation starts');
   assert.ok(navigationLoading.popstatePaths.includes('/c/second'), 'SPA fallback must notify the host router with popstate');
 
@@ -814,6 +827,60 @@ async function runFixtureSmoke(browser, extensionId) {
   const bleedCheck = await ui.evaluate(uiStateExpression());
   assert.equal(bleedCheck.messages.includes('Fixture answer'), false, 'smoke conversation content must not bleed into the second conversation');
   assert.equal(bleedCheck.messages.includes('Fixture user message 1'), false, 'smoke conversation question must not bleed across conversations');
+  await waitFor(async () => await ui.evaluate(`[...document.querySelectorAll('.conversation-item')]
+    .some((item) => item.textContent.includes('Delayed smoke-only answer'))`));
+  const delayedCaptureCheck = await ui.evaluate(uiStateExpression());
+  assert.equal(delayedCaptureCheck.messages.includes('Delayed smoke-only answer'), false, 'a response started in smoke must retain that identity after navigation');
+
+  await top.evaluate(`(() => {
+    const capture = (requestId, conversationId, eventConversationId, id, text) => {
+      const event = {
+        message: {
+          id,
+          author: { role: 'assistant' },
+          content: { parts: [text] },
+          status: 'finished_successfully',
+          end_turn: true,
+        },
+      };
+      if (eventConversationId) event.conversation_id = eventConversationId;
+      const payload = {
+        type: 'page-capture',
+        transport: 'fetch',
+        phase: 'complete',
+        requestId,
+        url: 'https://chatgpt.com/backend-api/conversation',
+        mimeType: 'application/json',
+        timestamp: Date.now(),
+        data: JSON.stringify(event),
+      };
+      if (conversationId) payload.conversationId = conversationId;
+      window.postMessage({
+        channel: 'slimgpt-page-v1',
+        direction: 'page-to-extension',
+        payload,
+      }, location.origin);
+    };
+    capture('scoped-stale-smoke', 'smoke', null, 'scoped-stale-a1', 'Scoped stale smoke answer');
+    capture('ambiguous-stale', null, null, 'ambiguous-stale-a1', 'Ambiguous stale answer');
+    capture('conflicting-stale', 'smoke', 'second', 'conflicting-stale-a1', 'Conflicting stale answer');
+  })()`);
+  await waitFor(async () => await ui.evaluate(`[...document.querySelectorAll('.conversation-item')]
+    .some((item) => item.textContent.includes('Scoped stale smoke answer'))`));
+  await sleep(50);
+  const isolatedCaptureCheck = await ui.evaluate(uiStateExpression());
+  assert.equal(isolatedCaptureCheck.messages.includes('Scoped stale smoke answer'), false, 'a late capture scoped to smoke must not render in second');
+  assert.equal(isolatedCaptureCheck.messages.includes('Ambiguous stale answer'), false, 'an unscoped late capture must be dropped instead of assigned to the visible conversation');
+  assert.equal(isolatedCaptureCheck.messages.includes('Conflicting stale answer'), false, 'conflicting capture identities must fail closed');
+
+  await ui.evaluate(`[...document.querySelectorAll('.conversation-item')]
+    .find((button) => button.textContent.includes('Mobile fixture'))?.click()`);
+  await waitFor(async () => (await top.evaluate('location.pathname')) === '/uc/mobile-smoke');
+  assert.equal((await ui.evaluate(uiStateExpression())).draft, failedText, 'returning to a conversation must restore only its own draft');
+  await ui.evaluate(`[...document.querySelectorAll('.conversation-item')]
+    .find((button) => button.textContent.includes('Second conversation'))?.click()`);
+  await waitFor(async () => (await top.evaluate('location.pathname')) === '/c/second');
+  assert.equal((await ui.evaluate(uiStateExpression())).draft, '', 'restoring another conversation must not carry the previous draft');
 
   const toolRendering = await ui.evaluate(`(() => {
     const text = (selector) => {
@@ -916,6 +983,15 @@ async function runFixtureSmoke(browser, extensionId) {
   const domRealtime = await ui.evaluate(`document.querySelector('.message-stage')?.innerText?.replace(/\\s+/g, ' ').trim() || ''`);
   assert.ok(domRealtime.includes('DOM stream two'), 'official character-data streaming mutations must update SlimGPT without polling');
 
+  await top.evaluate(`(() => {
+    const article = document.createElement('article');
+    article.setAttribute('data-message-id', 'late-dom-before-switch');
+    const content = document.createElement('div');
+    content.setAttribute('data-message-author-role', 'assistant');
+    content.textContent = 'Late live-only DOM answer';
+    article.appendChild(content);
+    document.body.appendChild(article);
+  })()`);
   await ui.evaluate(`[...document.querySelectorAll('.conversation-item')]
     .find((button) => button.textContent.includes('Fixture conversation'))?.click()`);
   await waitFor(async () => {
@@ -924,6 +1000,14 @@ async function runFixtureSmoke(browser, extensionId) {
   });
   const conversationNavigation = await top.evaluate('location.href');
   assert.equal(await top.evaluate('window.__slimgptNavigationDocumentToken'), navigationDocumentToken, 'cached conversation switches must also stay in-document');
+  await sleep(450);
+  const restoredSmokeState = await ui.evaluate(uiStateExpression());
+  assert.equal(restoredSmokeState.draft, '', 'a conversation without a draft must remain empty after switching back');
+  assert.equal(restoredSmokeState.messages.includes('Late live-only DOM answer'), false, 'DOM mutations queued before navigation must retain their source conversation');
+  assert.ok(restoredSmokeState.messages.includes('Scoped stale smoke answer'), 'late scoped content must remain owned by its source conversation');
+  assert.ok(restoredSmokeState.messages.includes('Delayed smoke-only answer'), 'request-scoped content must remain available in its source conversation');
+  assert.equal(restoredSmokeState.messages.includes('Ambiguous stale answer'), false);
+  assert.equal(restoredSmokeState.messages.includes('Conflicting stale answer'), false);
 
   const resumed = new Promise((resolve) => {
     fixture.onResumeRequest = (count) => {
@@ -954,6 +1038,12 @@ async function runFixtureSmoke(browser, extensionId) {
   assert.equal(newChatNavigation.token, navigationDocumentToken, 'new-chat navigation must preserve the host document');
   assert.equal(newChatNavigation.top.frameVisible, true, 'new-chat navigation must keep the takeover visible');
   assert.equal(newChatNavigation.empty, true, 'new-chat navigation should switch the right pane without a page flash');
+
+  await top.evaluate(`fetch('/backend-api/conversation/second').then((response) => response.json())`);
+  await sleep(150);
+  const backgroundCaptureOnNewChat = await ui.evaluate(uiStateExpression());
+  assert.equal(backgroundCaptureOnNewChat.title, '新对话', 'a background conversation payload must not hijack the new-chat route');
+  assert.equal(backgroundCaptureOnNewChat.messages.includes('Second answer'), false, 'background payload content must stay in its own cache');
 
   await sleep(250);
   const resizeObserverErrors = await ui.evaluate(`window.__slimgptWindowErrors.filter((message) => /ResizeObserver loop/i.test(message))`);
@@ -1050,6 +1140,10 @@ async function fulfillFixtureRequest(client, event, fixture) {
       : fixture.resume;
     fixture.onResumeRequest?.(fixture.resumeRequests);
     contentType = 'text/event-stream; charset=utf-8';
+  } else if (new URL(url).pathname === '/backend-api/f/conversation') {
+    await sleep(650);
+    body = JSON.stringify(fixture.delayedScopedEvent);
+    contentType = 'application/json; charset=utf-8';
   } else if (url.includes('/backend-api/conversations')) {
     body = JSON.stringify(fixture.list);
     contentType = 'application/json; charset=utf-8';
@@ -1199,6 +1293,15 @@ function makeFixture() {
     ] },
     conversation,
     secondConversation,
+    delayedScopedEvent: {
+      message: {
+        id: 'delayed-smoke-a1',
+        author: { role: 'assistant' },
+        content: { parts: ['Delayed smoke-only answer'] },
+        status: 'finished_successfully',
+        end_turn: true,
+      },
+    },
     liveOnlyEvent: {
       conversation_id: 'live-only',
       message: {
@@ -1220,7 +1323,6 @@ function makeFixture() {
       },
     },
     resume: `data: ${JSON.stringify({
-      conversation_id: 'smoke',
       message: {
         id: 'resume-a1',
         author: { role: 'assistant' },
