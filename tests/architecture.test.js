@@ -43,7 +43,11 @@ test('the isolated bridge is ready before the page hook on browsers with MAIN-wo
   }
 
   const bridge = await readFile('isolated-bridge.js', 'utf8');
-  assert.equal(bridge.includes('event.source === window'), false);
+  assert.equal(
+    bridge.includes('event.source === window'),
+    true,
+    'page-channel messages must come from the owning top-level window',
+  );
 });
 
 test('the project has no PWA or debugger runtime', async () => {
@@ -77,13 +81,30 @@ test('page synchronization is event-driven instead of interval-polled', async ()
   assert.equal(source.includes('transport: "dom"'), true);
 });
 
-test('official slow stream consumers are terminated locally without redefining logical turn completion', async () => {
+test('official slow stream consumers receive structural semantics without owning the real stream', async () => {
   const mitm = await readFile('main-mitm.js', 'utf8');
   const home = await readFile('src/pages/HomePage.svelte', 'utf8');
-  const cloneAt = mitm.indexOf('clone = response.clone()');
-  const divertAt = mitm.indexOf('return divertOfficialStream ? completeOfficialStream(response) : response');
-  assert.ok(cloneAt >= 0 && divertAt > cloneAt, 'SlimGPT must clone and own the real stream before terminating the official parser');
-  assert.ok(mitm.includes('new Response("data: [DONE]\\n\\n"'), 'the official consumer should receive a synthetic local terminal frame');
+  const semanticAt = mitm.indexOf('officialSemanticStream = divertOfficialStream ? createOfficialSemanticStream() : null');
+  const captureAt = mitm.indexOf('captureDone = captureReadableStream(captureResponse.body, streamMeta)');
+  const divertAt = mitm.indexOf('completeOfficialStream(response, officialSemanticStream?.readable, captureDone)');
+  assert.ok(
+    semanticAt >= 0 && captureAt > semanticAt && divertAt > captureAt,
+    'SlimGPT must consume the real body while the official parser receives a separate semantic stream',
+  );
+  assert.ok(
+    mitm.includes('officialSemanticStream?.finish(sawDone)') &&
+      mitm.includes('if (sawDone) controller.enqueue(encoder.encode("data: [DONE]\\n\\n"))'),
+    'the official semantic stream must preserve abnormal EOF instead of fabricating a done event',
+  );
+  assert.ok(
+    mitm.includes('projected.type === "resume_conversation_token"') &&
+      mitm.includes('if (!sawDone && projectedResumeControl) write("", projectedResumeControl)'),
+    'the official retry manager must receive the real resume token only when a disconnected stream closes',
+  );
+  assert.ok(
+    mitm.includes('projectOfficialMessageContent(message.content)'),
+    'official items must retain structure while expensive message bodies are suppressed',
+  );
   assert.ok(mitm.includes('event.stopImmediatePropagation()'), 'heavy official websocket conversation parsing should be cut off');
   assert.ok(home.includes('[DONE] terminates this SSE segment only'), 'synthetic/transport DONE must not become logical turn completion');
   assert.ok(mitm.includes("emitExecutionState('stopped', 'ws-turn-stopped'"), 'logical stop should follow the server conversation lifecycle');

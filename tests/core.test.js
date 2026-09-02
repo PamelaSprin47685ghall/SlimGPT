@@ -6,6 +6,7 @@ import {
   buildConversationView,
   contentToText,
   consumeSse,
+  createConversationSseDecoder,
   conversationIdFromUrl,
   conversationThinkingLevel,
   extractConversationItems,
@@ -14,6 +15,7 @@ import {
   findConversationPayload,
   findConversationLifecycleEvents,
   findMessageEvents,
+  fingerprintCapture,
   getThinkingLevel,
   getToolMessageInfo,
   groupConversationTurns,
@@ -302,6 +304,69 @@ test('an incomplete newest canonical page never fabricates its page head as conv
   assert.deepEqual(turns[0].replies.map((reply) => reply.id), ['a3']);
 });
 
+test('non-monotonic create_time never changes turn ownership or output-item order', () => {
+  let record = ingestConversationPayload(null, {
+    id: 'non-monotonic-time',
+    current_node: 'second-user',
+    mapping: {
+      'first-user': {
+        id: 'first-user',
+        parent: null,
+        children: ['second-user'],
+        message: {
+          id: 'first-user',
+          author: { role: 'user' },
+          content: { parts: ['first'] },
+          create_time: 900,
+        },
+      },
+      'second-user': {
+        id: 'second-user',
+        parent: 'first-user',
+        children: [],
+        message: {
+          id: 'second-user',
+          author: { role: 'user' },
+          content: { parts: ['second'] },
+          metadata: { turn_exchange_id: 'turn-second' },
+          create_time: 1,
+        },
+      },
+    },
+  });
+  record = ingestConversationMessage(record, {
+    id: 'time-final',
+    author: { role: 'assistant' },
+    content: { parts: ['final'] },
+    metadata: { turn_exchange_id: 'turn-second' },
+    create_time: 2,
+  }, { responseId: 'time-response', outputIndex: 2, sequenceNumber: 30, observationOrdinal: 1 });
+  record = ingestConversationMessage(record, {
+    id: 'time-reasoning',
+    author: { role: 'assistant' },
+    content: { content_type: 'thought', text: 'reasoning' },
+    metadata: { turn_exchange_id: 'turn-second' },
+    create_time: 999,
+  }, { responseId: 'time-response', outputIndex: 0, sequenceNumber: 10, observationOrdinal: 2 });
+  record = ingestConversationMessage(record, {
+    id: 'time-tool',
+    author: { role: 'assistant' },
+    recipient: 'web.run',
+    content: { content_type: 'code', text: '{"q":"time"}' },
+    metadata: { turn_exchange_id: 'turn-second' },
+    create_time: -100,
+  }, { responseId: 'time-response', outputIndex: 1, sequenceNumber: 20, observationOrdinal: 3 });
+
+  const turns = buildConversationRecordTurns(record);
+  assert.deepEqual(turns.map((turn) => turn.user?.id), ['first-user', 'second-user']);
+  assert.deepEqual(turns[0].replies, []);
+  assert.deepEqual(turns[1].replies.map((item) => item.id), [
+    'time-reasoning',
+    'time-tool',
+    'time-final',
+  ]);
+});
+
 test('reasoning commentary and final remain distinct output items even when message ids repeat', () => {
   let record = ingestConversationPayload(null, {
     id: 'same-message-items', current_node: 'u1',
@@ -446,11 +511,15 @@ test('user_editable_context and model_editable_context never create visible empt
         message: { id: 'ctx-user', author: { role: 'user' }, content: { content_type: 'user_editable_context', parts: ['internal'] } },
       },
       sys: {
-        id: 'sys', parent: 'ctx-user', children: ['ctx-model'],
+        id: 'sys', parent: 'ctx-user', children: ['developer'],
         message: { id: 'sys', author: { role: 'system' }, content: { content_type: 'text', parts: ['system'] } },
       },
+      developer: {
+        id: 'developer', parent: 'sys', children: ['ctx-model'],
+        message: { id: 'developer', author: { role: 'developer' }, content: { content_type: 'text', parts: ['hidden developer instruction'] } },
+      },
       'ctx-model': {
-        id: 'ctx-model', parent: 'sys', children: ['thought'],
+        id: 'ctx-model', parent: 'developer', children: ['thought'],
         message: { id: 'ctx-model', author: { role: 'assistant' }, content: { content_type: 'model_editable_context', parts: ['internal model context'] } },
       },
       thought: {
@@ -515,6 +584,64 @@ test('SSE parser preserves partial chunks', () => {
   const second = consumeSse(first.rest, ',"content":"x"}}\n\ndata: [DONE]\n\n', false);
   assert.equal(second.frames[0].json.message.id, 'm1');
   assert.equal(second.frames[1].data, '[DONE]');
+});
+
+test('official v1 delta events reconstruct immutable per-channel conversation snapshots', () => {
+  const decoder = createConversationSseDecoder();
+  assert.equal(decoder.decode({ event: 'delta_encoding', data: '"v1"', json: null }), null);
+
+  const first = decoder.decode({
+    event: 'delta',
+    json: {
+      v: {
+        conversation_id: 'delta-conversation',
+        message: {
+          id: 'delta-message',
+          author: { role: 'assistant' },
+          content: { content_type: 'text', parts: ['hello'] },
+          status: 'in_progress',
+        },
+      },
+    },
+  });
+  const second = decoder.decode({
+    event: 'delta',
+    json: { p: '/message/content/parts/0', o: 'append', v: ' world' },
+  });
+  const otherChannel = decoder.decode({
+    event: 'delta',
+    json: { c: 1, p: '', o: 'add', v: { type: 'side-channel', value: 1 } },
+  });
+  const finished = decoder.decode({
+    event: 'delta',
+    json: { c: 0, p: '/message/status', o: 'replace', v: 'finished_successfully' },
+  });
+
+  assert.equal(first.message.content.parts[0], 'hello', 'later deltas must not mutate an emitted snapshot');
+  assert.equal(second.message.content.parts[0], 'hello world');
+  assert.deepEqual(otherChannel, { type: 'side-channel', value: 1 });
+  assert.equal(finished.message.content.parts[0], 'hello world');
+  assert.equal(finished.message.status, 'finished_successfully');
+});
+
+test('capture identity keeps authoritative canonical completion distinct from an observed duplicate response', () => {
+  const body = '{"conversation_id":"same"}';
+  const observed = fingerprintCapture({
+    requestId: 'fetch-observed',
+    url: 'https://chatgpt.com/backend-api/conversations/same',
+    transport: 'fetch',
+    conversationId: 'same',
+  }, body);
+  const canonical = fingerprintCapture({
+    requestId: 'sync-authoritative-1',
+    canonicalSyncId: 'sync-authoritative',
+    canonicalPageIndex: 0,
+    canonicalComplete: true,
+    url: 'https://chatgpt.com/backend-api/conversations/same',
+    transport: 'fetch',
+    conversationId: 'same',
+  }, body);
+  assert.notEqual(observed, canonical);
 });
 
 test('payload/list discovery tolerates wrappers', () => {
@@ -1078,6 +1205,13 @@ test('tool calls and tool results are classified from message structure, not arb
     author: { role: 'assistant' },
     content: { content_type: 'text', parts: ['```json\n{"ordinary":true}\n```'] },
   }), null, 'ordinary assistant JSON must remain normal Markdown');
+
+  assert.equal(getToolMessageInfo({
+    author: { role: 'assistant', metadata: { real_author: 'tool:web' } },
+    recipient: 'all',
+    channel: 'final',
+    content: { content_type: 'text', parts: ['Final answer after web search'] },
+  }), null, 'tool provenance on a final assistant message must not turn the answer into a tool result');
 });
 
 test('extractThought extracts reasoning from metadata or content parts', () => {
@@ -1352,6 +1486,22 @@ test('extractThought extracts plural thoughts and reasoning_recap from real Chat
 });
 
 test('getToolMessageInfo extracts search result groups and reasoning titles', () => {
+  const searchQuery = getToolMessageInfo({
+    author: { role: 'tool', name: 'web.run' },
+    content: { content_type: 'text', parts: [''] },
+    metadata: {
+      reasoning_title: 'Searching current date',
+      search_model_queries: {
+        type: 'search_model_queries',
+        queries: ['current UTC date today'],
+      },
+    },
+  });
+  assert.deepEqual(searchQuery.payload, {
+    type: 'search_model_queries',
+    queries: ['current UTC date today'],
+  });
+
   const searchResult = getToolMessageInfo({
     author: { role: 'tool', name: 'web.run' },
     content: {

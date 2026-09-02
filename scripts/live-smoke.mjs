@@ -1,9 +1,15 @@
 import assert from 'node:assert/strict';
-import { access, cp, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { rmSync } from 'node:fs';
+import { access, chmod, cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
+
+if (process.argv[2] === '--profile-janitor') {
+  await runProfileJanitor(process.argv[3], process.argv[4]);
+  process.exit(0);
+}
 
 const flags = new Set(process.argv.slice(2));
 const live = flags.has('--live');
@@ -12,6 +18,9 @@ const virtualHeaded = flags.has('--virtual-headed');
 const cloneProfile = flags.has('--clone-profile');
 const sendLive = flags.has('--send-live');
 const keepOpen = flags.has('--keep-open');
+const liveDumpPath = process.env.SLIMGPT_LIVE_DUMP || '';
+const LIVE_PROTOCOL_CAPTURE_PATH = /^\/backend-api\/(?:(?:f\/)?conversation(?:\/resume)?(?:\/|$)|conversations\/)/;
+const SENSITIVE_DUMP_KEY = /^(?:(?:access|refresh|resume|session|csrf|auth|id)[_-]?token|token|authorization|cookie|set-cookie|api[_-]?key|email|phone(?:_number)?|picture|conversation_conduit_metadata|mobile_conduit_metadata)$/i;
 const extensionPath = resolve('dist-extension');
 const chromePath = await findChrome();
 const userDataDir = await mkdtemp(join(tmpdir(), 'slimgpt-live-'));
@@ -21,7 +30,14 @@ const port = await reservePort();
 const clonedProfileDirectory = cloneProfile
   ? await cloneChromeProfile(userDataDir)
   : null;
-
+const profileJanitor = cloneProfile
+  ? spawn(
+      process.execPath,
+      [resolve(process.argv[1]), '--profile-janitor', String(process.pid), userDataDir],
+      { detached: true, stdio: 'ignore' },
+    )
+  : null;
+profileJanitor?.unref();
 const chromeArgs = [
   headed || virtualHeaded ? null : '--headless=new',
   virtualHeaded ? '--ozone-platform=headless' : null,
@@ -43,6 +59,29 @@ chrome.stderr.on('data', (chunk) => {
 });
 
 let browserCdp = null;
+let resolveKeepOpenShutdown = null;
+const keepOpenShutdown = keepOpen
+  ? new Promise((resolveShutdown) => {
+      resolveKeepOpenShutdown = resolveShutdown;
+    })
+  : null;
+let keepOpenCleanupStarted = false;
+const requestKeepOpenShutdown = () => {
+  if (keepOpenCleanupStarted) return;
+  keepOpenCleanupStarted = true;
+  // Signal supervisors may hard-stop the process before asynchronous finally
+  // cleanup finishes. Unlink the cloned cookies synchronously first; the
+  // normal finally path still closes Chrome and retries recursive cleanup.
+  try {
+    rmSync(userDataDir, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
+  } catch {}
+  resolveKeepOpenShutdown?.();
+};
+if (keepOpen) {
+  process.once('SIGINT', requestKeepOpenShutdown);
+  process.once('SIGTERM', requestKeepOpenShutdown);
+}
+
 try {
   const version = await waitForJson(`http://127.0.0.1:${port}/json/version`);
   browserCdp = await connectCdp(version.webSocketDebuggerUrl);
@@ -57,26 +96,82 @@ try {
     // Keep Node's event loop anchored to the actual browser process. A never-
     // settling top-level await is treated as an error by modern Node and exits
     // with code 13, which immediately tears down the real-profile test window.
-    await onceExit(chrome);
+    await Promise.race([onceExit(chrome), keepOpenShutdown]);
   }
 } finally {
-  if (!keepOpen) {
-    try {
-      await browserCdp?.call('Browser.close');
-    } catch {
-      chrome.kill('SIGTERM');
-    }
-    await Promise.race([onceExit(chrome), sleep(4_000)]);
-    if (chrome.exitCode === null) chrome.kill('SIGKILL');
-    await Promise.race([onceExit(chrome), sleep(1_000)]);
-    await rm(userDataDir, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
+  // Supervisors may terminate the Chrome child before signalling this parent.
+  // Unlink the clone before any asynchronous shutdown work so that either
+  // child exit or an explicit signal removes copied cookies immediately.
+  try {
+    rmSync(userDataDir, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
+  } catch {}
+  try {
+    await Promise.race([
+      browserCdp?.call('Browser.close'),
+      sleep(1_000),
+    ]);
+  } catch {
+    if (chrome.exitCode === null) chrome.kill('SIGTERM');
   }
+  await Promise.race([onceExit(chrome), sleep(4_000)]);
+  if (chrome.exitCode === null) chrome.kill('SIGKILL');
+  await Promise.race([onceExit(chrome), sleep(1_000)]);
+  await rm(userDataDir, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
+  process.removeListener('SIGINT', requestKeepOpenShutdown);
+  process.removeListener('SIGTERM', requestKeepOpenShutdown);
   if (stderr && chrome.exitCode && chrome.exitCode !== 0 && chrome.exitCode !== 143) {
     console.error(stderr);
   }
 }
 
+async function readExtensionStorageValue(browser, extensionId, key) {
+  const created = await browser.call('Target.createTarget', {
+    url: `chrome-extension://${extensionId}/index.html?storage-probe=${encodeURIComponent(key)}`,
+  });
+  const target = await waitForTarget(port, (item) => item.id === created.targetId);
+  const client = await connectCdp(target.webSocketDebuggerUrl);
+  try {
+    await client.call('Runtime.enable');
+    await waitFor(async () => await client.evaluate(`Boolean(globalThis.chrome?.storage?.local)`));
+    return await client.evaluate(
+      `chrome.storage.local.get(${JSON.stringify(key)}).then((values) => values[${JSON.stringify(key)}])`,
+    );
+  } finally {
+    client.close();
+    await browser.call('Target.closeTarget', { targetId: created.targetId }).catch(() => {});
+  }
+}
+
 async function runFixtureSmoke(browser, extensionId) {
+  const dumpProbe = prepareLiveProtocolDump([
+    {
+      type: 'page-capture',
+      transport: 'fetch',
+      url: 'https://chatgpt.com/backend-api/me',
+      data: '{"email":"private@example.com","access_token":"account-secret"}',
+    },
+    {
+      type: 'page-capture',
+      transport: 'fetch',
+      url: 'https://chatgpt.com/backend-api/conversations?offset=0&limit=28',
+      data: '{"title":"private-conversation-title"}',
+    },
+    {
+      type: 'page-capture',
+      transport: 'sse',
+      url: 'https://chatgpt.com/backend-api/f/conversation',
+      data: 'data: {"type":"resume_conversation_token","token":"resume-secret","authToken":"camel-secret","email":"private@example.com"}\n\n',
+    },
+  ], 'passed');
+  const serializedDumpProbe = JSON.stringify(dumpProbe);
+  assert.equal(dumpProbe.events.length, 1, 'live protocol dumps must exclude unrelated account endpoints');
+  assert.ok(serializedDumpProbe.includes('resume_conversation_token'), 'live protocol dumps must retain protocol structure');
+  assert.equal(serializedDumpProbe.includes('account-secret'), false);
+  assert.equal(serializedDumpProbe.includes('private-conversation-title'), false);
+  assert.equal(serializedDumpProbe.includes('resume-secret'), false);
+  assert.equal(serializedDumpProbe.includes('camel-secret'), false);
+  assert.equal(serializedDumpProbe.includes('private@example.com'), false);
+
   const fixture = makeFixture();
   const created = await browser.call('Target.createTarget', { url: 'about:blank' });
   const topTarget = await waitForTarget(port, (item) => item.id === created.targetId);
@@ -241,13 +336,7 @@ async function runFixtureSmoke(browser, extensionId) {
   assert.ok(canonicalUi.historyPreview.includes('Fixture answer'), 'enhanced history must surface the latest message preview');
   assert.equal(canonicalUi.sidebarWorkState, 'stopped', 'an hydrated composer with no stop control is direct idle evidence');
   await sleep(700);
-  const persistedIndex = await ui.evaluate(`(async () => {
-    if (globalThis.chrome?.storage?.local) {
-      const value = await chrome.storage.local.get('conversationIndex');
-      return value.conversationIndex || [];
-    }
-    return JSON.parse(localStorage.getItem('slimgpt:conversation-index:v1') || '[]');
-  })()`);
+  const persistedIndex = await readExtensionStorageValue(browser, extensionId, 'conversationIndex') || [];
   assert.deepEqual(Object.keys(persistedIndex[0]).sort(), ['create_time', 'id', 'last', 'model', 'route', 'title', 'update_time']);
 
   await ui.evaluate(`document.querySelector('[data-overview-index="0"]')?.click()`);
@@ -774,6 +863,16 @@ async function runFixtureSmoke(browser, extensionId) {
   assert.equal(sendSuccess.composerStatus, '消息已发送（官方已确认）', 'composer success requires the page-world send confirmation, not just the click');
   assert.equal(sendSuccess.sidebarWorkState, 'running', 'a visible official stop control must be treated as direct running evidence');
   await waitFor(async () => (await ui.evaluate(uiStateExpression())).messages.includes('Turn trace final answer'));
+  await waitFor(async () => (await top.evaluate(`window.__slimgptOfficialResponseBody || ''`)).includes('"id":"turn-trace-final"'));
+  const officialTurnBody = await top.evaluate(`window.__slimgptOfficialResponseBody || ''`);
+  assert.ok(
+    officialTurnBody.includes('"id":"turn-trace-final"') &&
+      officialTurnBody.includes('"parent_id":"fixture-submitted-user-1"') &&
+      !officialTurnBody.includes('"id":"turn-trace-reason"') &&
+      !officialTurnBody.includes('"id":"turn-trace-call"') &&
+      !officialTurnBody.includes('"id":"turn-trace-tool"'),
+    'the hidden official renderer must receive only a valid user-to-final topology, not expensive intermediate items',
+  );
   const tracedTurnPreviews = await ui.evaluate(`Array.from(document.querySelectorAll('.overview-item')).map((node) => node.textContent?.replace(/\\s+/g, ' ').trim() || '')`);
   assert.equal(tracedTurnPreviews.length, 2, 'one existing user question plus one submitted question must produce exactly two visible turns');
   assert.equal(tracedTurnPreviews[0].includes('Turn trace final answer'), false, 'misleading parent ids must not contaminate the first turn');
@@ -810,7 +909,31 @@ async function runFixtureSmoke(browser, extensionId) {
     const send = form?.querySelector('[data-composer-submit]');
     if (send) send.hidden = false;
   })()`);
+  await sleep(500);
+  assert.equal(
+    (await ui.evaluate(uiStateExpression())).sidebarWorkState,
+    'running',
+    'the hidden official composer becoming ready after synthetic [DONE] must not stop the intercepted turn',
+  );
+  await top.evaluate(`window.postMessage({
+    channel: 'slimgpt-page-v1',
+    direction: 'page-to-extension',
+    payload: {
+      type: 'page-execution-state',
+      conversationId: 'mobile-smoke',
+      state: 'stopped',
+      source: 'ws-turn-complete',
+      observedAt: Date.now(),
+    },
+  }, location.origin)`);
   await waitFor(async () => (await ui.evaluate(uiStateExpression())).sidebarWorkState === 'stopped');
+  const sharedStoppedPulse = await waitFor(async () => {
+    const pulse = await readExtensionStorageValue(browser, extensionId, 'executionPulse');
+    return pulse?.payload?.conversationId === 'mobile-smoke' && pulse.payload.state === 'stopped'
+      ? pulse
+      : null;
+  });
+  assert.equal(sharedStoppedPulse.payload.source, 'ws-turn-complete');
   await top.evaluate(`fetch('/backend-api/messages/stale-running').then((response) => response.json())`);
   await sleep(180);
   assert.equal(
@@ -835,7 +958,10 @@ async function runFixtureSmoke(browser, extensionId) {
   // send-unconfirmed contract: a silent composer (button click swallowed) must
   // be reported as unconfirmed instead of success. The original fixture
   // composer is removed first so the silent one is the only composer found.
-  await top.evaluate(`document.getElementById('fixture-composer')?.remove()`);
+  await top.evaluate(`(() => {
+    window.__slimgptDetachedComposer = document.getElementById('fixture-composer');
+    window.__slimgptDetachedComposer?.remove();
+  })()`);
   await top.evaluate(`(() => {
     const form = document.createElement('form');
     form.id = 'fixture-composer-silent';
@@ -869,9 +995,51 @@ async function runFixtureSmoke(browser, extensionId) {
     textarea.dispatchEvent(new Event('input', { bubbles: true }));
   })()`);
 
+  // A tool-heavy official turn can leave the hidden route in its load error
+  // boundary with no composer. Recovery must use that boundary's own retry
+  // control, return to the same conversation, and submit exactly once.
+  await top.evaluate(`(() => {
+    window.__slimgptEnableComposerRecovery = true;
+    window.__slimgptComposerRecoveryHandler = () => {
+      if (
+        !window.__slimgptEnableComposerRecovery ||
+        location.pathname !== '/' ||
+        document.querySelector('[data-fixture-load-retry]')
+      ) return;
+      const retry = document.createElement('button');
+      retry.type = 'button';
+      retry.textContent = 'Try again';
+      retry.setAttribute('data-fixture-load-retry', '');
+      retry.addEventListener('click', () => {
+        retry.remove();
+        if (window.__slimgptDetachedComposer) {
+          document.body.appendChild(window.__slimgptDetachedComposer);
+        }
+      });
+      document.body.appendChild(retry);
+    };
+    addEventListener('popstate', window.__slimgptComposerRecoveryHandler);
+  })()`);
+  const recoveredText = 'Recovered composer submission';
+  await ui.evaluate(fillAndSubmitExpression(recoveredText));
+  await waitFor(async () => (await top.evaluate(`window.__slimgptSubmitted || ''`)) === recoveredText, 20_000);
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).composerStatus === '消息已发送（官方已确认）', 20_000);
+  const recoveredSend = await ui.evaluate(uiStateExpression());
+  assert.equal(recoveredSend.draft, '', 'official retry recovery must clear a confirmed draft exactly once');
+  assert.equal(await top.evaluate('location.pathname'), '/uc/mobile-smoke', 'composer recovery must return to the original conversation');
+
+  await top.evaluate(`(() => {
+    window.__slimgptEnableComposerRecovery = false;
+    removeEventListener('popstate', window.__slimgptComposerRecoveryHandler);
+    window.__slimgptComposerRecoveryHandler = null;
+    window.__slimgptDetachedComposer = document.getElementById('fixture-composer');
+    window.__slimgptDetachedComposer?.remove();
+    document.querySelector('[data-fixture-load-retry]')?.remove();
+  })()`);
+
   const failedText = 'Draft that must survive';
   await ui.evaluate(fillAndSubmitExpression(failedText));
-  await waitFor(async () => (await ui.evaluate(uiStateExpression())).composerStatus.includes('找不到官方输入框'), 7_000);
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).composerStatus.includes('找不到官方输入框'), 20_000);
   const sendFailure = await ui.evaluate(uiStateExpression());
   assert.equal(sendFailure.draft, failedText, 'failed submissions must preserve the draft');
   // Restore an official composer before testing hide/show takeover. A page
@@ -1097,13 +1265,7 @@ async function runFixtureSmoke(browser, extensionId) {
   assert.ok(ledgerPersistence.messages.includes('Short-window latest answer'));
 
   await sleep(700);
-  const persistedObservationLedger = await ui.evaluate(`(async () => {
-    if (globalThis.chrome?.storage?.local) {
-      const value = await chrome.storage.local.get('observationLedger');
-      return value.observationLedger || [];
-    }
-    return JSON.parse(localStorage.getItem('slimgpt:observation-ledger:v1') || '[]');
-  })()`);
+  const persistedObservationLedger = await readExtensionStorageValue(browser, extensionId, 'observationLedger') || [];
   const persistedSecond = persistedObservationLedger.find((entry) => entry?.id === 'second');
   assert.ok(persistedSecond?.observations?.length >= 5, 'recent reasoning/tool observations must be written to the local ledger');
   const persistedSecondText = JSON.stringify(persistedSecond);
@@ -1225,7 +1387,14 @@ async function runFixtureSmoke(browser, extensionId) {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ conversation_id: 'smoke', offset: 0 }),
   }).then((response) => response.text())`);
-  assert.equal(officialResumeBody, 'data: [DONE]\n\n', 'takeover must stop the official resume parser after cloning its stream');
+  assert.ok(
+    officialResumeBody.includes('"type":"resume_conversation_token"') &&
+      officialResumeBody.includes('"id":"resume-a1"') &&
+      officialResumeBody.includes('\u200b') &&
+      !officialResumeBody.includes('Diverted resume answer') &&
+      !officialResumeBody.includes('data: [DONE]'),
+    'takeover must forward resume identity and preserve abnormal EOF without forwarding expensive response content',
+  );
   const resumeReconnectCount = await Promise.race([
     resumed,
     new Promise((_, reject) => setTimeout(() => reject(new Error('resume reconnect timeout')), 10_000)),
@@ -1251,6 +1420,34 @@ async function runFixtureSmoke(browser, extensionId) {
   const backgroundCaptureOnNewChat = await ui.evaluate(uiStateExpression());
   assert.equal(backgroundCaptureOnNewChat.title, '新对话', 'a background conversation payload must not hijack the new-chat route');
   assert.equal(backgroundCaptureOnNewChat.messages.includes('Second answer'), false, 'background payload content must stay in its own cache');
+  await top.evaluate(`document.querySelectorAll('[data-message-id]').forEach((node) => node.remove())`);
+
+  await ui.evaluate(fillAndSubmitExpression('Fixture new-chat request https://example.com'));
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).composerStatus === '消息已发送（官方已确认）');
+  await waitFor(async () => (await top.evaluate('location.pathname')) === '/c/fixture-new-chat');
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).messages.includes('Fixture new-chat answer'));
+  await top.evaluate(`(() => {
+    const form = document.getElementById('fixture-composer');
+    form?.querySelector('[data-testid="stop-button"]')?.remove();
+    const send = form?.querySelector('[data-composer-submit]');
+    if (send) send.hidden = false;
+  })()`);
+  await top.evaluate(`window.postMessage({
+    channel: 'slimgpt-page-v1',
+    direction: 'page-to-extension',
+    payload: {
+      type: 'page-execution-state',
+      conversationId: 'fixture-new-chat',
+      state: 'stopped',
+      source: 'ws-turn-complete',
+      observedAt: Date.now(),
+    },
+  }, location.origin)`);
+  await waitFor(async () => (await ui.evaluate(uiStateExpression())).sidebarWorkState === 'stopped');
+  const newChatSend = await ui.evaluate(uiStateExpression());
+  assert.equal(newChatSend.overviewItems, 1, 'a provisional WEB:* route must bind to one persisted user/output turn');
+  assert.ok(newChatSend.messages.includes('Fixture new-chat request'));
+  assert.ok(newChatSend.messages.includes('Fixture new-chat answer'));
 
   await sleep(250);
   const resizeObserverErrors = await ui.evaluate(`window.__slimgptWindowErrors.filter((message) => /ResizeObserver loop/i.test(message))`);
@@ -1290,6 +1487,16 @@ async function runFixtureSmoke(browser, extensionId) {
   assert.ok(restoredLedgerUi.toolText.includes('ledger two'));
   assert.ok(restoredLedgerUi.toolText.includes('ledger three'));
   assert.ok(restoredLedgerUi.calls >= 2 && restoredLedgerUi.results >= 2, 'recent tool calls/results must survive a SlimGPT UI reload');
+  const executionPulse = await readExtensionStorageValue(browser, extensionId, 'executionPulse');
+  assert.ok(
+    executionPulse?.payload?.conversationId &&
+      !String(executionPulse.payload.conversationId).startsWith('WEB:'),
+    'cross-window execution pulses must carry only stable conversation ids',
+  );
+  assert.ok(
+    executionPulse?.payload?.state === 'running' || executionPulse?.payload?.state === 'stopped',
+    'cross-window execution pulses must carry an explicit state',
+  );
 
   return {
     mode: 'fixture',
@@ -1317,6 +1524,58 @@ async function runFixtureSmoke(browser, extensionId) {
     conversationNavigation,
     newChatNavigation,
   };
+}
+
+function shouldKeepLiveProtocolEvent(event) {
+  if (event?.type !== 'page-capture' && event?.type !== 'canonical-capture') return true;
+  if (!['fetch', 'xhr'].includes(event.transport)) return true;
+  try {
+    return LIVE_PROTOCOL_CAPTURE_PATH.test(new URL(event.url, 'https://chatgpt.com').pathname);
+  } catch {
+    return false;
+  }
+}
+
+function sanitizeDumpString(value) {
+  return String(value)
+    .replace(
+      /("(?:(?:access|refresh|resume|session|csrf|auth|id)[_-]?token|token|authorization|cookie|set-cookie|api[_-]?key|email|phone_number|picture|conversation_conduit_metadata|mobile_conduit_metadata)"\s*:\s*)"(?:\\.|[^"\\])*"/gi,
+      '$1"[REDACTED]"',
+    )
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]')
+    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, '[REDACTED_EMAIL]');
+}
+
+function sanitizeLiveDumpValue(value, key = '') {
+  if (SENSITIVE_DUMP_KEY.test(key)) return '[REDACTED]';
+  if (typeof value === 'string') return sanitizeDumpString(value);
+  if (Array.isArray(value)) return value.map((item) => sanitizeLiveDumpValue(item));
+  if (!value || typeof value !== 'object') return value;
+  const output = {};
+  for (const [entryKey, entryValue] of Object.entries(value)) {
+    output[entryKey] = sanitizeLiveDumpValue(entryValue, entryKey);
+  }
+  return output;
+}
+
+function prepareLiveProtocolDump(events, outcome, error = null) {
+  return sanitizeLiveDumpValue({
+    outcome,
+    error: error ? String(error?.stack || error) : null,
+    uiState: error?.failedUiState || null,
+    events: events.filter(shouldKeepLiveProtocolEvent),
+  });
+}
+
+async function writeLiveProtocolDump(top, outcome, error = null) {
+  if (!liveDumpPath) return;
+  const events = await top.evaluate('window.__slimgptLiveProtocolDump || []').catch(() => []);
+  await writeFile(
+    liveDumpPath,
+    JSON.stringify(prepareLiveProtocolDump(events, outcome, error), null, 2),
+    { mode: 0o600 },
+  );
+  await chmod(liveDumpPath, 0o600);
 }
 
 async function runLiveSmoke(browser, extensionId) {
@@ -1365,31 +1624,42 @@ async function runLiveSmoke(browser, extensionId) {
   const state = await top.evaluate(topStateExpression());
   assert.equal(state.takeover, true, 'SlimGPT frame must mount on the real ChatGPT origin');
   assert.equal(state.pageHook, true, 'page-world hook must install on the real ChatGPT origin');
+  if (liveDumpPath) {
+    await top.evaluate(`(() => {
+      window.__slimgptLiveProtocolDump = [];
+      addEventListener('message', (event) => {
+        const envelope = event.data;
+        if (envelope?.channel !== 'slimgpt-page-v1' || envelope?.direction !== 'page-to-extension') return;
+        window.__slimgptLiveProtocolDump.push(envelope.payload);
+        if (window.__slimgptLiveProtocolDump.length > 30000) window.__slimgptLiveProtocolDump.shift();
+      });
+    })()`);
+  }
 
   let uiState = null;
+  let ui = null;
+  const connectUi = async () => {
+    const frameTarget = await waitForTarget(
+      port,
+      (item) => item.type === 'iframe' && item.url.startsWith(`chrome-extension://${extensionId}/index.html`),
+      10_000,
+    );
+    ui = await connectCdp(frameTarget.webSocketDebuggerUrl);
+    await ui.call('Runtime.enable');
+    return ui;
+  };
+  const evaluateUi = async (expression) => {
+    if (!ui) await connectUi();
+    try {
+      return await ui.evaluate(expression);
+    } catch {
+      try { ui?.close?.(); } catch {}
+      ui = null;
+      await connectUi();
+      return ui.evaluate(expression);
+    }
+  };
   try {
-    let ui = null;
-    const connectUi = async () => {
-      const frameTarget = await waitForTarget(
-        port,
-        (item) => item.type === 'iframe' && item.url.startsWith(`chrome-extension://${extensionId}/index.html`),
-        10_000,
-      );
-      ui = await connectCdp(frameTarget.webSocketDebuggerUrl);
-      await ui.call('Runtime.enable');
-      return ui;
-    };
-    const evaluateUi = async (expression) => {
-      if (!ui) await connectUi();
-      try {
-        return await ui.evaluate(expression);
-      } catch {
-        try { ui?.close?.(); } catch {}
-        ui = null;
-        await connectUi();
-        return ui.evaluate(expression);
-      }
-    };
     await connectUi();
     uiState = await evaluateUi(uiStateExpression());
     if (sendLive) {
@@ -1431,13 +1701,19 @@ async function runLiveSmoke(browser, extensionId) {
         '消息已发送（官方已确认）',
         `real ChatGPT submission result: ${submissionState.composerStatus || 'empty'}; ${JSON.stringify(submissionDiagnostics)}`,
       );
-      await waitFor(async () => (await evaluateUi(uiStateExpression())).assistant.includes(expect), 45_000);
+      await waitFor(async () => {
+        const next = await evaluateUi(uiStateExpression());
+        return next.assistant.includes(expect) || next.messages.includes(expect);
+      }, 45_000);
       // Execution-state contract: stop only after a direct page/server
       // lifecycle observation says the turn is no longer running.
       await waitFor(async () => (await evaluateUi(uiStateExpression())).sidebarWorkState === 'stopped', 45_000);
       uiState = await evaluateUi(uiStateExpression());
     }
+    await writeLiveProtocolDump(top, 'passed');
   } catch (error) {
+    const failedUiState = await evaluateUi(uiStateExpression()).catch(() => null);
+    await writeLiveProtocolDump(top, 'failed', Object.assign(error, { failedUiState }));
     if (sendLive) throw error;
     uiState = { unavailable: String(error?.message || error) };
   }
@@ -1471,7 +1747,10 @@ async function fulfillFixtureRequest(client, event, fixture) {
     fixture.onResumeRequest?.(fixture.resumeRequests);
     contentType = 'text/event-stream; charset=utf-8';
   } else if (pathname === '/backend-api/f/conversation') {
-    if (event.request.headers?.['x-oai-turn-trace-id'] === 'fixture-turn-mobile') {
+    if (event.request.headers?.['x-oai-turn-trace-id'] === 'fixture-new-chat') {
+      body = fixture.newChatStream;
+      contentType = 'text/event-stream; charset=utf-8';
+    } else if (event.request.headers?.['x-oai-turn-trace-id'] === 'fixture-turn-mobile') {
       body = fixture.turnTraceStream;
       contentType = 'text/event-stream; charset=utf-8';
     } else {
@@ -1506,6 +1785,9 @@ async function fulfillFixtureRequest(client, event, fixture) {
     contentType = 'application/json; charset=utf-8';
   } else if (pathname === '/backend-api/conversations/mobile-smoke') {
     body = JSON.stringify(fixture.mobileCanonicalPage);
+    contentType = 'application/json; charset=utf-8';
+  } else if (pathname === '/backend-api/conversations/fixture-new-chat') {
+    body = JSON.stringify(fixture.newChatCanonicalPage);
     contentType = 'application/json; charset=utf-8';
   } else if (pathname === '/backend-api/conversations') {
     fixture.conversationListRequests = (fixture.conversationListRequests || 0) + 1;
@@ -1562,6 +1844,17 @@ async function fulfillFixtureRequest(client, event, fixture) {
     ],
     body: Buffer.from(body).toString('base64'),
   });
+}
+
+function encodeConversationDeltaStream(values) {
+  return [
+    'event: delta_encoding\ndata: "v1"',
+    ...values.map((value, index) => `event: delta\ndata: ${JSON.stringify(
+      index === 0 ? { v: value } : { o: 'replace', v: value },
+    )}`),
+    'data: [DONE]',
+    '',
+  ].join('\n\n');
 }
 
 function makeFixture() {
@@ -1835,6 +2128,28 @@ function makeFixture() {
     ],
     page_info: { has_previous_page: false, has_next_page: false },
   };
+  const newChatCanonicalPage = {
+    id: 'fixture-new-chat',
+    conversation_id: 'fixture-new-chat',
+    title: 'Fixture new chat',
+    current_node: 'fixture-new-final',
+    messages: [
+      {
+        id: 'fixture-new-user',
+        author: { role: 'user' },
+        content: { parts: ['Fixture new-chat request [https://example.com](https://example.com)'] },
+      },
+      {
+        id: 'fixture-new-final',
+        author: { role: 'assistant' },
+        content: { parts: ['Fixture new-chat answer'] },
+        metadata: { parent_id: 'fixture-new-user', turn_exchange_id: 'fixture-new-turn' },
+        status: 'finished_successfully',
+        end_turn: true,
+      },
+    ],
+    page_info: { has_previous_page: false, has_next_page: false },
+  };
   const encodedConversation = escapeHtmlAttribute(JSON.stringify(mobileConversation));
   return {
     document: '<!doctype html><html><head><meta charset="utf-8"><title>Fixture ChatGPT</title></head><body><main id="official">Official fixture</main></body></html>',
@@ -1848,6 +2163,38 @@ function makeFixture() {
     secondConversation,
     secondCanonicalPage,
     mobileCanonicalPage,
+    newChatCanonicalPage,
+    newChatStream: encodeConversationDeltaStream([
+      {
+        conversation_id: 'fixture-new-chat',
+        sequence_number: 1,
+        output_index: 0,
+        response_id: 'fixture-new-response',
+        message: {
+          id: 'fixture-new-user',
+          author: { role: 'user' },
+          content: { content_type: 'text', parts: ['Fixture new-chat request [https://example.com](https://example.com)'] },
+          metadata: { turn_exchange_id: 'fixture-new-turn' },
+          status: 'finished_successfully',
+          end_turn: true,
+        },
+      },
+      {
+        conversation_id: 'fixture-new-chat',
+        sequence_number: 2,
+        output_index: 1,
+        response_id: 'fixture-new-response',
+        message: {
+          id: 'fixture-new-final',
+          parent_id: 'fixture-new-user',
+          author: { role: 'assistant' },
+          content: { content_type: 'text', parts: ['Fixture new-chat answer'] },
+          metadata: { parent_id: 'fixture-new-user', turn_exchange_id: 'fixture-new-turn' },
+          status: 'finished_successfully',
+          end_turn: true,
+        },
+      },
+    ]),
     secondWindowConversation,
     secondLedgerA,
     secondLedgerB,
@@ -1925,8 +2272,8 @@ function makeFixture() {
         create_time: 6,
       },
     },
-    turnTraceStream: [
-      `data: ${JSON.stringify({
+    turnTraceStream: encodeConversationDeltaStream([
+      {
         sequence_number: 1,
         output_index: 0,
         response_id: 'fixture-response-mobile',
@@ -1939,8 +2286,8 @@ function makeFixture() {
           end_turn: false,
           create_time: 20,
         },
-      })}`,
-      `data: ${JSON.stringify({
+      },
+      {
         sequence_number: 2,
         output_index: 1,
         response_id: 'fixture-response-mobile',
@@ -1952,8 +2299,8 @@ function makeFixture() {
           content: { content_type: 'code', text: '{"query":"turn identity"}' },
           create_time: 21,
         },
-      })}`,
-      `data: ${JSON.stringify({
+      },
+      {
         sequence_number: 3,
         output_index: 2,
         response_id: 'fixture-response-mobile',
@@ -1964,8 +2311,8 @@ function makeFixture() {
           content: { parts: ['{"ok":true,"turn":"second"}'] },
           create_time: 22,
         },
-      })}`,
-      `data: ${JSON.stringify({
+      },
+      {
         sequence_number: 4,
         output_index: 3,
         response_id: 'fixture-response-mobile',
@@ -1978,11 +2325,14 @@ function makeFixture() {
           end_turn: true,
           create_time: 23,
         },
-      })}`,
-      'data: [DONE]',
-      '',
-    ].join('\n\n'),
+      },
+    ]),
     resume: `data: ${JSON.stringify({
+      type: 'resume_conversation_token',
+      kind: 'topic',
+      token: 'fixture-resume-token',
+      conversation_id: 'smoke',
+    })}\n\ndata: ${JSON.stringify({
       message: {
         id: 'resume-a1',
         author: { role: 'assistant' },
@@ -2051,30 +2401,43 @@ function installComposerExpression() {
     button.addEventListener('click', (event) => {
       event.preventDefault();
       const submittedText = textarea.value;
+      const newChat = location.pathname === '/';
+      window.__slimgptSubmissionIndex = (window.__slimgptSubmissionIndex || 0) + 1;
+      const userMessageId = newChat
+        ? 'fixture-new-user'
+        : 'fixture-submitted-user-' + window.__slimgptSubmissionIndex;
       window.__slimgptSubmitted = submittedText;
       const message = document.createElement('div');
-      message.setAttribute('data-message-id', 'fixture-submitted-user');
+      message.setAttribute('data-message-id', userMessageId);
       const content = document.createElement('div');
       content.setAttribute('data-message-author-role', 'user');
-      content.textContent = submittedText;
+      content.textContent = newChat
+        ? submittedText.replace('https://example.com', '[https://example.com](https://example.com)')
+        : submittedText;
       message.appendChild(content);
       document.body.appendChild(message);
+      if (newChat) {
+        history.replaceState(history.state, '', '/c/WEB:fixture-new-chat');
+        dispatchEvent(new PopStateEvent('popstate', { state: history.state }));
+      }
       void fetch('/backend-api/f/conversation', {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          'x-oai-turn-trace-id': 'fixture-turn-mobile',
+          'x-oai-turn-trace-id': newChat ? 'fixture-new-chat' : 'fixture-turn-mobile',
         },
         body: JSON.stringify({
-          conversation_id: 'mobile-smoke',
-          parent_message_id: 'ma1',
+          ...(newChat ? {} : { conversation_id: 'mobile-smoke' }),
+          parent_message_id: newChat ? 'client-created-root' : 'ma1',
           messages: [{
-            id: 'fixture-submitted-user',
+            id: userMessageId,
             author: { role: 'user' },
             content: { content_type: 'text', parts: [submittedText] },
           }],
         }),
-      }).then((response) => response.text()).catch(() => {});
+      }).then((response) => response.text()).then((body) => {
+        window.__slimgptOfficialResponseBody = body;
+      }).catch(() => {});
       textarea.value = '';
       button.hidden = true;
       let stop = form.querySelector('[data-testid="stop-button"]');
@@ -2324,6 +2687,33 @@ async function connectCdp(url) {
 function onceExit(child) {
   if (child.exitCode !== null) return Promise.resolve(child.exitCode);
   return new Promise((resolveExit) => child.once('exit', resolveExit));
+}
+
+async function runProfileJanitor(rawParentPid, rawDirectory) {
+  const parentPid = Number(rawParentPid);
+  const directory = resolve(String(rawDirectory || ''));
+  const allowedPrefix = join(resolve(tmpdir()), 'slimgpt-live-');
+  if (!Number.isInteger(parentPid) || parentPid <= 1 || !directory.startsWith(allowedPrefix)) {
+    throw new Error('Invalid profile janitor arguments');
+  }
+
+  // The janitor is detached specifically to survive hard process-tree shutdown
+  // long enough to unlink the cloned cookie database.
+  process.on('SIGINT', () => {});
+  process.on('SIGTERM', () => {});
+  while (true) {
+    try {
+      process.kill(parentPid, 0);
+      await sleep(250);
+    } catch (error) {
+      if (error?.code === 'EPERM') {
+        await sleep(250);
+        continue;
+      }
+      break;
+    }
+  }
+  rmSync(directory, { recursive: true, force: true, maxRetries: 8, retryDelay: 125 });
 }
 
 function sleep(ms) {

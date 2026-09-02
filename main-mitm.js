@@ -26,14 +26,12 @@
   // official state transition and falsely reports send-control-not-ready.
   const SEND_CONTROL_TIMEOUT = 5_000;
   const SEND_CONFIRM_TIMEOUT = 10_000;
-  const BLOCKED_TAKEOVER_RETRY_MS = 500;
-  const TAKEOVER_BLOCKER_GUARD_MS = 5_000;
+  const COMPOSER_REHYDRATE_TIMEOUT = 10_000;
   const COMPLETE_RESPONSE_RECLICK_MS = 1_250;
   const RESUME_PATH = "/backend-api/f/conversation/resume";
   const RECONNECT_STORM_WINDOW_MS = 15_000;
   const RECONNECT_STORM_LIMIT = 6;
   const EXECUTION_DOM_SETTLE_MS = 220;
-  const EXECUTION_SUBMISSION_GRACE_MS = 1_200;
   const NEW_CHAT_EXECUTION_KEY = "__slimgpt_new_chat__";
   const MAX_EXECUTION_STATES = 256;
   const CONVERSATION_INDEX_PAGE_SIZE = 100;
@@ -45,6 +43,7 @@
   let resleepTimer = null;
   let sendInFlight = false;
   let takeoverActive = false;
+  let takeoverUserHidden = false;
   let officialUiHydrated = false;
   let renderSleepRequested = false;
   let officialFocusPermitDepth = 0;
@@ -60,6 +59,7 @@
   let lastConversationIndexSyncAttemptAt = 0;
   let turnSessionCounter = 0;
   let pendingNewTurnSession = null;
+  let suppressLocationEmission = false;
   let thinkingSync = Promise.resolve();
   let resumeGeneration = 0;
   let resumeSession = null;
@@ -79,8 +79,6 @@
   const canonicalFailureCounts = new Map();
   const activeTurnSessions = new Map();
   const executionStates = new Map();
-  const lastDomRunningAt = new Map();
-  const lastExecutionStoppedAt = new Map();
   const observedFetchResponses = new WeakSet();
   const XHR_RESPONSE_OBSERVED = Symbol("slimgpt-xhr-response-observed");
   const WEBSOCKET_OBSERVED = Symbol("slimgpt-websocket-observed");
@@ -318,7 +316,7 @@
         if (!['user', 'assistant', 'tool'].includes(role)) continue;
         const messageRoot = roleNode.closest('[data-message-id]') || roleNode.querySelector?.('[data-message-id]');
         const messageId = messageRoot?.getAttribute?.('data-message-id') || roleNode.getAttribute('data-message-id');
-        if (!messageId) continue;
+        if (!messageId || /^request-placeholder(?:-|$)/i.test(messageId)) continue;
         const ownerNode = messageRoot || roleNode;
         const conversationId = messageOwners.get(ownerNode) || pageConversationId;
         if (!messageOwners.has(ownerNode)) messageOwners.set(ownerNode, conversationId);
@@ -412,21 +410,15 @@
     const now = Date.now();
     const previous = executionStates.get(key) || null;
 
-    if (state === 'stopped' && source === 'dom-composer-ready' && previous?.state === 'running') {
-      const domRunningAt = lastDomRunningAt.get(key) || 0;
-      const stoppedAt = lastExecutionStoppedAt.get(key) || 0;
-      const witnessedThisRun = domRunningAt > stoppedAt;
-      const submissionGrace = ['submission-accepted', 'sse-active'].includes(previous.source) &&
-        now - previous.observedAt < EXECUTION_SUBMISSION_GRACE_MS;
-      const authoritativeServerRun = previous.source === 'ws-turn-running' && !witnessedThisRun;
-      if (submissionGrace || authoritativeServerRun) {
-        scheduleExecutionStateScan(Math.max(EXECUTION_DOM_SETTLE_MS, EXECUTION_SUBMISSION_GRACE_MS - (now - previous.observedAt)));
-        return;
-      }
+    if (state === 'stopped' && source === 'dom-composer-ready') {
+      const activeTurn = conversationId
+        ? activeTurnSessions.get(conversationId)
+        : pendingNewTurnSession;
+      // SlimGPT gives the hidden renderer a low-cost semantic stream. Composer
+      // readiness can precede the captured server lifecycle, so it cannot
+      // declare the logical turn stopped while the intercepted turn is active.
+      if (activeTurn) return;
     }
-
-    if (state === 'running' && source === 'dom-stop-control') lastDomRunningAt.set(key, now);
-    if (state === 'stopped') lastExecutionStoppedAt.set(key, now);
 
     const next = {
       state,
@@ -440,8 +432,6 @@
       for (const candidateKey of executionStates.keys()) {
         if (candidateKey === key) continue;
         executionStates.delete(candidateKey);
-        lastDomRunningAt.delete(candidateKey);
-        lastExecutionStoppedAt.delete(candidateKey);
         break;
       }
     }
@@ -591,14 +581,16 @@
 
       const requestId = nextRequestId("fetch");
       const mimeType = response.headers.get("content-type") || "";
-      let clone;
-      try {
-        clone = response.clone();
-      } catch {
-        return response;
+      const divertOfficialStream = shouldDivertOfficialConversationStream(response, url, mimeType);
+      let captureResponse = response;
+      if (!divertOfficialStream) {
+        try {
+          captureResponse = response.clone();
+        } catch {
+          return response;
+        }
       }
 
-      const divertOfficialStream = shouldDivertOfficialConversationStream(response, url, mimeType);
       const divertResume = Boolean(resumeSnapshot && divertOfficialStream);
       let resumeGenerationForCapture = null;
       if (divertResume) resumeGenerationForCapture = adoptResumeRequest(resumeSnapshot);
@@ -612,10 +604,13 @@
         conversationRequest: Boolean(submission),
       };
 
-      if (mimeType.includes("text/vnd.openai.web-mobile-partial+html") && clone.body) {
-        void captureWebMobileStream(clone.body, captureMeta);
-      } else if (mimeType.includes("text/event-stream") && clone.body) {
-        const streamMeta = { ...captureMeta };
+      let captureDone = null;
+      let officialSemanticStream = null;
+      if (mimeType.includes("text/vnd.openai.web-mobile-partial+html") && captureResponse.body) {
+        captureDone = captureWebMobileStream(captureResponse.body, captureMeta);
+      } else if (mimeType.includes("text/event-stream") && captureResponse.body) {
+        officialSemanticStream = divertOfficialStream ? createOfficialSemanticStream() : null;
+        const streamMeta = { ...captureMeta, officialSemanticStream };
         if (divertResume) {
           streamMeta.resume = true;
           streamMeta.cancelSignal = resumeSession?.generation === resumeGenerationForCapture
@@ -623,15 +618,17 @@
             : null;
           streamMeta.onClose = (result) => handleResumeStreamClose(resumeGenerationForCapture, result);
         }
-        void captureReadableStream(clone.body, streamMeta);
+        captureDone = captureReadableStream(captureResponse.body, streamMeta);
       } else {
         const declaredLength = Number(response.headers.get("content-length") || 0);
         if (!declaredLength || declaredLength <= MAX_NON_STREAM_BODY) {
-          void captureBoundedResponse(clone, captureMeta);
+          void captureBoundedResponse(captureResponse, captureMeta);
         }
       }
 
-      return divertOfficialStream ? completeOfficialStream(response) : response;
+      return divertOfficialStream
+        ? completeOfficialStream(response, officialSemanticStream?.readable, captureDone)
+        : response;
     };
   }
 
@@ -852,6 +849,16 @@
     const session = { ...pendingNewTurnSession, conversationId };
     pendingNewTurnSession = null;
     activeTurnSessions.set(conversationId, session);
+    const pendingExecution = executionStates.get(NEW_CHAT_EXECUTION_KEY);
+    if (pendingExecution) {
+      executionStates.delete(NEW_CHAT_EXECUTION_KEY);
+      emitExecutionState(
+        pendingExecution.state,
+        pendingExecution.source || "conversation-bound",
+        conversationId,
+        { boundFromNewChat: true },
+      );
+    }
     return session;
   }
 
@@ -1075,8 +1082,8 @@
   }
 
   // The official renderer is fragile with long-lived streams. SlimGPT owns
-  // the real resume response and gives the official consumer an immediate
-  // terminal frame. If the owned stream drops without [DONE], the exact
+  // the real resume response while the official consumer receives a low-cost
+  // semantic stream. If the owned stream drops without [DONE], the exact
   // observed request is replayed immediately; delay is used only to stop a
   // reconnect storm.
   function adoptResumeRequest(snapshot) {
@@ -1245,32 +1252,418 @@
     session.controller?.abort();
   }
 
-  function completeOfficialStream(response) {
-    try {
-      void response.body.cancel().catch(() => {});
-    } catch {
-      // The capture clone already owns the stream; cancellation is only a
-      // best-effort release of the official parser's tee branch.
-    }
-    const headers = new Headers(response.headers);
-    headers.delete("content-encoding");
-    headers.delete("content-length");
-    headers.delete("transfer-encoding");
-    headers.set("content-type", "text/event-stream; charset=utf-8");
-    const completed = new Response("data: [DONE]\n\n", {
-      status: response.status,
-      statusText: response.statusText,
-      headers,
+  function createOfficialSemanticStream() {
+    const encoder = new TextEncoder();
+    const channelValues = [];
+    const projectedByChannel = [];
+    const projectedChannelOrder = [];
+    const projectedLegacyMessages = new Map();
+    const projectedControls = new Map();
+    let projectedResumeControl = null;
+    let turnUserMessageId = null;
+    let turnParentMessageId = null;
+    let controller = null;
+    let closed = false;
+    let source = "";
+    let encoding = null;
+    let previousDelta = { channel: 0, op: "add", path: "", value: undefined };
+
+    const readable = new ReadableStream({
+      start(nextController) {
+        controller = nextController;
+      },
+      cancel() {
+        closed = true;
+        controller = null;
+      },
     });
-    observedFetchResponses.add(completed);
-    return completed;
+
+    const write = (event, value) => {
+      if (closed || !controller) return;
+      const prefix = event ? `event: ${event}\n` : "";
+      controller.enqueue(encoder.encode(`${prefix}data: ${JSON.stringify(value)}\n\n`));
+    };
+
+    const processBlock = (block) => {
+      const frame = parseOfficialSseFrame(block);
+      if (!frame || frame.data === "[DONE]") return;
+      if (frame.event === "delta_encoding") {
+        if (frame.value !== "v1") return;
+        encoding = "v1";
+        previousDelta = { channel: 0, op: "add", path: "", value: undefined };
+        channelValues.length = 0;
+        projectedByChannel.length = 0;
+        projectedChannelOrder.length = 0;
+        return;
+      }
+      if (frame.event === "delta" && encoding === "v1") {
+        try {
+          const delta = decodeOfficialCompactDelta(frame.value, previousDelta);
+          previousDelta = delta;
+          const value = applyOfficialDelta(channelValues[delta.channel], delta);
+          channelValues[delta.channel] = value;
+          const projected = projectOfficialSemanticValue(value);
+          if (!projected) return;
+          if (projectedByChannel[delta.channel] === undefined) {
+            projectedChannelOrder.push(delta.channel);
+          }
+          projectedByChannel[delta.channel] = projected;
+        } catch {
+          // A future delta dialect must not fall back to the expensive raw
+          // official renderer. SlimGPT still owns and displays the real stream.
+        }
+        return;
+      }
+
+      const projected = projectOfficialSemanticValue(frame.value);
+      if (!projected) return;
+      if (projected.type === "resume_conversation_token") {
+        // A successful stream needs no resume state. On abnormal EOF this is
+        // emitted immediately before close so the official retry manager can
+        // continue the turn instead of treating a synthetic DONE as success.
+        projectedResumeControl = projected;
+      } else if (projected.message?.id) {
+        projectedLegacyMessages.set(projected.message.id, projected);
+      } else if (projected.type) {
+        projectedControls.set(projected.type, projected);
+      }
+    };
+
+    return {
+      readable,
+      setContext(context) {
+        turnUserMessageId = context?.turnUserMessageId || turnUserMessageId;
+        turnParentMessageId = context?.turnParentMessageId || turnParentMessageId;
+      },
+      accept(chunk) {
+        if (closed || !chunk) return;
+        source += chunk;
+        while (true) {
+          const boundary = source.match(/\r?\n\r?\n/);
+          if (!boundary || boundary.index === undefined) break;
+          const block = source.slice(0, boundary.index);
+          source = source.slice(boundary.index + boundary[0].length);
+          processBlock(block);
+        }
+      },
+      finish(sawDone) {
+        if (closed) return;
+        if (source.trim()) processBlock(source);
+        source = "";
+        if (controller) {
+          if (!sawDone && projectedResumeControl) write("", projectedResumeControl);
+
+          const orderedMessages = [];
+          const messagesById = new Map();
+          const rememberMessage = (projected) => {
+            const id = projected?.message?.id;
+            if (!id) return;
+            if (!messagesById.has(id)) orderedMessages.push(id);
+            messagesById.set(id, projected);
+          };
+          for (const channel of projectedChannelOrder) rememberMessage(projectedByChannel[channel]);
+          for (const projected of projectedLegacyMessages.values()) rememberMessage(projected);
+
+          let matchingUser = null;
+          let latestUser = null;
+          let final = null;
+          for (const id of orderedMessages) {
+            const projected = messagesById.get(id);
+            if (projected?.message?.author?.role === "user") {
+              latestUser = projected;
+              if (id === turnUserMessageId) matchingUser = projected;
+            }
+            if (isOfficialFinalAssistant(projected?.message)) final = projected;
+          }
+          const user = matchingUser || latestUser;
+          const userId = turnUserMessageId || user?.message?.id || null;
+
+          if (user) write("", projectOfficialTurnNode(user, turnParentMessageId));
+          if (final) write("", projectOfficialTurnNode(final, userId));
+          for (const type of [
+            "title_generation",
+            "message_stream_complete",
+            "conversation_detail_metadata",
+          ]) {
+            const projected = projectedControls.get(type);
+            if (projected) write("", projected);
+          }
+          if (sawDone) controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          controller.close();
+        }
+        controller = null;
+        closed = true;
+      },
+    };
+  }
+
+  function isOfficialFinalAssistant(message) {
+    if (message?.author?.role !== "assistant") return false;
+    if (message.recipient && message.recipient !== "all") return false;
+    return message.end_turn === true ||
+      (message.channel === "final" && /^finished/.test(String(message.status || "")));
+  }
+
+  function projectOfficialTurnNode(projected, parentMessageId) {
+    const message = projected.message;
+    const parent = parentMessageId || message.parent_id || message.metadata?.parent_id || null;
+    return {
+      ...projected,
+      message: {
+        ...message,
+        ...(parent ? { parent_id: parent } : {}),
+        content: { content_type: "text", parts: ["\u200b"] },
+        metadata: {
+          ...(message.metadata || {}),
+          ...(parent ? { parent_id: parent } : {}),
+        },
+      },
+    };
+  }
+
+  function parseOfficialSseFrame(block) {
+    if (!block) return null;
+    let event = "";
+    const data = [];
+    for (const line of String(block).split(/\r?\n/)) {
+      if (line.startsWith("event:")) event = line.slice(6).trim();
+      else if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
+    }
+    if (!data.length) return null;
+    const body = data.join("\n");
+    if (body === "[DONE]") return { event, data: body, value: null };
+    try {
+      return { event, data: body, value: JSON.parse(body) };
+    } catch {
+      return null;
+    }
+  }
+
+  function decodeOfficialCompactDelta(rawDelta, previousDelta) {
+    if (!rawDelta || typeof rawDelta !== "object" || Array.isArray(rawDelta)) {
+      throw new Error("Unexpected official delta");
+    }
+    const compact = { ...rawDelta };
+    for (const [field, short] of [["channel", "c"], ["path", "p"], ["op", "o"]]) {
+      if (!(short in compact)) compact[short] = previousDelta[field];
+    }
+    return expandOfficialDelta(compact);
+  }
+
+  function expandOfficialDelta(compact) {
+    const delta = { ...compact };
+    for (const [field, short] of [["channel", "c"], ["path", "p"], ["op", "o"], ["value", "v"]]) {
+      if (!(short in compact)) continue;
+      delta[field] = compact[short];
+      delete delta[short];
+    }
+    if (delta.op === "patch") {
+      if (!Array.isArray(delta.value)) throw new Error("Invalid official patch");
+      delta.value = delta.value.map(expandOfficialDelta);
+    }
+    return delta;
+  }
+
+  function applyOfficialDelta(previousValue, delta) {
+    const root = Symbol("official-delta-root");
+    const path = [root, ...parseOfficialDeltaPath(delta.path)];
+    const result = { [root]: previousValue };
+    let source = result;
+    let target = result;
+    for (let index = 0; index < path.length - 1; index += 1) {
+      const key = path[index];
+      const nextKey = path[index + 1];
+      const sourceChild = source && typeof source === "object" ? source[key] : undefined;
+      const targetChild = Array.isArray(sourceChild)
+        ? sourceChild.slice()
+        : (sourceChild && typeof sourceChild === "object")
+          ? { ...sourceChild }
+          : typeof nextKey === "number" ? [] : {};
+      target[key] = targetChild;
+      source = sourceChild;
+      target = targetChild;
+    }
+    applyOfficialDeltaOperation(target, path[path.length - 1], delta);
+    return result[root];
+  }
+
+  function parseOfficialDeltaPath(value) {
+    if (!value) return [];
+    const source = value[0] === "/" ? value.slice(1) : value;
+    return source.split("/").map((part) => {
+      const decoded = part.replace(/~1/g, "/").replace(/~0/g, "~");
+      if (["__proto__", "prototype", "constructor"].includes(decoded)) {
+        throw new Error("Unsafe official delta path");
+      }
+      return /^(?:0|[1-9]\d*)$/.test(decoded) ? Number.parseInt(decoded, 10) : decoded;
+    });
+  }
+
+  function applyOfficialDeltaOperation(target, key, delta) {
+    if (delta.op === "patch") {
+      let value = target[key];
+      for (const patch of delta.value) value = applyOfficialDelta(value, patch);
+      target[key] = value;
+    } else if (delta.op === "add") {
+      if (Array.isArray(target)) target.splice(key, 0, delta.value);
+      else target[key] = delta.value;
+    } else if (delta.op === "remove") {
+      if (Array.isArray(target)) target.splice(key, 1);
+      else delete target[key];
+    } else if (delta.op === "replace") {
+      target[key] = delta.value;
+    } else if (delta.op === "append") {
+      const previous = target[key];
+      if (typeof previous === "string") target[key] = previous + delta.value;
+      else if (Array.isArray(previous)) {
+        target[key] = previous.concat(Array.isArray(delta.value) ? delta.value : [delta.value]);
+      } else if (
+        previous && delta.value &&
+        typeof previous === "object" && typeof delta.value === "object" &&
+        !Array.isArray(previous) && !Array.isArray(delta.value)
+      ) {
+        target[key] = { ...previous, ...delta.value };
+      } else target[key] = delta.value;
+    } else if (delta.op === "truncate") {
+      if (typeof target[key] === "string") target[key] = target[key].substring(0, delta.value);
+      else if (Array.isArray(target[key])) target[key] = target[key].slice(0, delta.value);
+    } else {
+      throw new Error("Unknown official delta operation");
+    }
+  }
+
+  function projectOfficialSemanticValue(value) {
+    if (!value || typeof value !== "object") return null;
+    if (value.message && typeof value.message === "object") {
+      const message = value.message;
+      const metadata = {};
+      for (const key of [
+        "parent_id",
+        "request_id",
+        "turn_exchange_id",
+        "working_turn_id",
+        "turn_trace_id",
+        "message_type",
+        "message_source",
+        "can_save",
+        "is_visually_hidden_from_conversation",
+        "selected_sources",
+        "serialization_metadata",
+        "reasoning_status",
+        "cot_version",
+        "model_switcher_deny",
+        "model_slug",
+        "resolved_model_slug",
+        "default_model_slug",
+        "thinking_effort",
+        "is_complete",
+        "finish_details",
+        "async_source",
+        "real_author",
+        "call_id",
+        "tool_call_id",
+      ]) {
+        if (message.metadata?.[key] !== undefined) metadata[key] = message.metadata[key];
+      }
+      return {
+        message: {
+          id: message.id,
+          ...(message.parent_id ? { parent_id: message.parent_id } : {}),
+          author: {
+            role: message.author?.role,
+            name: message.author?.name ?? null,
+            metadata: message.author?.metadata?.real_author
+              ? { real_author: message.author.metadata.real_author }
+              : {},
+          },
+          create_time: message.create_time ?? null,
+          update_time: message.update_time ?? null,
+          content: projectOfficialMessageContent(message.content),
+          status: message.status ?? null,
+          end_turn: message.end_turn ?? null,
+          weight: message.weight ?? 1,
+          metadata,
+          recipient: message.recipient ?? "all",
+          channel: message.channel ?? null,
+        },
+        conversation_id: value.conversation_id || null,
+        error: value.error ?? null,
+        error_code: value.error_code ?? null,
+      };
+    }
+
+    if (value.type === "input_message") return null;
+    if (typeof value.type === "string") {
+      const serialized = JSON.stringify(value);
+      return serialized.length <= 16_384 ? value : { type: value.type, conversation_id: value.conversation_id || null };
+    }
+    return null;
+  }
+
+  function projectOfficialMessageContent(content) {
+    const type = content?.content_type || "text";
+    const placeholder = type === "code" ? "{}" : "\u200b";
+    if (Array.isArray(content?.parts)) return { content_type: type, parts: [placeholder] };
+    if (typeof content?.text === "string") return { content_type: type, text: placeholder };
+    if (typeof content?.content === "string") return { content_type: type, content: placeholder };
+    return { content_type: type, parts: [placeholder] };
+  }
+
+  function completeOfficialStream(response, semanticBody, captureDone) {
+    // Retain the native network Response identity while substituting only its
+    // body reader. ChatGPT associates response internals with router/request
+    // state; constructing a new Response loses that semantic identity.
+    const body = semanticBody || new ReadableStream({
+      start(controller) {
+        Promise.resolve(captureDone)
+          .catch(() => {})
+          .then(() => {
+            controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+            controller.close();
+          });
+      },
+    });
+    try {
+      Object.defineProperties(response, {
+        body: {
+          configurable: true,
+          value: body,
+        },
+        bodyUsed: {
+          configurable: true,
+          get: () => body.locked,
+        },
+        text: {
+          configurable: true,
+          value: async () => new Response(body).text(),
+        },
+        json: {
+          configurable: true,
+          value: async () => JSON.parse(await new Response(body).text()),
+        },
+      });
+      return response;
+    } catch {
+      const headers = new Headers(response.headers);
+      headers.delete("content-encoding");
+      headers.delete("content-length");
+      headers.delete("transfer-encoding");
+      const fallback = new Response(body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      });
+      observedFetchResponses.add(fallback);
+      return fallback;
+    }
   }
 
   async function captureReadableStream(stream, meta) {
     const reader = stream.getReader();
     const decoder = new TextDecoder();
-    const { onClose, cancelSignal, ...unresolvedMeta } = meta;
+    const { onClose, cancelSignal, officialSemanticStream, ...unresolvedMeta } = meta;
     const captureMeta = await resolveCaptureMeta(unresolvedMeta);
+    officialSemanticStream?.setContext(captureMeta);
     if (captureMeta.conversationId && isExecutionStreamUrl(captureMeta.url)) {
       emitExecutionState('running', 'sse-active', captureMeta.conversationId);
     }
@@ -1283,6 +1676,7 @@
 
     const captureChunk = (data) => {
       if (!data) return;
+      officialSemanticStream?.accept(data);
       markerTail = `${markerTail}${data}`.slice(-256);
       if (/(?:^|\n)\s*data:\s*\[DONE\]/.test(markerTail)) sawDone = true;
       emit({
@@ -1305,6 +1699,7 @@
     } catch (error) {
       readError = error;
     } finally {
+      officialSemanticStream?.finish(sawDone);
       emit({
         type: "page-capture",
         transport: "sse",
@@ -1705,7 +2100,7 @@
     try {
       await task;
     } catch (error) {
-      scheduleCanonicalBackoff(conversationId, generation, error);
+      scheduleCanonicalBackoff(conversationId, error);
     } finally {
       canonicalFetches.delete(conversationId);
       if ((canonicalQueueGenerations.get(conversationId) || 0) !== generation) {
@@ -1714,7 +2109,7 @@
     }
   }
 
-  function scheduleCanonicalBackoff(conversationId, generation, error) {
+  function scheduleCanonicalBackoff(conversationId, error) {
     const failureCount = (canonicalFailureCounts.get(conversationId) || 0) + 1;
     canonicalFailureCounts.set(conversationId, failureCount);
     const explicitDelay = Number(error?.retryAfterMs);
@@ -2336,6 +2731,7 @@
   }
 
   function emitLocation() {
+    if (suppressLocationEmission) return;
     if (location.href !== observedLocationHref) {
       preserveDomConversationOwnership(conversationIdFromUrl(observedLocationHref));
       observedLocationHref = location.href;
@@ -2759,6 +3155,7 @@
       return;
     }
     takeoverActive = true;
+    takeoverUserHidden = false;
     frame.dataset.slimgptVisible = "1";
     frame.style.pointerEvents = "auto";
     frame.style.opacity = "1";
@@ -2790,7 +3187,12 @@
     const check = () => {
       if (takeoverActive && findBlockingOfficialUi()) {
         suspendTakeoverForBlocker();
-      } else if (!takeoverActive && findComposerElement() && !findBlockingOfficialUi()) {
+      } else if (
+        !takeoverActive &&
+        !takeoverUserHidden &&
+        findComposerElement() &&
+        !findBlockingOfficialUi()
+      ) {
         showTakeover();
       }
     };
@@ -2828,6 +3230,7 @@
     renderSleepRequested = false;
     wakeOfficialUi();
     takeoverActive = false;
+    takeoverUserHidden = true;
     frame.dataset.slimgptVisible = "0";
     frame.style.pointerEvents = "none";
     frame.style.opacity = "0";
@@ -2912,7 +3315,8 @@
     if (!submittedText) {
       return { ok: false, commandId, error: "empty-message" };
     }
-    const composer = findComposer();
+    let composer = findComposer();
+    if (!composer) composer = await rehydrateOfficialComposer();
     if (!composer) {
       return { ok: false, commandId, error: "composer-not-found" };
     }
@@ -3028,6 +3432,134 @@
       observer.observe(document.documentElement || document, { childList: true, subtree: true, characterData: true });
       timer = setTimeout(() => finish(false), SEND_CONFIRM_TIMEOUT);
       if (officialDomTextFor(submittedText)) finish(true);
+    });
+  }
+
+  async function rehydrateOfficialComposer() {
+    const conversationId = conversationIdFromUrl(location.href);
+    if (!conversationId || !document.documentElement) return null;
+    const targetUrl = location.href;
+    const deadline = Date.now() + COMPOSER_REHYDRATE_TIMEOUT;
+    const remaining = () => Math.max(0, deadline - Date.now());
+    preserveDomConversationOwnership(conversationId);
+    suppressLocationEmission = true;
+    try {
+      const currentRetry = findOfficialLoadRetryControl();
+      if (currentRetry) {
+        currentRetry.click();
+        const recovered = await waitForOfficialDom(() => {
+          const composer = findComposer();
+          return composer
+            ? { composer, ready: Boolean(document.querySelector("[data-message-author-role]")) }
+            : null;
+        }, Math.min(2_500, remaining()));
+        if (recovered?.ready) return recovered.composer;
+      }
+
+      nativeReplaceState.call(history, history.state, "", location.origin);
+      window.dispatchEvent(new PopStateEvent("popstate", { state: history.state }));
+      const rootComposer = await recoverOfficialRouteComposer(null, remaining(), false);
+      if (!rootComposer) return null;
+
+      let routeLink = findOfficialRouteLink(targetUrl);
+      if (!routeLink) {
+        routeLink = await waitForOfficialDom(
+          () => findOfficialRouteLink(targetUrl),
+          Math.min(2_500, remaining()),
+        );
+      }
+      if (routeLink) {
+        routeLink.dispatchEvent(new MouseEvent("click", {
+          bubbles: true,
+          cancelable: true,
+          button: 0,
+        }));
+      } else {
+        nativeReplaceState.call(history, history.state, "", targetUrl);
+        window.dispatchEvent(new PopStateEvent("popstate", { state: history.state }));
+      }
+      return await recoverOfficialRouteComposer(rootComposer, remaining(), true);
+    } finally {
+      if (location.href !== targetUrl) {
+        nativeReplaceState.call(history, history.state, "", targetUrl);
+      }
+      suppressLocationEmission = false;
+      emitLocation();
+    }
+  }
+
+  async function recoverOfficialRouteComposer(previousComposer, timeoutMs, requireMessages) {
+    const deadline = Date.now() + timeoutMs;
+    const remaining = () => Math.max(0, deadline - Date.now());
+    const state = await waitForOfficialDom(() => {
+      const composer = findComposer();
+      const hasMessages = Boolean(document.querySelector("[data-message-author-role]"));
+      const routeReady = composer &&
+        (!requireMessages || hasMessages) &&
+        (!previousComposer || composer !== previousComposer || hasMessages);
+      return {
+        composer: routeReady ? composer : null,
+        retry: findOfficialLoadRetryControl(),
+      };
+    }, remaining(), (value) => Boolean(value.composer || value.retry));
+    if (state?.composer) return state.composer;
+    if (!state?.retry) return null;
+    state.retry.click();
+    return await waitForOfficialDom(() => {
+      const composer = findComposer();
+      const hasMessages = Boolean(document.querySelector("[data-message-author-role]"));
+      return composer &&
+        (!requireMessages || hasMessages) &&
+        (!previousComposer || composer !== previousComposer || hasMessages)
+          ? composer
+          : null;
+    }, remaining());
+  }
+
+  function findOfficialRouteLink(rawUrl) {
+    const target = new URL(rawUrl, location.origin);
+    for (const anchor of document.querySelectorAll("a[href]")) {
+      try {
+        const href = new URL(anchor.href, location.href);
+        if (href.origin === target.origin && href.pathname === target.pathname) return anchor;
+      } catch {}
+    }
+    return null;
+  }
+
+  function findOfficialLoadRetryControl() {
+    if (findComposer()) return null;
+    for (const button of document.querySelectorAll("button")) {
+      if (!(button instanceof HTMLButtonElement) || button.disabled || button.hidden) continue;
+      const label = String(button.textContent || "").replace(/\s+/g, " ").trim();
+      if (/^(?:try again|retry|重试|再试一次)$/i.test(label)) return button;
+    }
+    return null;
+  }
+
+  function waitForOfficialDom(predicate, timeoutMs, accepts = Boolean) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        observer.disconnect();
+        resolve(value);
+      };
+      const scan = () => {
+        const value = predicate();
+        if (accepts(value)) finish(value);
+      };
+      const observer = new MutationObserver(scan);
+      const timer = setTimeout(() => finish(null), timeoutMs);
+      observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["disabled", "aria-disabled", "contenteditable"],
+      });
+      queueMicrotask(scan);
     });
   }
 

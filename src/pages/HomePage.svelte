@@ -7,23 +7,24 @@
   import Composer from '../components/Composer.svelte';
   import { createTransport } from '../lib/transport.js';
   import { downloadConversationMarkdown } from '../lib/export.js';
-import {
-  loadConversationIndex,
-  loadObservationLedger,
-  saveConversationIndex,
-  saveObservationLedger,
-  loadUserSettings,
-  saveUserSettings,
-  subscribeStorageChanges,
-  DEFAULT_SETTINGS,
-  THINKING_LEVELS,
-} from '../lib/storage.js';
+  import {
+    loadConversationIndex,
+    loadObservationLedger,
+    saveConversationIndex,
+    saveObservationLedger,
+    loadUserSettings,
+    saveUserSettings,
+    subscribeStorageChanges,
+    DEFAULT_SETTINGS,
+    THINKING_LEVELS,
+  } from '../lib/storage.js';
   import {
     bindConversationTurnUser,
     buildConversationRecordTurns,
     buildConversationView,
     contentToText,
     consumeSse,
+    createConversationSseDecoder,
     conversationIdFromPayload,
     conversationIdFromUrl,
     conversationThinkingLevel,
@@ -37,6 +38,7 @@ import {
     hydrateConversationObservations,
     ingestConversationMessage,
     ingestConversationPayload,
+    messageTurnIdentity,
     parseJson,
     parseWebMobilePartialConversation,
     resolveConversationScope,
@@ -64,7 +66,6 @@ import {
   let panelPointerIntent = null;
   let activeTurnIndex = $state(0);
   let saveTimer = null;
-  let persistMaxTimer = null;
   let persistInFlight = false;
   let persistQueued = false;
   let sendTimer = null;
@@ -76,7 +77,11 @@ import {
   let newChatWorkState = $state('unknown');
   const MAX_CAPTURE_BUFFER = 20 * 1024 * 1024;
   const MAX_CACHED_CONVERSATIONS = 24;
+  // Main-world recovery is MutationObserver-driven but can traverse the
+  // official root error boundary before it confirms the conversation request.
+  const SEND_COMMAND_WATCHDOG_MS = 30_000;
   const sseBuffers = new Map();
+  const sseDecoders = new Map();
   const xhrBuffers = new Map();
   const captureConversationIds = new Map();
   const conflictedCaptureIds = new Set();
@@ -188,10 +193,10 @@ import {
       unsubscribeStorage?.();
       transport.stop();
       clearTimeout(saveTimer);
-      clearTimeout(persistMaxTimer);
       clearTimeout(sendTimer);
       clearTimeout(navigationTimer);
       sseBuffers.clear();
+      sseDecoders.clear();
       xhrBuffers.clear();
       captureConversationIds.clear();
       conflictedCaptureIds.clear();
@@ -233,6 +238,9 @@ import {
     if (!update || typeof update !== 'object') return;
     if (Array.isArray(update.conversationIndex)) mergeConversationIndex(update.conversationIndex);
     if (Array.isArray(update.observationLedger)) mergeObservationLedger(update.observationLedger);
+    if (update.executionPulse?.payload?.type === 'page-execution-state') {
+      applyExecutionState(update.executionPulse.payload);
+    }
     if (update.userSettings && typeof update.userSettings === 'object') {
       userSettings = { ...DEFAULT_SETTINGS, ...userSettings, ...update.userSettings };
     }
@@ -264,6 +272,19 @@ import {
     conversationRecords = next;
   }
 
+  function applyExecutionState(message) {
+    const { conversationId, conflicted } = resolveConversationScope(
+      message.conversationId,
+      message.conversationId ? null : conversationIdFromUrl(message.url || ''),
+    );
+    if (!conflicted && ['running', 'stopped', 'unknown'].includes(message.state)) {
+      if (conversationId && message.state === 'running') {
+        bindLifecycleConversation(conversationId, message, { conversationRequest: false });
+      }
+      setConversationWorkState(conversationId, message.state);
+    }
+  }
+
   async function handleThinkingLevelChange(thinkingLevel) {
     thinkingLevelOverride = thinkingLevel;
     userSettings = { ...userSettings, thinkingLevel };
@@ -288,16 +309,7 @@ import {
       status = { ...status, takeover: message.active };
     }
     else if (message.type === 'page-execution-state') {
-      const { conversationId, conflicted } = resolveConversationScope(
-        message.conversationId,
-        message.conversationId ? null : conversationIdFromUrl(message.url || ''),
-      );
-      if (!conflicted && ['running', 'stopped', 'unknown'].includes(message.state)) {
-        if (conversationId && message.state === 'running') {
-          bindLifecycleConversation(conversationId, message, { conversationRequest: false });
-        }
-        setConversationWorkState(conversationId, message.state);
-      }
+      applyExecutionState(message);
     }
     else if (message.type === 'page-conversation-bound') {
       const { conversationId, conflicted } = resolveConversationScope(message.conversationId);
@@ -331,16 +343,27 @@ import {
     const isEventStream = capture.transport === 'sse' || String(capture.mimeType || '').includes('text/event-stream');
     if (isEventStream) {
       const key = capture.requestId || capture.url || 'sse';
+      const decoder = sseDecoders.get(key) || createConversationSseDecoder();
+      sseDecoders.set(key, decoder);
       const { rest, frames } = consumeSse(sseBuffers.get(key) || '', text, capture.phase === 'complete');
-      if (capture.phase === 'complete') sseBuffers.delete(key);
-      else sseBuffers.set(key, rest);
+      if (capture.phase === 'complete') {
+        sseBuffers.delete(key);
+        sseDecoders.delete(key);
+      } else {
+        sseBuffers.set(key, rest);
+      }
 
       for (const frame of frames) {
         if (frame.data === '[DONE]') {
           // [DONE] terminates this SSE segment only. It is not evidence that
           // the conversation turn has stopped; async/tool work may continue.
-        } else if (frame.json) {
-          processStructured(frame.json, capture);
+          continue;
+        }
+        try {
+          const decoded = decoder.decode(frame);
+          if (decoded && typeof decoded === 'object') processStructured(decoded, capture);
+        } catch {
+          setComposerStatus('官方增量事件无法解码；将以完整会话同步结果为准', true);
         }
       }
       if (capture.phase === 'complete') {
@@ -406,8 +429,11 @@ import {
       bindLifecycleConversation(scope.conversationId, lifecycle, capture);
     }
 
+    const structuredConversationId = conversationIdFromPayload(value);
+    const provisionalPageId = conversationIdFromUrl(capture.url || '');
     const conversation = findConversationPayload(value, {
-      conversationId: capture.conversationId || conversationIdFromUrl(capture.url || ''),
+      conversationId: structuredConversationId || capture.conversationId ||
+        (isProvisionalConversationId(provisionalPageId) ? '' : provisionalPageId),
     });
     if (conversation) {
       const scope = resolveCapturedConversation(capture, conversationIdFromPayload(conversation));
@@ -474,6 +500,10 @@ import {
     }
   }
 
+  function isProvisionalConversationId(id) {
+    return /^WEB:/i.test(String(id || ''));
+  }
+
   function bindLifecycleConversation(id, lifecycle = {}, capture = {}) {
     if (!id) return;
     const turnAliases = [...new Set([
@@ -494,8 +524,11 @@ import {
       pendingUser?.message?.turnId,
       ...(pendingUser?.message?.turnAliases || []),
       pendingUser?.message?.transportTurnId,
+      pendingUser?.userMessageId,
+      pendingUser?.message?.turnUserMessageId,
     ].filter(Boolean))];
     const correlated = capture.conversationRequest === true ||
+      Boolean(capture.turnUserMessageId && pendingUser?.userMessageId === capture.turnUserMessageId) ||
       (turnAliases.length > 0 && pendingAliases.some((alias) => turnAliases.includes(alias)));
 
     const identityCapture = {
@@ -507,7 +540,11 @@ import {
       turnParentMessageId: capture.turnParentMessageId || null,
     };
     bindPendingTurnIdentity(id, identityCapture);
-    if (pendingUser?.conversationId === null && currentConversationId === null && correlated) {
+    if (
+      pendingUser?.conversationId === null &&
+      (!currentConversationId || isProvisionalConversationId(currentConversationId)) &&
+      correlated
+    ) {
       bindPendingConversation(id);
     }
   }
@@ -517,7 +554,6 @@ import {
     if (pendingUser.conversationId && pendingUser.conversationId !== id) return;
     pendingUser = {
       ...pendingUser,
-      conversationId: pendingUser.conversationId || id,
       turnId: capture.turnId || pendingUser.turnId || null,
       turnAliases: capture.turnAliases || pendingUser.turnAliases || [],
       transportTurnId: capture.transportTurnId || pendingUser.transportTurnId || null,
@@ -553,6 +589,21 @@ import {
       urlConversationId,
       key ? captureConversationIds.get(key) : null,
     );
+    if (
+      scope.conflicted &&
+      capture.conversationRequest === true &&
+      pendingUser?.conversationId === null
+    ) {
+      const stableIds = [explicitConversationId, capture.conversationId, urlConversationId]
+        .filter((id) => id && !isProvisionalConversationId(id));
+      const provisionalIds = [explicitConversationId, capture.conversationId, urlConversationId]
+        .filter((id) => isProvisionalConversationId(id));
+      const stableId = [...new Set(stableIds)][0] || null;
+      if (stableId && new Set(stableIds).size === 1 && provisionalIds.length) {
+        if (key) captureConversationIds.set(key, stableId);
+        return { conversationId: stableId, conflicted: false };
+      }
+    }
     if (scope.conflicted) {
       if (key) {
         captureConversationIds.delete(key);
@@ -586,10 +637,10 @@ import {
   function maybeActivateCapturedConversation(id, capture) {
     bindPendingTurnIdentity(id, capture);
     if (id === currentConversationId) return;
-    if (currentConversationId) return;
     if (
       capture.conversationRequest === true &&
-      pendingUser?.conversationId === null
+      pendingUser?.conversationId === null &&
+      (!currentConversationId || isProvisionalConversationId(currentConversationId))
     ) {
       bindPendingConversation(id);
     }
@@ -652,6 +703,16 @@ import {
     status = { ...status, pageUrl: url };
     const id = conversationIdFromUrl(url);
     if (id) {
+      if (
+        isProvisionalConversationId(id) &&
+        pendingUser?.conversationId === null &&
+        currentConversationId === null
+      ) {
+        // ChatGPT exposes a WEB:* optimistic route before the server assigns
+        // the persisted conversation id. Keep the new-chat scope unbound until
+        // an intercepted event carries the real id.
+        return;
+      }
       if (id !== currentConversationId) {
         if (pendingUser?.conversationId === null && currentConversationId === null) {
           bindPendingConversation(id);
@@ -722,15 +783,28 @@ import {
   }
 
   function bindPendingConversation(id) {
-    if (!id || pendingUser?.conversationId !== null) return;
+    if (!id || !pendingUser || (pendingUser.conversationId && !isProvisionalConversationId(pendingUser.conversationId))) return;
+    const provisionalId = isProvisionalConversationId(currentConversationId)
+      ? currentConversationId
+      : (isProvisionalConversationId(pendingUser.conversationId) ? pendingUser.conversationId : null);
     pendingUser = { ...pendingUser, conversationId: id };
     if (
       pendingCommandId === pendingUser.commandId &&
-      pendingCommandConversationId === null
+      (!pendingCommandConversationId || isProvisionalConversationId(pendingCommandConversationId))
     ) {
       pendingCommandConversationId = id;
     }
-    if (currentConversationId === null) {
+    if (currentConversationId === null || currentConversationId === provisionalId) {
+      if (provisionalId) {
+        const nextRecords = new Map(conversationRecords);
+        const provisionalRecord = nextRecords.get(provisionalId);
+        if (provisionalRecord && !nextRecords.has(id)) nextRecords.set(id, provisionalRecord);
+        nextRecords.delete(provisionalId);
+        conversationRecords = nextRecords;
+        const nextConversationMap = new Map(conversationMap);
+        nextConversationMap.delete(provisionalId);
+        conversationMap = nextConversationMap;
+      }
       setCurrentConversation(id, { migrateDraft: true });
     }
     if (transport.supportsLiveChat) {
@@ -824,7 +898,7 @@ import {
     pendingCommandConversationId = currentConversationId;
     pendingUser = {
       commandId,
-      conversationId: currentConversationId,
+      conversationId: isProvisionalConversationId(currentConversationId) ? null : currentConversationId,
       text,
       message: {
         id: `pending-${stamp}`,
@@ -859,7 +933,7 @@ import {
       if (pendingUser?.commandId === commandId) pendingUser = null;
       setConversationWorkState(timedOutConversationId, 'unknown');
       setComposerStatus('官方输入框未确认提交；内容仍保留，请检查官方界面后手动决定是否重试', true);
-    }, 14_000);
+    }, SEND_COMMAND_WATCHDOG_MS);
     setComposerStatus('正在通过 ChatGPT 页面发送；断线后不会自动重发');
   }
 
@@ -904,31 +978,76 @@ import {
     setComposerStatus('消息已发送（官方已确认）');
   }
 
+  function pendingUserMatch(rawMessage) {
+    if (!pendingUser || rawMessage?.author?.role !== 'user') return false;
+
+    const messageId = String(rawMessage.id || '').trim();
+    const expectedIds = new Set([
+      pendingUser.userMessageId,
+      pendingUser.message?.turnUserMessageId,
+    ].filter(Boolean).map(String));
+    if (expectedIds.size) return Boolean(messageId && expectedIds.has(messageId));
+
+    const pendingAliases = new Set([
+      ...(pendingUser.turnAliases || []),
+      pendingUser.turnId,
+      ...(pendingUser.message?.turnAliases || []),
+      pendingUser.message?.turnId,
+    ].filter(Boolean).map(String));
+    const observedAliases = messageTurnIdentity(rawMessage).turnAliases;
+    if (pendingAliases.size && observedAliases.length) {
+      return observedAliases.some((alias) => pendingAliases.has(alias));
+    }
+
+    const text = rawMessage.content?.parts
+      ?.filter((part) => typeof part === 'string')
+      .join('\n') || '';
+    return text.trim() === pendingUser.text.trim();
+  }
+
   function reconcilePending(id, rawMessage) {
     if (
       !pendingUser ||
       pendingUser.conversationId !== id ||
-      rawMessage?.author?.role !== 'user'
+      !pendingUserMatch(rawMessage)
     ) {
       return;
     }
-    const text = rawMessage?.content?.parts?.filter((part) => typeof part === 'string').join('\n') || '';
-    if (text.trim() === pendingUser.text.trim()) {
-      bindPendingTurnToUser(id, rawMessage.id);
-      pendingUser = null;
-    }
+    bindPendingTurnToUser(id, rawMessage.id);
+    pendingUser = null;
   }
 
   function reconcilePendingAgainstPayload(id, payload) {
     if (!pendingUser || pendingUser.conversationId !== id || !payload?.mapping) return;
-    for (const node of Object.values(payload.mapping)) {
-      if (node?.message?.author?.role !== 'user') continue;
-      const text = (node.message.content?.parts || []).filter((part) => typeof part === 'string').join('\n');
-      if (text.trim() === pendingUser.text.trim()) {
+
+    const mapping = payload.mapping;
+    const expectedIds = new Set([
+      pendingUser.userMessageId,
+      pendingUser.message?.turnUserMessageId,
+    ].filter(Boolean).map(String));
+    if (expectedIds.size) {
+      for (const node of Object.values(mapping)) {
+        const messageId = String(node?.message?.id || node?.id || '').trim();
+        if (!expectedIds.has(messageId) || node?.message?.author?.role !== 'user') continue;
+        bindPendingTurnToUser(id, messageId);
+        pendingUser = null;
+        return;
+      }
+      return;
+    }
+
+    let nodeId = payload.current_node;
+    const visited = new Set();
+    while (nodeId && !visited.has(nodeId)) {
+      visited.add(nodeId);
+      const node = mapping[nodeId];
+      if (!node) return;
+      if (pendingUserMatch(node.message)) {
         bindPendingTurnToUser(id, node.message.id || node.id);
         pendingUser = null;
         return;
       }
+      nodeId = node.parent;
     }
   }
 
@@ -974,16 +1093,19 @@ import {
   }
 
   function schedulePersist() {
-    clearTimeout(saveTimer);
-    saveTimer = setTimeout(() => void flushPersist(), 500);
-    if (!persistMaxTimer) persistMaxTimer = setTimeout(() => void flushPersist(), 3_000);
+    if (persistInFlight) {
+      persistQueued = true;
+      return;
+    }
+    if (saveTimer) return;
+    // Throttle rather than debounce. Continuous token streams must publish
+    // bounded progress to sibling windows instead of waiting for final silence.
+    saveTimer = setTimeout(() => void flushPersist(), 750);
   }
 
   async function flushPersist() {
     clearTimeout(saveTimer);
-    clearTimeout(persistMaxTimer);
     saveTimer = null;
-    persistMaxTimer = null;
     if (persistInFlight) {
       persistQueued = true;
       return;

@@ -1,7 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { compactObservationLedger, extensionStorageArea, subscribeStorageChanges } from '../src/lib/storage.js';
+import {
+  compactObservationLedger,
+  extensionStorageArea,
+  loadConversationIndex,
+  loadObservationLedger,
+  loadUserSettings,
+  subscribeStorageChanges,
+} from '../src/lib/storage.js';
 import {
   buildConversationRecordTurns,
   buildConversationRecordView,
@@ -39,6 +46,12 @@ test('observation ledger preserves normalized reasoning/tool data but strips cre
             name: 'web.run',
             payload: { function: { name: 'search', arguments: '{"query":"SlimGPT"}' } },
           },
+          metadata: {
+            search_model_queries: {
+              type: 'search_model_queries',
+              queries: ['SlimGPT'],
+            },
+          },
           _rawMessage: {
             id: 'tool-1',
             author: { role: 'assistant' },
@@ -56,6 +69,7 @@ test('observation ledger preserves normalized reasoning/tool data but strips cre
   const serialized = JSON.stringify(ledger);
   assert.ok(serialized.includes('first half and second half'));
   assert.ok(serialized.includes('SlimGPT'));
+  assert.ok(serialized.includes('search_model_queries'));
   assert.equal(serialized.includes('MUST_NOT_PERSIST'), false);
   assert.equal(serialized.includes('access_token'), false);
   assert.equal(serialized.includes('resume_token'), false);
@@ -141,6 +155,129 @@ test('extension storage changes are delivered event-first and unsubscribe cleanl
 
   unsubscribe();
   assert.equal(listeners.size, 0);
+});
+
+test('extension storage loads migrate the prior iframe-local cache once', async () => {
+  const previous = new Map(['location', 'chrome', 'browser', 'localStorage'].map((key) => [
+    key,
+    Object.getOwnPropertyDescriptor(globalThis, key),
+  ]));
+  const stored = {};
+  const legacy = new Map([
+    ['slimgpt:conversation-index:v1', JSON.stringify([{ id: 'legacy-conversation', title: 'Legacy' }])],
+    ['slimgpt:observation-ledger:v1', JSON.stringify([{
+      id: 'legacy-conversation',
+      observations: [{ id: 'legacy-message', role: 'assistant', text: 'legacy answer' }],
+    }])],
+    ['slimgpt:user-settings:v1', JSON.stringify({ thinkingLevel: 'high' })],
+  ]);
+  try {
+    Object.defineProperty(globalThis, 'location', {
+      configurable: true,
+      value: { protocol: 'chrome-extension:' },
+    });
+    Object.defineProperty(globalThis, 'chrome', {
+      configurable: true,
+      value: {
+        storage: {
+          local: {
+            async get(key) {
+              return { [key]: stored[key] };
+            },
+            async set(values) {
+              Object.assign(stored, values);
+            },
+          },
+        },
+      },
+    });
+    Object.defineProperty(globalThis, 'browser', { configurable: true, value: undefined });
+    Object.defineProperty(globalThis, 'localStorage', {
+      configurable: true,
+      value: { getItem: (key) => legacy.get(key) || null },
+    });
+
+    assert.deepEqual(await loadConversationIndex(), [{ id: 'legacy-conversation', title: 'Legacy' }]);
+    assert.equal((await loadObservationLedger())[0].observations[0].text, 'legacy answer');
+    assert.equal((await loadUserSettings()).thinkingLevel, 'high');
+    assert.equal(stored.conversationIndex[0].id, 'legacy-conversation');
+    assert.equal(stored.observationLedger[0].observations[0].id, 'legacy-message');
+    assert.equal(stored.userSettings.thinkingLevel, 'high');
+  } finally {
+    for (const [key, descriptor] of previous) {
+      if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+      else delete globalThis[key];
+    }
+  }
+});
+
+test('embedded extension frames receive cross-tab storage changes through the isolated bridge', () => {
+  const listeners = new Set();
+  const parent = { postMessage() {} };
+  const windowApi = {
+    parent,
+    addEventListener(type, listener) {
+      if (type === 'message') listeners.add(listener);
+    },
+    removeEventListener(type, listener) {
+      if (type === 'message') listeners.delete(listener);
+    },
+  };
+  const received = [];
+  const unsubscribe = subscribeStorageChanges(
+    (update) => received.push(update),
+    'chrome-extension:',
+    {},
+    {},
+    windowApi,
+  );
+
+  assert.equal(listeners.size, 1);
+  [...listeners][0]({
+    source: parent,
+    origin: 'https://chatgpt.com',
+    data: {
+      channel: 'slimgpt-ui-v1',
+      direction: 'bridge-to-ui',
+      payload: {
+        type: 'storage-change',
+        values: {
+          conversationIndex: [{ id: 'shared-conversation' }],
+          observationLedger: [{
+            id: 'shared-conversation',
+            observations: [{ id: 'shared-message', text: 'cross-window update' }],
+          }],
+          executionPulse: {
+            source: 'peer-window',
+            nonce: 'pulse-1',
+            payload: {
+              type: 'page-execution-state',
+              conversationId: 'shared-conversation',
+              state: 'running',
+            },
+          },
+        },
+      },
+    },
+  });
+  assert.deepEqual(received, [{
+    conversationIndex: [{ id: 'shared-conversation' }],
+    observationLedger: [{
+      id: 'shared-conversation',
+      observations: [{ id: 'shared-message', text: 'cross-window update' }],
+    }],
+    executionPulse: {
+      source: 'peer-window',
+      nonce: 'pulse-1',
+      payload: {
+        type: 'page-execution-state',
+        conversationId: 'shared-conversation',
+        state: 'running',
+      },
+    },
+  }]);
+
+  unsubscribe();
 });
 
 test('persisted observation ledger round-trips full reasoning/tools across a short canonical reload', () => {

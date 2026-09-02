@@ -106,6 +106,167 @@ export function consumeSse(buffer, chunk, flush = false) {
   return { rest: source, frames };
 }
 
+const CONVERSATION_DELTA_FIELDS = [
+  ["channel", "c"],
+  ["path", "p"],
+  ["op", "o"],
+  ["value", "v"],
+];
+
+export function createConversationSseDecoder() {
+  let encoding = null;
+  let previousDelta = initialConversationDelta();
+  const previousValueByChannel = [];
+
+  return {
+    decode(frame) {
+      if (!frame || frame.data === "[DONE]") return null;
+      if (frame.event === "delta_encoding") {
+        const declared = parseSseScalar(frame.data);
+        if (declared !== "v1") throw new Error(`Unsupported conversation delta encoding: ${String(declared)}`);
+        encoding = declared;
+        previousDelta = initialConversationDelta();
+        previousValueByChannel.length = 0;
+        return null;
+      }
+      if (frame.event !== "delta") return frame.json ?? null;
+      if (encoding !== "v1") throw new Error("Conversation delta received before delta_encoding");
+      const rawDelta = frame.json ?? parseSseScalar(frame.data);
+      const delta = decodeCompactConversationDelta(rawDelta, previousDelta);
+      previousDelta = delta;
+      const value = applyConversationDelta(previousValueByChannel[delta.channel], delta);
+      previousValueByChannel[delta.channel] = value;
+      return value;
+    },
+  };
+}
+
+function initialConversationDelta() {
+  return { channel: 0, op: "add", path: "", value: undefined };
+}
+
+function parseSseScalar(value) {
+  try {
+    return JSON.parse(String(value || ""));
+  } catch {
+    return value;
+  }
+}
+
+function decodeCompactConversationDelta(rawDelta, previousDelta) {
+  if (!rawDelta || typeof rawDelta !== "object" || Array.isArray(rawDelta)) {
+    throw new Error("Unexpected conversation delta payload");
+  }
+  const compact = { ...rawDelta };
+  for (const [field, short] of CONVERSATION_DELTA_FIELDS) {
+    if (field !== "value" && !(short in rawDelta)) compact[short] = previousDelta[field];
+  }
+  const delta = expandConversationDelta(compact);
+  if (!Number.isInteger(delta.channel) || delta.channel < 0) {
+    throw new Error("Invalid conversation delta channel");
+  }
+  if (typeof delta.path !== "string") throw new Error("Invalid conversation delta path");
+  if (!["add", "remove", "replace", "append", "truncate", "patch"].includes(delta.op)) {
+    throw new Error("Unknown conversation delta operation");
+  }
+  return delta;
+}
+
+function expandConversationDelta(compact) {
+  const delta = { ...compact };
+  for (const [field, short] of CONVERSATION_DELTA_FIELDS) {
+    if (!(short in compact)) continue;
+    delta[field] = compact[short];
+    delete delta[short];
+  }
+  if (delta.op === "patch") {
+    if (!Array.isArray(delta.value)) throw new Error("Invalid conversation patch payload");
+    delta.value = delta.value.map(expandConversationDelta);
+  }
+  return delta;
+}
+
+function applyConversationDelta(previousValue, delta) {
+  const root = Symbol("conversation-delta-root");
+  const path = [root, ...parseConversationDeltaPath(delta.path)];
+  const result = { [root]: previousValue };
+  let source = result;
+  let target = result;
+
+  for (let index = 0; index < path.length - 1; index += 1) {
+    const key = path[index];
+    const nextKey = path[index + 1];
+    const sourceChild = source && typeof source === "object" ? source[key] : undefined;
+    const targetChild = cloneConversationDeltaContainer(sourceChild, nextKey);
+    target[key] = targetChild;
+    source = sourceChild;
+    target = targetChild;
+  }
+
+  applyConversationDeltaOperation(target, path[path.length - 1], delta);
+  return result[root];
+}
+
+function parseConversationDeltaPath(value) {
+  if (!value) return [];
+  const source = value[0] === "/" ? value.slice(1) : value;
+  return source.split("/").map((part) => {
+    const decoded = part.replace(/~1/g, "/").replace(/~0/g, "~");
+    if (["__proto__", "prototype", "constructor"].includes(decoded)) {
+      throw new Error("Unsafe conversation delta path");
+    }
+    return /^(?:0|[1-9]\d*)$/.test(decoded) ? Number.parseInt(decoded, 10) : decoded;
+  });
+}
+
+function cloneConversationDeltaContainer(value, nextKey) {
+  if (Array.isArray(value)) return value.slice();
+  if (value && typeof value === "object") return { ...value };
+  return typeof nextKey === "number" ? [] : {};
+}
+
+function applyConversationDeltaOperation(target, key, delta) {
+  switch (delta.op) {
+    case "patch": {
+      let value = target[key];
+      for (const patch of delta.value) value = applyConversationDelta(value, patch);
+      target[key] = value;
+      break;
+    }
+    case "add":
+      if (Array.isArray(target)) target.splice(key, 0, delta.value);
+      else target[key] = delta.value;
+      break;
+    case "remove":
+      if (Array.isArray(target)) target.splice(key, 1);
+      else delete target[key];
+      break;
+    case "replace":
+      target[key] = delta.value;
+      break;
+    case "append": {
+      const previous = target[key];
+      if (typeof previous === "string") target[key] = previous + delta.value;
+      else if (Array.isArray(previous)) {
+        target[key] = previous.concat(Array.isArray(delta.value) ? delta.value : [delta.value]);
+      } else if (
+        previous && delta.value &&
+        typeof previous === "object" && typeof delta.value === "object" &&
+        !Array.isArray(previous) && !Array.isArray(delta.value)
+      ) {
+        target[key] = { ...previous, ...delta.value };
+      } else {
+        target[key] = delta.value;
+      }
+      break;
+    }
+    case "truncate":
+      if (typeof target[key] === "string") target[key] = target[key].substring(0, delta.value);
+      else if (Array.isArray(target[key])) target[key] = target[key].slice(0, delta.value);
+      break;
+  }
+}
+
 function parseSseBlock(block) {
   const data = [];
   let event = "message";
@@ -856,13 +1017,6 @@ function dedupeMessageEvents(events) {
   return merged;
 }
 
-function messageEventIdentitiesCompatible(left, right) {
-  const leftIdentity = normalizedObservationIdentity(left.message, left);
-  const rightIdentity = normalizedObservationIdentity(right.message, right);
-  return observationSubjectsMatch(leftIdentity, rightIdentity) &&
-    observationIdentitiesCompatible(leftIdentity, rightIdentity);
-}
-
 function looksLikeMessage(value) {
   return Boolean(value && typeof value === "object" && value.id && (value.author || value.content));
 }
@@ -1507,7 +1661,7 @@ export function getToolMessageInfo(message) {
     contentType === "execution_output" ||
     contentType === "tether_browsing_display" ||
     contentType === "tether_quote" ||
-    realAuthor.startsWith("tool:")
+    (role !== "assistant" && realAuthor.startsWith("tool:"))
   ) {
     kind = "tool-result";
   } else if (
@@ -1550,9 +1704,13 @@ function extractToolPayload(message, toolCalls) {
   const content = message.content;
   const metadata = message.metadata || {};
 
+  if (metadata.search_model_queries && typeof metadata.search_model_queries === "object") {
+    return metadata.search_model_queries;
+  }
+
   if (Array.isArray(metadata.search_result_groups) && metadata.search_result_groups.length) {
     return {
-      queries: metadata.search_queries || undefined,
+      queries: metadata.search_model_queries?.queries || metadata.search_queries || undefined,
       results: metadata.search_result_groups,
     };
   }
@@ -2553,7 +2711,7 @@ function isVisibleConversationUser(message) {
 
 function isInternalConversationContext(message) {
   const contentType = String(message?.contentType || message?.metadata?.content_type || "").toLowerCase();
-  if (message?.role === "system") return true;
+  if (message?.role === "system" || message?.role === "developer") return true;
   return contentType === "user_editable_context" ||
     contentType === "model_editable_context" ||
     Boolean(message?.metadata?.is_visually_hidden_from_conversation);
@@ -2899,10 +3057,14 @@ export function estimateMessageHeight(message) {
 export function fingerprintCapture(capture, text) {
   const body = String(text || "");
   return [
+    capture?.requestId || "",
     capture?.url || "",
     capture?.transport || "",
     capture?.conversationId || "",
     capture?.conversationIdConflict ? "conflict" : "",
+    capture?.canonicalSyncId || "",
+    capture?.canonicalPageIndex ?? "",
+    capture?.canonicalComplete ? "complete" : "",
     body.length,
     body.slice(0, 96),
     body.slice(-96),

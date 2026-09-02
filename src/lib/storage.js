@@ -2,11 +2,20 @@ const INDEX_KEY = 'slimgpt:conversation-index:v1';
 const SETTINGS_KEY = 'slimgpt:user-settings:v1';
 const MODELS_CACHE_KEY = 'slimgpt:models-cache:v1';
 const OBSERVATION_LEDGER_KEY = 'slimgpt:observation-ledger:v1';
+const STORAGE_BRIDGE_CHANNEL = 'slimgpt-ui-v1';
+const STORAGE_BRIDGE_HOST_ORIGIN = 'https://chatgpt.com';
+const STORAGE_BRIDGE_TIMEOUT = 10_000;
 const MAX_LEDGER_CONVERSATIONS = 24;
 const MAX_LEDGER_BYTES = 4 * 1024 * 1024;
 const MAX_LEDGER_STRING = 512 * 1024;
 const MAX_LEDGER_ARRAY = 256;
 const MAX_LEDGER_OBJECT_KEYS = 160;
+
+let storageBridgeRequestCounter = 0;
+let storageBridgeWindow = null;
+let storageBridgeMessageHandler = null;
+const storageBridgeRequests = new Map();
+const storageBridgeListeners = new Set();
 
 const PERSISTED_METADATA_KEYS = new Set([
   'model_slug',
@@ -39,6 +48,7 @@ const PERSISTED_METADATA_KEYS = new Set([
   'tool_calls',
   'search_result_groups',
   'search_queries',
+  'search_model_queries',
   'inline_cot_expandable_content',
   'aggregate_result',
   'attachments',
@@ -109,21 +119,22 @@ export const DEFAULT_SETTINGS = {
 };
 
 export async function loadConversationIndex() {
-  const storage = extensionStorageArea();
+  const storage = storageArea();
   if (storage) {
     const value = await storage.get('conversationIndex');
-    return Array.isArray(value.conversationIndex) ? value.conversationIndex : [];
+    if (Array.isArray(value.conversationIndex)) return value.conversationIndex;
+    const legacy = readLegacyJson(INDEX_KEY, []);
+    const items = Array.isArray(legacy) ? legacy : [];
+    if (items.length) await storage.set({ conversationIndex: items });
+    return items;
   }
-  try {
-    return JSON.parse(localStorage.getItem(INDEX_KEY) || '[]');
-  } catch {
-    return [];
-  }
+  const stored = readLegacyJson(INDEX_KEY, []);
+  return Array.isArray(stored) ? stored : [];
 }
 
 export async function saveConversationIndex(items) {
   const limited = items.slice(0, 500);
-  const storage = extensionStorageArea();
+  const storage = storageArea();
   if (storage) {
     await storage.set({ conversationIndex: limited });
     return;
@@ -134,12 +145,16 @@ export async function saveConversationIndex(items) {
 export async function loadObservationLedger() {
   let stored = [];
   try {
-    const storage = extensionStorageArea();
+    const storage = storageArea();
     if (storage) {
       const value = await storage.get('observationLedger');
-      stored = value.observationLedger;
+      if (Array.isArray(value.observationLedger)) stored = value.observationLedger;
+      else {
+        stored = readLegacyJson(OBSERVATION_LEDGER_KEY, []);
+        if (stored.length) await storage.set({ observationLedger: compactObservationLedger(stored) });
+      }
     } else {
-      stored = JSON.parse(localStorage.getItem(OBSERVATION_LEDGER_KEY) || '[]');
+      stored = readLegacyJson(OBSERVATION_LEDGER_KEY, []);
     }
   } catch {
     return [];
@@ -149,7 +164,7 @@ export async function loadObservationLedger() {
 
 export async function saveObservationLedger(records) {
   const compact = compactObservationLedger(records);
-  const storage = extensionStorageArea();
+  const storage = storageArea();
   if (storage) {
     await storage.set({ observationLedger: compact });
     return compact;
@@ -300,22 +315,27 @@ function compactValue(value, depth = 0) {
 }
 
 export async function loadUserSettings() {
-  const storage = extensionStorageArea();
+  const storage = storageArea();
   if (storage) {
     const value = await storage.get('userSettings');
-    return { ...DEFAULT_SETTINGS, ...(value.userSettings || {}) };
+    if (value.userSettings && typeof value.userSettings === 'object') {
+      return { ...DEFAULT_SETTINGS, ...value.userSettings };
+    }
+    const stored = readLegacyJson(SETTINGS_KEY, {});
+    const legacy = stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {};
+    if (Object.keys(legacy).length) await storage.set({ userSettings: legacy });
+    return { ...DEFAULT_SETTINGS, ...legacy };
   }
-  try {
-    const stored = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
-    return { ...DEFAULT_SETTINGS, ...stored };
-  } catch {
-    return { ...DEFAULT_SETTINGS };
-  }
+  const stored = readLegacyJson(SETTINGS_KEY, {});
+  return {
+    ...DEFAULT_SETTINGS,
+    ...(stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {}),
+  };
 }
 
 export async function saveUserSettings(settings) {
   const safe = { ...DEFAULT_SETTINGS, ...settings };
-  const storage = extensionStorageArea();
+  const storage = storageArea();
   if (storage) {
     await storage.set({ userSettings: safe });
     return safe;
@@ -325,27 +345,36 @@ export async function saveUserSettings(settings) {
 }
 
 export async function loadCachedModels() {
-  const storage = extensionStorageArea();
+  const storage = storageArea();
   if (storage) {
     const value = await storage.get('cachedModels');
-    return Array.isArray(value.cachedModels) && value.cachedModels.length ? value.cachedModels : DEFAULT_MODELS;
+    if (Array.isArray(value.cachedModels) && value.cachedModels.length) return value.cachedModels;
+    const legacy = readLegacyJson(MODELS_CACHE_KEY, []);
+    const models = Array.isArray(legacy) ? legacy : [];
+    if (models.length) await storage.set({ cachedModels: models });
+    return models.length ? models : DEFAULT_MODELS;
   }
-  try {
-    const stored = JSON.parse(localStorage.getItem(MODELS_CACHE_KEY) || '[]');
-    return Array.isArray(stored) && stored.length ? stored : DEFAULT_MODELS;
-  } catch {
-    return DEFAULT_MODELS;
-  }
+  const stored = readLegacyJson(MODELS_CACHE_KEY, []);
+  return Array.isArray(stored) && stored.length ? stored : DEFAULT_MODELS;
 }
 
 export async function saveCachedModels(models) {
   if (!Array.isArray(models) || !models.length) return;
-  const storage = extensionStorageArea();
+  const storage = storageArea();
   if (storage) {
     await storage.set({ cachedModels: models });
     return;
   }
   localStorage.setItem(MODELS_CACHE_KEY, JSON.stringify(models));
+}
+
+function readLegacyJson(key, fallback) {
+  try {
+    const value = globalThis.localStorage?.getItem(key);
+    return value ? JSON.parse(value) : fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 export function extensionStorageArea(
@@ -355,6 +384,93 @@ export function extensionStorageArea(
 ) {
   if (!/^(?:chrome|moz)-extension:$/.test(protocol)) return null;
   return chromeApi?.storage?.local || browserApi?.storage?.local || null;
+}
+
+function storageArea(
+  protocol = globalThis.location?.protocol || '',
+  chromeApi = globalThis.chrome,
+  browserApi = globalThis.browser,
+  windowApi = globalThis.window,
+) {
+  return extensionStorageArea(protocol, chromeApi, browserApi) ||
+    extensionStorageBridgeArea(protocol, windowApi);
+}
+
+function extensionStorageBridgeArea(protocol, windowApi) {
+  if (
+    !/^(?:chrome|moz)-extension:$/.test(protocol) ||
+    !windowApi?.addEventListener ||
+    !windowApi?.parent?.postMessage ||
+    windowApi.parent === windowApi
+  ) {
+    return null;
+  }
+  ensureStorageBridgeListener(windowApi);
+  return {
+    async get(keys) {
+      return requestStorageBridge('storage-get', {
+        keys: Array.isArray(keys) ? keys : [keys],
+      });
+    },
+    async set(values) {
+      await requestStorageBridge('storage-set', { values });
+    },
+  };
+}
+
+function ensureStorageBridgeListener(windowApi) {
+  if (storageBridgeWindow === windowApi && storageBridgeMessageHandler) return;
+  if (storageBridgeWindow && storageBridgeMessageHandler) {
+    storageBridgeWindow.removeEventListener?.('message', storageBridgeMessageHandler);
+  }
+  for (const request of storageBridgeRequests.values()) {
+    clearTimeout(request.timer);
+    request.reject(new Error('Storage bridge context changed'));
+  }
+  storageBridgeRequests.clear();
+  storageBridgeWindow = windowApi;
+  storageBridgeMessageHandler = (event) => {
+    if (
+      event.source !== windowApi.parent ||
+      event.origin !== STORAGE_BRIDGE_HOST_ORIGIN ||
+      event.data?.channel !== STORAGE_BRIDGE_CHANNEL ||
+      event.data?.direction !== 'bridge-to-ui'
+    ) {
+      return;
+    }
+    const payload = event.data.payload;
+    if (payload?.type === 'storage-result') {
+      const request = storageBridgeRequests.get(payload.requestId);
+      if (!request) return;
+      storageBridgeRequests.delete(payload.requestId);
+      clearTimeout(request.timer);
+      if (payload.ok) request.resolve(payload.values || {});
+      else request.reject(new Error(payload.error || 'Storage bridge request failed'));
+      return;
+    }
+    if (payload?.type === 'storage-change' && payload.values && typeof payload.values === 'object') {
+      for (const listener of storageBridgeListeners) listener(payload.values);
+    }
+  };
+  windowApi.addEventListener('message', storageBridgeMessageHandler);
+}
+
+function requestStorageBridge(type, payload) {
+  const windowApi = storageBridgeWindow;
+  if (!windowApi) return Promise.reject(new Error('Storage bridge is unavailable'));
+  const requestId = `storage-${Date.now().toString(36)}-${(++storageBridgeRequestCounter).toString(36)}`;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      storageBridgeRequests.delete(requestId);
+      reject(new Error('Storage bridge request timed out'));
+    }, STORAGE_BRIDGE_TIMEOUT);
+    storageBridgeRequests.set(requestId, { resolve, reject, timer });
+    windowApi.parent.postMessage({
+      channel: STORAGE_BRIDGE_CHANNEL,
+      direction: 'ui-to-bridge',
+      payload: { type, requestId, ...payload },
+    }, STORAGE_BRIDGE_HOST_ORIGIN);
+  });
 }
 
 export function subscribeStorageChanges(
@@ -368,17 +484,24 @@ export function subscribeStorageChanges(
 
   if (/^(?:chrome|moz)-extension:$/.test(protocol)) {
     const changed = chromeApi?.storage?.onChanged || browserApi?.storage?.onChanged;
-    if (!changed?.addListener) return () => {};
-    const onChanged = (changes, areaName) => {
-      if (areaName && areaName !== 'local') return;
-      const update = {};
-      if (changes?.conversationIndex) update.conversationIndex = changes.conversationIndex.newValue;
-      if (changes?.observationLedger) update.observationLedger = changes.observationLedger.newValue;
-      if (changes?.userSettings) update.userSettings = changes.userSettings.newValue;
-      if (Object.keys(update).length) listener(update);
-    };
-    changed.addListener(onChanged);
-    return () => changed.removeListener?.(onChanged);
+    if (changed?.addListener) {
+      const onChanged = (changes, areaName) => {
+        if (areaName && areaName !== 'local') return;
+        const update = {};
+        if (changes?.conversationIndex) update.conversationIndex = changes.conversationIndex.newValue;
+        if (changes?.observationLedger) update.observationLedger = changes.observationLedger.newValue;
+        if (changes?.userSettings) update.userSettings = changes.userSettings.newValue;
+        if (changes?.executionPulse) update.executionPulse = changes.executionPulse.newValue;
+        if (Object.keys(update).length) listener(update);
+      };
+      changed.addListener(onChanged);
+      return () => changed.removeListener?.(onChanged);
+    }
+
+    const bridge = extensionStorageBridgeArea(protocol, windowApi);
+    if (!bridge) return () => {};
+    storageBridgeListeners.add(listener);
+    return () => storageBridgeListeners.delete(listener);
   }
 
   if (!windowApi?.addEventListener) return () => {};

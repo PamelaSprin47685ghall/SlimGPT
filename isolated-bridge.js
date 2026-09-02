@@ -7,6 +7,16 @@
   const FRAME_ID = 'slimgpt-takeover-frame';
   const MAX_PENDING_UI_EVENTS = 512;
   const MAX_PENDING_UI_BYTES = 32 * 1024 * 1024;
+  const STORAGE_KEYS = new Set([
+    'conversationIndex',
+    'observationLedger',
+    'userSettings',
+    'cachedModels',
+    'executionPulse',
+  ]);
+  const EXTENSION_ORIGIN = new URL(chrome.runtime.getURL('/')).origin;
+  const EXECUTION_PULSE_SOURCE = crypto.randomUUID?.() ||
+    `bridge-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 
   let frame = null;
   let pageHookReady = false;
@@ -17,21 +27,108 @@
 
   installTakeoverFrame();
   installPageHookFallback();
+  installStorageChangeForwarder();
 
   window.addEventListener('message', (event) => {
     const message = event.data;
     if (!message || typeof message !== 'object') return;
 
     if (
+      event.source === frame?.contentWindow &&
+      event.origin === EXTENSION_ORIGIN &&
+      message.channel === UI_CHANNEL &&
+      message.direction === 'ui-to-bridge' &&
+      (message.payload?.type === 'storage-get' || message.payload?.type === 'storage-set')
+    ) {
+      void handleStorageCommand(message.payload);
+      return;
+    }
+
+    if (
+      event.source === window &&
       event.origin === location.origin &&
       message.channel === PAGE_CHANNEL &&
       message.direction === 'page-to-extension'
     ) {
       if (message.payload?.type === 'page-hook-ready') pageHookReady = true;
       forwardPagePayload(message.payload);
+      if (message.payload?.type === 'page-execution-state') {
+        void publishExecutionPulse(message.payload);
+      }
       return;
     }
   });
+
+  async function publishExecutionPulse(payload) {
+    const conversationId = typeof payload?.conversationId === 'string'
+      ? payload.conversationId.trim()
+      : '';
+    if (!conversationId || /^WEB:/i.test(conversationId) || !chrome.storage?.local) return;
+    try {
+      await chrome.storage.local.set({
+        executionPulse: {
+          source: EXECUTION_PULSE_SOURCE,
+          nonce: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+          payload: {
+            type: 'page-execution-state',
+            conversationId,
+            state: payload.state === 'running' ? 'running' : 'stopped',
+            source: String(payload.source || 'cross-window'),
+            observedAt: Number(payload.observedAt) || Date.now(),
+          },
+        },
+      });
+    } catch {
+      // Cross-window status is advisory; local execution state remains valid.
+    }
+  }
+
+  function installStorageChangeForwarder() {
+    const onChanged = (changes, areaName) => {
+      if (areaName && areaName !== 'local') return;
+      const values = {};
+      for (const [key, change] of Object.entries(changes || {})) {
+        if (!STORAGE_KEYS.has(key)) continue;
+        values[key] = change?.newValue;
+      }
+      if (Object.keys(values).length) {
+        forwardToUi({ type: 'storage-change', values });
+      }
+    };
+    chrome.storage?.onChanged?.addListener(onChanged);
+    addEventListener('pagehide', () => {
+      chrome.storage?.onChanged?.removeListener?.(onChanged);
+    }, { once: true });
+  }
+
+  async function handleStorageCommand(payload) {
+    const requestId = typeof payload?.requestId === 'string' ? payload.requestId : null;
+    if (!requestId || !chrome.storage?.local) return;
+    try {
+      if (payload.type === 'storage-get') {
+        const keys = Array.isArray(payload.keys)
+          ? payload.keys.filter((key) => STORAGE_KEYS.has(key))
+          : [];
+        const values = await chrome.storage.local.get(keys);
+        postToUi({ type: 'storage-result', requestId, ok: true, values });
+        return;
+      }
+
+      const values = {};
+      for (const [key, value] of Object.entries(payload.values || {})) {
+        if (STORAGE_KEYS.has(key)) values[key] = value;
+      }
+      await chrome.storage.local.set(values);
+      postToUi({ type: 'storage-result', requestId, ok: true, values: {} });
+    } catch (error) {
+      postToUi({
+        type: 'storage-result',
+        requestId,
+        ok: false,
+        error: String(error?.message || error),
+      });
+    }
+  }
 
   function installTakeoverFrame() {
     const mount = () => {
