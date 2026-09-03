@@ -37,8 +37,6 @@
   const CONVERSATION_INDEX_PAGE_SIZE = 100;
   const CANONICAL_PAGE_TURNS = 10;
   const MAX_SYNCED_CONVERSATIONS = 500;
-  const CONVERSATION_INDEX_REFRESH_MS = 30_000;
-  const CONVERSATION_INDEX_RETRY_MS = 5_000;
   let requestCounter = 0;
   let resleepTimer = null;
   let sendInFlight = false;
@@ -55,8 +53,8 @@
   let backendHeaders = null;
   let backendSessionHeaders = null;
   let conversationIndexSync = null;
-  let lastConversationIndexSyncAt = 0;
-  let lastConversationIndexSyncAttemptAt = 0;
+  let conversationIndexSyncRequested = false;
+  let conversationIndexBootstrapped = false;
   let turnSessionCounter = 0;
   let pendingNewTurnSession = null;
   let suppressLocationEmission = false;
@@ -65,7 +63,7 @@
   let resumeSession = null;
   let conversationSocketGeneration = 0;
   let conversationSocketState = null;
-  let observedLocationHref = location.href;
+  let observedLocationHref = null;
   let preserveDomConversationOwnership = () => {};
   let executionObserver = null;
   let executionScanTimer = null;
@@ -650,17 +648,20 @@
   }
 
   function snapshotConversationScope(request) {
-    const urlConversationId = conversationIdFromUrl(request?.url);
+    const endpointConversationId = conversationIdFromUrl(request?.url);
+    const pageConversationId = isConversationSubmission(request) || isResumeRequest(request)
+      ? conversationIdFromUrl(location.href)
+      : null;
     const bodyConversationId = isConversationSubmission(request) || isResumeRequest(request)
       ? readRequestConversationId(request)
       : Promise.resolve(null);
     return bodyConversationId.then((bodyId) => {
       const stableBodyId = isProvisionalConversationId(bodyId) ? null : bodyId;
-      if (stableBodyId && urlConversationId && stableBodyId !== urlConversationId) {
+      if (stableBodyId && endpointConversationId && stableBodyId !== endpointConversationId) {
         return { conversationId: null, conflicted: true };
       }
       return {
-        conversationId: stableBodyId || urlConversationId,
+        conversationId: stableBodyId || endpointConversationId || pageConversationId,
         ...(isProvisionalConversationId(bodyId) ? { provisionalConversationId: bodyId } : {}),
         conflicted: false,
       };
@@ -695,12 +696,18 @@
       parentMessageId: null,
       startedAt: Date.now(),
     };
+    if (!session.transportTurnId) session.transportTurnId = session.sessionId;
+    registerTurnSession(session);
     const [scope, identity] = await Promise.all([
       conversationScope?.catch(() => ({ conversationId: null, conflicted: false })) ||
         Promise.resolve({ conversationId: null, conflicted: false }),
       readRequestTurnIdentity(request),
     ]);
-    if (!scope?.conflicted && scope?.conversationId) session.conversationId = scope.conversationId;
+    if (!scope?.conflicted && scope?.conversationId) {
+      session.conversationId = scope.conversationId;
+      if (pendingNewTurnSession?.sessionId === session.sessionId) pendingNewTurnSession = null;
+      registerTurnSession(session);
+    }
     if (identity?.userMessageId) session.userMessageId = identity.userMessageId;
     if (identity?.parentMessageId) session.parentMessageId = identity.parentMessageId;
     if (identity?.turnId) session.turnId = identity.turnId;
@@ -709,9 +716,7 @@
     if (identity?.workingTurnId) session.workingTurnId = identity.workingTurnId;
     if (identity?.requestId) session.requestId = identity.requestId;
     if (identity?.turnTraceId) session.turnTraceId = identity.turnTraceId;
-    if (!session.transportTurnId) session.transportTurnId = session.sessionId;
-    registerTurnSession(session);
-    return { ...session };
+    return session;
   }
 
   async function snapshotActiveTurn(conversationScope) {
@@ -846,9 +851,11 @@
 
   function bindPendingTurnSession(conversationId) {
     if (!conversationId || !pendingNewTurnSession) return null;
-    const session = { ...pendingNewTurnSession, conversationId };
+    const session = pendingNewTurnSession;
     pendingNewTurnSession = null;
+    session.conversationId = conversationId;
     activeTurnSessions.set(conversationId, session);
+    requestConversationIndexSync();
     const pendingExecution = executionStates.get(NEW_CHAT_EXECUTION_KEY);
     if (pendingExecution) {
       executionStates.delete(NEW_CHAT_EXECUTION_KEY);
@@ -895,12 +902,14 @@
       ? await Promise.resolve(turnScope).catch(() => null)
       : null;
     if (scope.conflicted) return { ...captureMeta, conversationIdConflict: true };
-    const resolved = scope.conversationId
-      ? { ...captureMeta, conversationId: scope.conversationId }
+    const resolvedConversationId = scope.conversationId || turn?.conversationId || null;
+    const resolved = resolvedConversationId
+      ? { ...captureMeta, conversationId: resolvedConversationId }
       : { ...captureMeta };
     if (scope.provisionalConversationId) resolved.provisionalConversationId = scope.provisionalConversationId;
     if (turn?.turnId) resolved.turnId = turn.turnId;
     if (turn?.turnAliases?.length) resolved.turnAliases = turn.turnAliases.slice();
+    if (turn?.sessionId) resolved.transportSessionId = turn.sessionId;
     if (turn?.transportTurnId) resolved.transportTurnId = turn.transportTurnId;
     if (turn?.turnExchangeId) resolved.turnExchangeId = turn.turnExchangeId;
     if (turn?.workingTurnId) resolved.workingTurnId = turn.workingTurnId;
@@ -936,23 +945,33 @@
       backendHeaders = new Headers(request.headers);
     }
     drainCanonicalFetches();
-    if (!lastConversationIndexSyncAt) requestConversationIndexSync();
+    if (!conversationIndexBootstrapped) {
+      conversationIndexBootstrapped = true;
+      requestConversationIndexSync();
+    } else {
+      drainConversationIndexSync();
+    }
   }
 
   function requestConversationIndexSync() {
+    conversationIndexSyncRequested = true;
+    drainConversationIndexSync();
+  }
+
+  function drainConversationIndexSync() {
     const sourceHeaders = backendHeaders || backendSessionHeaders;
-    const now = Date.now();
-    if (!backendFetch || !sourceHeaders || conversationIndexSync) return;
-    if (now - lastConversationIndexSyncAt < CONVERSATION_INDEX_REFRESH_MS) return;
-    if (now - lastConversationIndexSyncAttemptAt < CONVERSATION_INDEX_RETRY_MS) return;
-    lastConversationIndexSyncAttemptAt = now;
+    if (!conversationIndexSyncRequested || conversationIndexSync || !backendFetch || !sourceHeaders) return;
+    conversationIndexSyncRequested = false;
     conversationIndexSync = syncConversationIndex(new Headers(sourceHeaders))
       .then((synced) => {
-        if (synced) lastConversationIndexSyncAt = Date.now();
+        conversationIndexBootstrapped = Boolean(synced);
       })
-      .catch(() => {})
+      .catch(() => {
+        conversationIndexBootstrapped = false;
+      })
       .finally(() => {
         conversationIndexSync = null;
+        if (conversationIndexSyncRequested) drainConversationIndexSync();
       });
   }
 
@@ -962,8 +981,21 @@
     headers.delete("content-type");
     headers.set("accept", "application/json");
 
+    const items = [];
+    const itemIds = new Set();
+    const publish = (complete) => {
+      if (items.length || complete) {
+        emit({
+          type: "page-conversation-index",
+          items,
+          complete,
+          timestamp: Date.now(),
+        });
+      }
+      return complete || items.length > 0;
+    };
+
     let offset = 0;
-    let synced = false;
     const seenPages = new Set();
     while (offset < MAX_SYNCED_CONVERSATIONS) {
       const limit = Math.min(CONVERSATION_INDEX_PAGE_SIZE, MAX_SYNCED_CONVERSATIONS - offset);
@@ -972,46 +1004,52 @@
       url.searchParams.set("limit", String(limit));
       url.searchParams.set("order", "updated");
 
-      const response = await Reflect.apply(observedFetch, window, [
+      const response = await Reflect.apply(backendFetch, backendFetchThis, [
         url.href,
         {
           method: "GET",
           credentials: "include",
           cache: "no-store",
-          headers,
+          headers: new Headers(headers),
         },
       ]);
-      if (!response.ok) return synced;
+      if (!response.ok) return publish(false);
 
       const text = await response.text();
-      if (text.length > MAX_NON_STREAM_BODY) return synced;
-      synced = true;
+      if (text.length > MAX_NON_STREAM_BODY) return publish(false);
 
       let value;
       try {
         value = JSON.parse(text);
       } catch {
-        return synced;
+        return publish(false);
       }
-      const items = Array.isArray(value?.items)
+      const pageItems = Array.isArray(value?.items)
         ? value.items
         : (Array.isArray(value?.data?.items) ? value.data.items : []);
-      if (!items.length) return synced;
+      if (!pageItems.length) return publish(true);
 
-      const firstId = items[0]?.id || '';
-      const lastId = items[items.length - 1]?.id || '';
-      const pageSignature = `${items.length}:${firstId}:${lastId}`;
-      if (seenPages.has(pageSignature)) return synced;
+      const firstId = pageItems[0]?.id || '';
+      const lastId = pageItems[pageItems.length - 1]?.id || '';
+      const pageSignature = `${pageItems.length}:${firstId}:${lastId}`;
+      if (seenPages.has(pageSignature)) return publish(false);
       seenPages.add(pageSignature);
 
-      offset += items.length;
+      for (const item of pageItems) {
+        const id = typeof item?.id === "string" ? item.id : "";
+        if (!id || itemIds.has(id)) continue;
+        itemIds.add(id);
+        items.push(item);
+      }
+
+      offset += pageItems.length;
       const rawTotal = value?.total ?? value?.data?.total;
       const total = rawTotal == null ? Number.NaN : Number(rawTotal);
-      if (Number.isFinite(total) && offset >= total) return synced;
+      if (Number.isFinite(total) && offset >= total) return publish(true);
       const hasMore = value?.has_more ?? value?.hasMore ?? value?.data?.has_more ?? value?.data?.hasMore;
-      if (hasMore === false) return synced;
+      if (hasMore === false) return publish(true);
     }
-    return synced;
+    return publish(false);
   }
 
   function snapshotRequest(request, upstreamFetch, fetchThis, conversationScope, turnScope = null) {
@@ -1712,6 +1750,9 @@
       });
       cancelSignal?.removeEventListener("abort", cancelReader);
       reader.releaseLock();
+      if (sawDone && isExecutionStreamUrl(captureMeta.url)) {
+        requestConversationIndexSync();
+      }
       try {
         onClose?.({
           sawDone,
@@ -1904,25 +1945,26 @@
         if (meta && interesting(meta.url) && !this[XHR_RESPONSE_OBSERVED]) {
           this[XHR_RESPONSE_OBSERVED] = true;
           const url = new URL(meta.url, location.href);
-          const urlConversationId = conversationIdFromUrl(url.href);
-          const bodyCanDeclareConversation = String(meta.method || "").toUpperCase() === "POST" &&
-            (url.pathname === "/backend-api/conversation" ||
-              url.pathname === "/backend-api/f/conversation" ||
-              url.pathname === RESUME_PATH);
-          const bodyConversationId = bodyCanDeclareConversation
+          const method = String(meta.method || "").toUpperCase();
+          const conversationRequest = method === "POST" &&
+            url.origin === location.origin &&
+            (url.pathname === "/backend-api/conversation" || url.pathname === "/backend-api/f/conversation");
+          const resumeRequest = method === "POST" && url.origin === location.origin && url.pathname === RESUME_PATH;
+          const endpointConversationId = conversationIdFromUrl(url.href);
+          const pageConversationId = conversationRequest || resumeRequest
+            ? conversationIdFromUrl(location.href)
+            : null;
+          const bodyConversationId = conversationRequest || resumeRequest
             ? conversationIdFromRequestBody(body)
             : null;
           const conversationScope = Promise.resolve(
-            bodyConversationId && urlConversationId && bodyConversationId !== urlConversationId
+            bodyConversationId && endpointConversationId && bodyConversationId !== endpointConversationId
               ? { conversationId: null, conflicted: true }
               : {
-                  conversationId: bodyConversationId || urlConversationId,
+                  conversationId: bodyConversationId || endpointConversationId || pageConversationId,
                   conflicted: false,
                 },
           );
-          const conversationRequest = String(meta.method || "").toUpperCase() === "POST" &&
-            url.origin === location.origin &&
-            (url.pathname === "/backend-api/conversation" || url.pathname === "/backend-api/f/conversation");
           const turnScope = conversationRequest
             ? snapshotXhrSubmissionTurn(body, conversationScope)
             : (url.pathname === RESUME_PATH ? snapshotActiveTurn(conversationScope) : null);
@@ -1970,7 +2012,7 @@
     if (identity?.turnTraceId) session.turnTraceId = identity.turnTraceId;
     session.transportTurnId = session.sessionId;
     registerTurnSession(session);
-    return { ...session };
+    return session;
   }
 
   function observeXhrResponse(xhr, meta) {
@@ -2440,6 +2482,10 @@
             emit({
               type: 'page-conversation-bound',
               conversationId,
+              transportSessionId: boundSession.sessionId || null,
+              transportTurnId: boundSession.transportTurnId || null,
+              turnUserMessageId: boundSession.userMessageId || null,
+              turnParentMessageId: boundSession.parentMessageId || null,
               turnId: notification.turnAliases?.[0] || boundSession.turnId || null,
               turnAliases: uniqueTurnIdentityStrings([
                 ...(boundSession.turnAliases || []),
@@ -2473,6 +2519,7 @@
         });
         if (conversationId && stateValue === 'stopped') {
           queueCanonicalConversation(conversationId);
+          requestConversationIndexSync();
         }
       }
     });
@@ -2730,19 +2777,21 @@
     return typeof value === "string" && /^WEB:/i.test(value.trim());
   }
 
-  function emitLocation() {
+  function emitLocation(force = false) {
     if (suppressLocationEmission) return;
-    if (location.href !== observedLocationHref) {
+    const href = location.href;
+    const changed = href !== observedLocationHref;
+    if (changed) {
       preserveDomConversationOwnership(conversationIdFromUrl(observedLocationHref));
-      observedLocationHref = location.href;
+      observedLocationHref = href;
       resetResumeSession();
     }
-    const conversationId = conversationIdFromUrl(location.href);
-    if (conversationId) {
+    const conversationId = conversationIdFromUrl(href);
+    if ((changed || force === true) && conversationId) {
       bindPendingTurnSession(conversationId);
       queueCanonicalConversation(conversationId);
     }
-    emit({ type: "page-location", url: location.href });
+    emit({ type: "page-location", url: href });
     scheduleExecutionStateScan(0);
   }
 
@@ -2761,6 +2810,9 @@
     return result;
   };
   addEventListener("popstate", emitLocation);
+  addEventListener("hashchange", emitLocation);
+  addEventListener("pageshow", emitLocation);
+  globalThis.navigation?.addEventListener?.("currententrychange", emitLocation);
   queueMicrotask(emitLocation);
 
   window.addEventListener("message", async (event) => {
@@ -3265,7 +3317,7 @@
     const target = new URL(pathname, location.origin);
     if (target.origin !== location.origin) return;
     if (target.href === location.href) {
-      emitLocation();
+      emitLocation(true);
       return;
     }
     navigateThroughOfficialRouter(target);

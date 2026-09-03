@@ -87,8 +87,12 @@
   const conflictedCaptureIds = new Set();
   const draftsByConversation = new Map();
   const recentFingerprints = new Set();
+  const locallyPromotedConversationIds = new Set();
+  const pendingLiveEvents = new Map();
+  const MAX_PENDING_LIVE_EVENTS = 512;
+  let pendingLiveEventCount = 0;
 
-  const conversations = $derived([...conversationMap.values()].sort((a, b) => (Number(b.update_time) || 0) - (Number(a.update_time) || 0)));
+  const conversations = $derived([...conversationMap.values()]);
   const currentRecord = $derived(currentConversationId ? conversationRecords.get(currentConversationId) || null : null);
   const currentPayload = $derived(currentRecord?.payload || null);
   const currentHasRenderableContent = $derived(Boolean(
@@ -205,6 +209,8 @@
       xhrBuffers.clear();
       captureConversationIds.clear();
       conflictedCaptureIds.clear();
+      locallyPromotedConversationIds.clear();
+      clearPendingLiveEvents();
       layoutQuery.removeEventListener?.('change', syncLayout);
       window.removeEventListener('resize', syncLayout);
       window.visualViewport?.removeEventListener('resize', syncLayout);
@@ -251,19 +257,41 @@
     }
   }
 
-  function mergeConversationIndex(items) {
+  function mergeConversationIndex(items, { promote = true } = {}) {
     if (!Array.isArray(items) || !items.length) return;
-    const next = new Map(conversationMap);
+    const existing = new Map(conversationMap);
+    const incoming = [];
+    const incomingIds = new Set();
     for (const item of items) {
       if (!item?.id) continue;
-      const previous = next.get(String(item.id)) || {};
-      const incoming = normalizeConversationMeta(item, previous);
-      const incomingTime = Number(incoming.update_time) || 0;
-      const previousTime = Number(previous.update_time) || 0;
-      next.set(incoming.id, incomingTime >= previousTime
-        ? normalizeConversationMeta({ ...previous, ...incoming }, previous)
-        : normalizeConversationMeta({ ...incoming, ...previous }, incoming));
+      const id = String(item.id);
+      const previous = existing.get(id) || {};
+      incomingIds.add(id);
+      incoming.push([id, normalizeConversationMeta({ ...previous, ...item }, previous)]);
+      existing.delete(id);
     }
+    if (!incoming.length) return;
+
+    if (!promote) {
+      const next = new Map(conversationMap);
+      for (const [id, item] of incoming) next.set(id, item);
+      conversationMap = next;
+      return;
+    }
+
+    const next = new Map();
+    for (const id of locallyPromotedConversationIds) {
+      if (incomingIds.has(id)) {
+        locallyPromotedConversationIds.delete(id);
+        continue;
+      }
+      const item = existing.get(id);
+      if (!item) continue;
+      next.set(id, item);
+      existing.delete(id);
+    }
+    for (const [id, item] of incoming) next.set(id, item);
+    for (const [id, item] of existing) next.set(id, item);
     conversationMap = next;
   }
 
@@ -319,6 +347,10 @@
     else if (message.type === 'page-conversation-bound') {
       const { conversationId, conflicted } = resolveConversationScope(message.conversationId);
       if (!conflicted && conversationId) bindLifecycleConversation(conversationId, message, { conversationRequest: true });
+    }
+    else if (message.type === 'page-conversation-index') {
+      mergeConversationIndex(message.items, { promote: message.complete === true });
+      schedulePersist();
     }
     else if (message.type === 'page-location') handlePageLocation(message.url);
     else if (message.type === 'page-capture' || message.type === 'canonical-capture') handleCapture(message);
@@ -451,12 +483,9 @@
 
     const items = extractConversationItems(value);
     if (items.length) {
-      const next = new Map(conversationMap);
-      for (const item of items) {
-        if (!item?.id) continue;
-        next.set(item.id, normalizeConversationMeta(item, next.get(item.id)));
-      }
-      conversationMap = next;
+      mergeConversationIndex(items, {
+        promote: isFirstConversationIndexPage(capture.url),
+      });
       schedulePersist();
       return;
     }
@@ -467,41 +496,107 @@
         event.conversationId,
         event.conversationIdConflict,
       );
-      if (scope.conflicted || !scope.conversationId) continue;
-      const id = scope.conversationId;
-      maybeActivateCapturedConversation(id, capture);
-      bindPendingTurnIdentity(id, capture);
-      const turnAliases = [...new Set([
-        ...(event.turnAliases || []),
-        ...(capture.turnAliases || []),
-      ].filter(Boolean))];
-      const next = new Map(conversationRecords);
-      next.set(id, ingestConversationMessage(next.get(id), event.message, {
-        textMode: capture.transport === 'dom' ? 'snapshot' : 'progressive',
-        semanticTurnId: event.turnId || capture.turnId || null,
-        turnAliases,
-        transportTurnId: capture.transportTurnId || null,
-        turnUserMessageId: capture.turnUserMessageId || event.turnUserMessageId || null,
-        turnParentMessageId: capture.turnParentMessageId || event.turnParentMessageId || null,
-        captureId: capture.requestId || null,
-        captureTransport: capture.transport || null,
-        observationOrdinal: ++observationOrdinal,
-        sequenceNumber: event.sequenceNumber ?? null,
-        outputIndex: event.outputIndex ?? null,
-        responseId: event.responseId || null,
-        itemId: event.itemId || null,
-        callId: event.callId || null,
-        toolCallId: event.toolCallId || null,
-        phase: event.phase || null,
-        channel: event.channel || null,
-        eventType: event.eventType || null,
-      }));
-      conversationRecords = next;
-      schedulePersist();
-      updateConversationPreviewFromMessage(id, event.message);
-      if (id === currentConversationId) {
-        reconcilePending(id, event.message);
+      if (scope.conflicted) continue;
+      if (!scope.conversationId) {
+        queuePendingLiveEvent(event, capture);
+        continue;
       }
+      acceptMessageEvent(scope.conversationId, event, capture);
+    }
+  }
+
+  function acceptMessageEvent(id, event, capture) {
+    maybeActivateCapturedConversation(id, capture);
+    bindPendingTurnIdentity(id, capture);
+    const turnAliases = [...new Set([
+      ...(event.turnAliases || []),
+      ...(capture.turnAliases || []),
+    ].filter(Boolean))];
+    const next = new Map(conversationRecords);
+    next.set(id, ingestConversationMessage(next.get(id), event.message, {
+      textMode: capture.transport === 'dom' ? 'snapshot' : 'progressive',
+      semanticTurnId: event.turnId || capture.turnId || null,
+      turnAliases,
+      transportTurnId: capture.transportTurnId || capture.transportSessionId || null,
+      turnUserMessageId: capture.turnUserMessageId || event.turnUserMessageId || null,
+      turnParentMessageId: capture.turnParentMessageId || event.turnParentMessageId || null,
+      captureId: capture.requestId || null,
+      captureTransport: capture.transport || null,
+      observationOrdinal: ++observationOrdinal,
+      sequenceNumber: event.sequenceNumber ?? null,
+      outputIndex: event.outputIndex ?? null,
+      responseId: event.responseId || null,
+      itemId: event.itemId || null,
+      callId: event.callId || null,
+      toolCallId: event.toolCallId || null,
+      phase: event.phase || null,
+      channel: event.channel || null,
+      eventType: event.eventType || null,
+    }));
+    conversationRecords = next;
+    schedulePersist();
+    updateConversationPreviewFromMessage(id, event.message);
+    if (id === currentConversationId) reconcilePending(id, event.message);
+  }
+
+  function queuePendingLiveEvent(event, capture) {
+    if (
+      !pendingUser ||
+      pendingUser.conversationId !== null ||
+      capture.conversationRequest !== true
+    ) {
+      return false;
+    }
+    const key = capture.transportSessionId || capture.transportTurnId || capture.requestId;
+    if (!key) return false;
+
+    bindPendingTurnIdentity(null, capture);
+    const captureMeta = { ...capture };
+    delete captureMeta.data;
+    delete captureMeta.body;
+    const queued = pendingLiveEvents.get(key) || [];
+    queued.push({ event, capture: captureMeta });
+    pendingLiveEvents.set(key, queued);
+    pendingLiveEventCount += 1;
+
+    while (pendingLiveEventCount > MAX_PENDING_LIVE_EVENTS) {
+      const oldestKey = pendingLiveEvents.keys().next().value;
+      const oldest = pendingLiveEvents.get(oldestKey) || [];
+      oldest.shift();
+      pendingLiveEventCount -= 1;
+      if (oldest.length) pendingLiveEvents.set(oldestKey, oldest);
+      else pendingLiveEvents.delete(oldestKey);
+      setComposerStatus('新对话事件超过安全缓存上限；未丢失的事件仍会在服务端绑定会话后显示', true);
+    }
+    return true;
+  }
+
+  function flushPendingLiveEvents(id) {
+    if (!id || !pendingLiveEventCount) return;
+    const queued = [];
+    for (const entries of pendingLiveEvents.values()) queued.push(...entries);
+    clearPendingLiveEvents();
+    for (const entry of queued) {
+      acceptMessageEvent(id, entry.event, {
+        ...entry.capture,
+        conversationId: id,
+        conversationIdConflict: false,
+      });
+    }
+  }
+
+  function clearPendingLiveEvents() {
+    pendingLiveEvents.clear();
+    pendingLiveEventCount = 0;
+  }
+
+  function isFirstConversationIndexPage(rawUrl) {
+    try {
+      const url = new URL(String(rawUrl || ''), 'https://chatgpt.com/');
+      if (url.pathname !== '/backend-api/conversations') return true;
+      return Number(url.searchParams.get('offset') || 0) === 0;
+    } catch {
+      return true;
     }
   }
 
@@ -520,29 +615,41 @@
       lifecycle.turnTraceId,
       ...(capture.turnAliases || []),
       capture.turnId,
-      capture.transportTurnId,
     ].filter(Boolean))];
     const pendingAliases = [...new Set([
       ...(pendingUser?.turnAliases || []),
       pendingUser?.turnId,
-      pendingUser?.transportTurnId,
       pendingUser?.message?.turnId,
       ...(pendingUser?.message?.turnAliases || []),
-      pendingUser?.message?.transportTurnId,
-      pendingUser?.userMessageId,
-      pendingUser?.message?.turnUserMessageId,
     ].filter(Boolean))];
+    const transportIds = new Set([
+      lifecycle.transportSessionId,
+      lifecycle.transportTurnId,
+      capture.transportSessionId,
+      capture.transportTurnId,
+    ].filter(Boolean));
+    const pendingTransportIds = [
+      pendingUser?.transportSessionId,
+      pendingUser?.transportTurnId,
+      pendingUser?.message?.transportSessionId,
+      pendingUser?.message?.transportTurnId,
+    ].filter(Boolean);
     const correlated = capture.conversationRequest === true ||
-      Boolean(capture.turnUserMessageId && pendingUser?.userMessageId === capture.turnUserMessageId) ||
+      Boolean(
+        (lifecycle.turnUserMessageId || capture.turnUserMessageId) &&
+        pendingUser?.userMessageId === (lifecycle.turnUserMessageId || capture.turnUserMessageId)
+      ) ||
+      pendingTransportIds.some((id) => transportIds.has(id)) ||
       (turnAliases.length > 0 && pendingAliases.some((alias) => turnAliases.includes(alias)));
 
     const identityCapture = {
       ...capture,
       turnId: lifecycle.turnId || capture.turnId || null,
       turnAliases,
-      transportTurnId: capture.transportTurnId || null,
-      turnUserMessageId: capture.turnUserMessageId || null,
-      turnParentMessageId: capture.turnParentMessageId || null,
+      transportSessionId: lifecycle.transportSessionId || capture.transportSessionId || null,
+      transportTurnId: lifecycle.transportTurnId || capture.transportTurnId || null,
+      turnUserMessageId: lifecycle.turnUserMessageId || capture.turnUserMessageId || null,
+      turnParentMessageId: lifecycle.turnParentMessageId || capture.turnParentMessageId || null,
     };
     bindPendingTurnIdentity(id, identityCapture);
     if (
@@ -555,18 +662,28 @@
   }
 
   function bindPendingTurnIdentity(id, capture) {
-    if (!pendingUser || !(capture?.turnId || capture?.transportTurnId || capture?.turnUserMessageId)) return;
+    if (
+      !pendingUser ||
+      !(capture?.turnId || capture?.transportSessionId || capture?.transportTurnId || capture?.turnUserMessageId)
+    ) {
+      return;
+    }
     if (pendingUser.conversationId && pendingUser.conversationId !== id) return;
+    const turnAliases = capture.turnAliases?.length
+      ? capture.turnAliases
+      : (pendingUser.turnAliases || []);
     pendingUser = {
       ...pendingUser,
       turnId: capture.turnId || pendingUser.turnId || null,
-      turnAliases: capture.turnAliases || pendingUser.turnAliases || [],
+      turnAliases,
+      transportSessionId: capture.transportSessionId || pendingUser.transportSessionId || null,
       transportTurnId: capture.transportTurnId || pendingUser.transportTurnId || null,
       userMessageId: capture.turnUserMessageId || pendingUser.userMessageId || null,
       message: {
         ...pendingUser.message,
         turnId: capture.turnId || pendingUser.message?.turnId || null,
-        turnAliases: capture.turnAliases || pendingUser.message?.turnAliases || [],
+        turnAliases,
+        transportSessionId: capture.transportSessionId || pendingUser.message?.transportSessionId || null,
         transportTurnId: capture.transportTurnId || pendingUser.message?.transportTurnId || null,
         turnUserMessageId: capture.turnUserMessageId || pendingUser.message?.turnUserMessageId || null,
         turnParentMessageId: capture.turnParentMessageId || pendingUser.message?.turnParentMessageId || null,
@@ -689,7 +806,7 @@
       id,
       title: mergedPayload.title || previous.title || 'Untitled',
       create_time: mergedPayload.create_time || previous.create_time,
-      update_time: mergedPayload.update_time || Date.now() / 1000,
+      update_time: mergedPayload.update_time || previous.update_time || null,
       route: mergedPayload.metadata?.source === 'web-mobile-partial' ||
         (pageConversationId === id && pagePath.startsWith('/uc/'))
         ? 'uc'
@@ -765,6 +882,7 @@
     newChatWorkState = 'unknown';
     finishConversationLoading();
     pendingUser = null;
+    clearPendingLiveEvents();
     closeMobilePanels();
     if (transport.supportsLiveChat) {
       transport.send({ type: 'new-chat', thinkingLevel: userSettings.thinkingLevel });
@@ -789,6 +907,7 @@
 
   function bindPendingConversation(id) {
     if (!id || !pendingUser || (pendingUser.conversationId && !isProvisionalConversationId(pendingUser.conversationId))) return;
+    const pendingText = pendingUser.text;
     const provisionalId = isProvisionalConversationId(currentConversationId)
       ? currentConversationId
       : (isProvisionalConversationId(pendingUser.conversationId) ? pendingUser.conversationId : null);
@@ -826,6 +945,8 @@
       setConversationWorkState(id, newChatWorkState);
       newChatWorkState = 'unknown';
     }
+    updateConversationPreview(id, pendingText, '');
+    flushPendingLiveEvents(id);
   }
 
   function startConversationLoading(id) {
@@ -894,6 +1015,7 @@
       setComposerStatus('上一条消息仍在提交；SlimGPT 不会重复发送', true);
       return;
     }
+    clearPendingLiveEvents();
     const stamp = Date.now();
     const commandId = crypto.randomUUID();
     const thinkingLevel = options?.thinkingLevel || effectiveThinkingLevel;
@@ -936,6 +1058,7 @@
       pendingCommandConversationId = null;
       sendInFlight = false;
       if (pendingUser?.commandId === commandId) pendingUser = null;
+      clearPendingLiveEvents();
       setConversationWorkState(timedOutConversationId, 'unknown');
       setComposerStatus('官方输入框未确认提交；内容仍保留，请检查官方界面后手动决定是否重试', true);
     }, SEND_COMMAND_WATCHDOG_MS);
@@ -953,6 +1076,7 @@
     pendingCommandConversationId = null;
     if (!message.ok) {
       pendingUser = null;
+      clearPendingLiveEvents();
       if (message.error === 'send-in-progress') setConversationWorkState(submittedConversationId, 'running');
       else if (message.error === 'send-unconfirmed') setConversationWorkState(submittedConversationId, 'unknown');
       const details = {
@@ -1169,23 +1293,30 @@
     const metadata = rawMessage.metadata || {};
     updateConversationPreview(
       id,
-      contentToText(rawMessage.content),
+      contentToText(rawMessage.content, metadata),
       metadata.model_slug || metadata.default_model_slug || metadata.model || '',
     );
   }
 
   function updateConversationPreview(id, text, model = '') {
-    const previous = conversationMap.get(id);
-    if (!previous) return;
+    const existing = conversationMap.get(id) || null;
+    const previous = existing || normalizeConversationMeta({
+      id,
+      title: 'Untitled',
+      route: 'c',
+    });
     const preview = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 160);
-    if (!preview && !model) return;
-    const next = new Map(conversationMap);
-    next.set(id, normalizeConversationMeta({
+    if (existing && !preview && !model) return;
+    const updated = normalizeConversationMeta({
       ...previous,
       last: preview || previous.last,
       model: model || previous.model,
-      update_time: Date.now() / 1000,
-    }, previous));
+    }, previous);
+    locallyPromotedConversationIds.add(id);
+    const next = new Map([[id, updated]]);
+    for (const [candidateId, item] of conversationMap) {
+      if (candidateId !== id) next.set(candidateId, item);
+    }
     conversationMap = next;
     schedulePersist();
   }

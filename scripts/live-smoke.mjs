@@ -178,6 +178,9 @@ async function runFixtureSmoke(browser, extensionId) {
   const top = await connectCdp(topTarget.webSocketDebuggerUrl);
   await top.call('Page.enable');
   await top.call('Runtime.enable');
+  await top.call('Page.addScriptToEvaluateOnNewDocument', {
+    source: 'window.__slimgptNativeReplaceState = history.replaceState.bind(history);',
+  });
   await top.call('Fetch.enable', {
     patterns: [
       { urlPattern: 'https://chatgpt.com/*', resourceType: 'Document', requestStage: 'Request' },
@@ -1424,10 +1427,25 @@ async function runFixtureSmoke(browser, extensionId) {
   assert.equal(backgroundCaptureOnNewChat.messages.includes('Second answer'), false, 'background payload content must stay in its own cache');
   await top.evaluate(`document.querySelectorAll('[data-message-id]').forEach((node) => node.remove())`);
 
+  const indexRequestsBeforeNewChat = fixture.conversationListRequests || 0;
   await ui.evaluate(fillAndSubmitExpression('Fixture new-chat request https://example.com'));
   await waitFor(async () => (await ui.evaluate(uiStateExpression())).composerStatus === '消息已发送（官方已确认）');
   await waitFor(async () => (await top.evaluate('location.pathname')) === '/c/fixture-new-chat');
-  await waitFor(async () => (await ui.evaluate(uiStateExpression())).messages.includes('Fixture new-chat answer'));
+  await waitFor(async () => {
+    const state = await ui.evaluate(uiStateExpression());
+    return (
+      state.messages.includes('Fixture new-chat live reasoning') &&
+      state.messages.includes('Fixture new-chat live tool result') &&
+      state.messages.includes('Fixture new-chat answer')
+    );
+  });
+  await waitFor(async () => (
+    await ui.evaluate(`document.querySelector('.conversation-title')?.textContent?.trim() || ''`)
+  ) === 'Fixture new chat');
+  assert.ok(
+    (fixture.conversationListRequests || 0) > indexRequestsBeforeNewChat,
+    'stream completion must event-trigger a fresh sidebar index read',
+  );
   await top.evaluate(`(() => {
     const form = document.getElementById('fixture-composer');
     form?.querySelector('[data-testid="stop-button"]')?.remove();
@@ -1447,9 +1465,21 @@ async function runFixtureSmoke(browser, extensionId) {
   }, location.origin)`);
   await waitFor(async () => (await ui.evaluate(uiStateExpression())).sidebarWorkState === 'stopped');
   const newChatSend = await ui.evaluate(uiStateExpression());
+  const newChatLiveCards = await ui.evaluate(`(() => ({
+    firstConversation: document.querySelector('.conversation-title')?.textContent?.trim() || '',
+    thoughts: document.querySelectorAll('.thought-block').length,
+    toolCalls: document.querySelectorAll('.message-card.tool-call').length,
+    toolResults: document.querySelectorAll('.message-card.tool-result').length,
+  }))()`);
   assert.equal(newChatSend.overviewItems, 1, 'a provisional WEB:* route must bind to one persisted user/output turn');
   assert.ok(newChatSend.messages.includes('Fixture new-chat request'));
+  assert.ok(newChatSend.messages.includes('Fixture new-chat live reasoning'));
+  assert.ok(newChatSend.messages.includes('Fixture new-chat live tool result'));
   assert.ok(newChatSend.messages.includes('Fixture new-chat answer'));
+  assert.equal(newChatLiveCards.firstConversation, 'Fixture new chat', 'the bound conversation must move to the sidebar front without a clock sort');
+  assert.equal(newChatLiveCards.thoughts, 1);
+  assert.equal(newChatLiveCards.toolCalls, 1);
+  assert.equal(newChatLiveCards.toolResults, 1);
 
   await sleep(250);
   const resizeObserverErrors = await ui.evaluate(`window.__slimgptWindowErrors.filter((message) => /ResizeObserver loop/i.test(message))`);
@@ -1466,6 +1496,11 @@ async function runFixtureSmoke(browser, extensionId) {
   await waitFor(async () => (await ui.evaluate(`document.querySelector('.status-pill')?.textContent?.trim() || ''`)) === '已接管');
   await waitFor(async () => await ui.evaluate(`[...document.querySelectorAll('.conversation-item')]
     .some((button) => button.textContent.includes('Second conversation'))`));
+  assert.equal(
+    await ui.evaluate(`document.querySelector('.conversation-title')?.textContent?.trim() || ''`),
+    'Fixture new chat',
+    'a locally observed newest conversation must retain first position across UI reload while the server index is incomplete',
+  );
   await ui.evaluate(`[...document.querySelectorAll('.conversation-item')]
     .find((button) => button.textContent.includes('Second conversation'))?.click()`);
   await waitFor(async () => await ui.evaluate(`(() => {
@@ -2168,9 +2203,7 @@ function makeFixture() {
     newChatCanonicalPage,
     newChatStream: encodeConversationDeltaStream([
       {
-        conversation_id: 'fixture-new-chat',
         sequence_number: 1,
-        output_index: 0,
         response_id: 'fixture-new-response',
         message: {
           id: 'fixture-new-user',
@@ -2182,16 +2215,58 @@ function makeFixture() {
         },
       },
       {
-        conversation_id: 'fixture-new-chat',
         sequence_number: 2,
-        output_index: 1,
+        output_index: 0,
         response_id: 'fixture-new-response',
+        phase: 'reasoning',
         message: {
-          id: 'fixture-new-final',
+          id: 'fixture-new-reasoning',
           parent_id: 'fixture-new-user',
           author: { role: 'assistant' },
-          content: { content_type: 'text', parts: ['Fixture new-chat answer'] },
+          content: { content_type: 'thought', text: 'Fixture new-chat live reasoning' },
           metadata: { parent_id: 'fixture-new-user', turn_exchange_id: 'fixture-new-turn' },
+          status: 'in_progress',
+          end_turn: false,
+        },
+      },
+      {
+        sequence_number: 3,
+        output_index: 1,
+        response_id: 'fixture-new-response',
+        phase: 'tool',
+        message: {
+          id: 'fixture-new-call',
+          parent_id: 'fixture-new-reasoning',
+          author: { role: 'assistant' },
+          recipient: 'web.run',
+          content: { content_type: 'code', text: '{"query":"event driven"}' },
+          metadata: { parent_id: 'fixture-new-reasoning', turn_exchange_id: 'fixture-new-turn' },
+        },
+      },
+      {
+        sequence_number: 4,
+        output_index: 2,
+        response_id: 'fixture-new-response',
+        phase: 'tool',
+        message: {
+          id: 'fixture-new-result',
+          parent_id: 'fixture-new-call',
+          author: { role: 'tool', name: 'web.run' },
+          content: { content_type: 'text', parts: ['Fixture new-chat live tool result'] },
+          metadata: { parent_id: 'fixture-new-call', turn_exchange_id: 'fixture-new-turn' },
+        },
+      },
+      {
+        sequence_number: 5,
+        output_index: 3,
+        response_id: 'fixture-new-response',
+        phase: 'final',
+        message: {
+          id: 'fixture-new-final',
+          parent_id: 'fixture-new-result',
+          author: { role: 'assistant' },
+          content: { content_type: 'text', parts: ['Fixture new-chat answer'] },
+          metadata: { parent_id: 'fixture-new-result', turn_exchange_id: 'fixture-new-turn' },
           status: 'finished_successfully',
           end_turn: true,
         },
@@ -2429,7 +2504,6 @@ function installComposerExpression() {
           'x-oai-turn-trace-id': newChat ? 'fixture-new-chat' : 'fixture-turn-mobile',
         },
         body: JSON.stringify({
-          ...(newChat ? {} : { conversation_id: 'mobile-smoke' }),
           parent_message_id: newChat ? 'client-created-root' : 'ma1',
           messages: [{
             id: userMessageId,
@@ -2439,6 +2513,9 @@ function installComposerExpression() {
         }),
       }).then((response) => response.text()).then((body) => {
         window.__slimgptOfficialResponseBody = body;
+        if (newChat) {
+          window.__slimgptNativeReplaceState(history.state, '', '/c/fixture-new-chat');
+        }
       }).catch(() => {});
       textarea.value = '';
       button.hidden = true;

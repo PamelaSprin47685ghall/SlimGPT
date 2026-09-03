@@ -74,11 +74,27 @@ test('the project has no PWA or debugger runtime', async () => {
 
 test('page synchronization is event-driven instead of interval-polled', async () => {
   const source = await readFile('main-mitm.js', 'utf8');
+  const home = await readFile('src/pages/HomePage.svelte', 'utf8');
   assert.equal(source.includes('setInterval('), false);
   assert.equal(source.includes('new MutationObserver'), true);
   assert.equal(source.includes('socket.addEventListener("message"'), true);
   assert.equal(source.includes('xhr.addEventListener("progress"'), true);
   assert.equal(source.includes('transport: "dom"'), true);
+  assert.ok(source.includes('globalThis.navigation?.addEventListener?.("currententrychange", emitLocation)'));
+  assert.ok(source.includes('conversationIndexSyncRequested = true'));
+  assert.ok(source.includes('type: "page-conversation-index"'));
+  assert.equal(source.includes('CONVERSATION_INDEX_REFRESH_MS'), false);
+  assert.equal(source.includes('lastConversationIndexSyncAt'), false);
+  assert.ok(home.includes('queuePendingLiveEvent(event, capture)'));
+  assert.ok(home.includes('flushPendingLiveEvents(id)'));
+  assert.ok(home.includes('const conversations = $derived([...conversationMap.values()])'));
+  const previewStart = home.indexOf('function updateConversationPreview(id, text');
+  const previewEnd = home.indexOf('function selectOverviewMessage', previewStart);
+  assert.equal(
+    home.slice(previewStart, previewEnd).includes('Date.now()'),
+    false,
+    'sidebar activity order must follow message/index events rather than wall-clock timestamps',
+  );
 });
 
 test('official slow stream consumers receive structural semantics without owning the real stream', async () => {
@@ -134,6 +150,20 @@ test('intercepted turn sessions survive transport boundaries and clean up on ser
   assert.ok(source.includes('notificationMatchesTurnSession(notification, activeSession)'), 'a delayed stop notification must not delete a semantically different active turn');
   assert.ok(source.includes('adoptNotificationTurnIdentity(conversationId, notification)'), 'server semantic turn aliases should enrich the active session for later resume');
   assert.ok(source.includes('bindPendingTurnSession(conversationId)'), 'new-chat transport sessions must bind when the official route acquires its conversation id');
+  const scopeStart = source.indexOf('function snapshotConversationScope');
+  const scopeEnd = source.indexOf('async function readRequestConversationId', scopeStart);
+  assert.ok(
+    source.slice(scopeStart, scopeEnd).includes('conversationIdFromUrl(location.href)'),
+    'a submission without a body conversation id must inherit the event-time page route',
+  );
+  assert.ok(source.includes('transportSessionId: boundSession.sessionId || null'));
+  const submissionStart = source.indexOf('async function snapshotSubmissionTurn');
+  const submissionEnd = source.indexOf('async function snapshotActiveTurn', submissionStart);
+  const submission = source.slice(submissionStart, submissionEnd);
+  assert.ok(
+    submission.indexOf('registerTurnSession(session)') < submission.indexOf('await Promise.all'),
+    'the transport session must exist before asynchronous request-body parsing can race route binding',
+  );
 });
 
 test('canonical pagination never publishes a partial history when an older cursor fails', async () => {
