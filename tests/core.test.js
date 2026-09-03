@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  buildConversationRecordTimeline,
   buildConversationRecordTurns,
   buildConversationRecordView,
   buildConversationView,
@@ -18,6 +19,7 @@ import {
   fingerprintCapture,
   getThinkingLevel,
   getToolMessageInfo,
+  groupConversationTimeline,
   groupConversationTurns,
   hasNonTextExtras,
   ingestConversationMessage,
@@ -115,6 +117,17 @@ test('conversation turns keep each user question with its following replies', ()
   assert.deepEqual(turns[1].replies.map((message) => message.text), ['answer two']);
 });
 
+test('non-user preamble remains visible without creating a conversation page', () => {
+  const timeline = groupConversationTimeline([
+    { id: 'orphan', role: 'assistant', text: 'unassigned output' },
+    { id: 'u1', role: 'user', text: 'question' },
+    { id: 'a1', role: 'assistant', text: 'answer' },
+  ]);
+
+  assert.deepEqual(timeline.turns.map((turn) => turn.user.id), ['u1']);
+  assert.deepEqual(timeline.unresolved.map((message) => message.id), ['orphan']);
+});
+
 test('explicit turn identity wins over misleading parent timing when attaching live output', () => {
   let record = ingestConversationPayload(null, {
     id: 'turn-identity',
@@ -169,12 +182,72 @@ test('unassigned live output stays in a tail bucket instead of contaminating the
     content: { parts: ['orphan result'] },
   }, { observationOrdinal: 10 });
 
-  const turns = buildConversationRecordTurns(record);
-  assert.equal(turns.length, 3);
-  assert.deepEqual(turns[0].replies.map((item) => item.id), ['a1']);
-  assert.deepEqual(turns[1].replies.map((item) => item.id), ['a2']);
-  assert.equal(turns[2].user, null);
-  assert.deepEqual(turns[2].replies.map((item) => item.id), ['orphan-tool']);
+  const timeline = buildConversationRecordTimeline(record);
+  assert.equal(timeline.turns.length, 2);
+  assert.deepEqual(timeline.turns[0].replies.map((item) => item.id), ['a1']);
+  assert.deepEqual(timeline.turns[1].replies.map((item) => item.id), ['a2']);
+  assert.equal(timeline.unresolved.length, 1);
+  assert.deepEqual(timeline.unresolved[0].replies.map((item) => item.id), ['orphan-tool']);
+});
+
+test('only canonical user messages create pages across a tool-heavy turn stream', () => {
+  const inheritedTurnMetadata = {
+    async_source: 'saserver-prod:conversation-turn-shared:EU',
+    cot_version: 'v5',
+  };
+  const payload = findConversationPayload({
+    id: 'corpus-page-invariant',
+    conversation_id: 'corpus-page-invariant',
+    current_node: 'final-3',
+    messages: [
+      {
+        id: 'user-1', author: { role: 'user' },
+        content: { content_type: 'text', parts: ['one'] },
+        metadata: inheritedTurnMetadata,
+      },
+      {
+        id: 'final-1', author: { role: 'assistant' },
+        content: { content_type: 'text', parts: ['answer one'] },
+        metadata: { ...inheritedTurnMetadata, parent_id: 'user-1' },
+      },
+      {
+        id: 'user-2', author: { role: 'user' },
+        content: { content_type: 'text', parts: ['two'] },
+        metadata: { ...inheritedTurnMetadata, parent_id: 'final-1' },
+      },
+      {
+        id: 'call-2', author: { role: 'assistant' }, recipient: 'api_tool.call_tool',
+        content: { content_type: 'code', text: '{"name":"read"}' },
+        metadata: { ...inheritedTurnMetadata, parent_id: 'user-2' },
+      },
+      {
+        id: 'result-2', author: { role: 'tool', name: 'api_tool.call_tool' },
+        content: { content_type: 'code', text: '{"ok":true}' },
+        metadata: { ...inheritedTurnMetadata, parent_id: 'call-2' },
+      },
+      {
+        id: 'user-3', author: { role: 'user' },
+        content: { content_type: 'text', parts: ['three'] },
+        metadata: { ...inheritedTurnMetadata, parent_id: 'result-2' },
+      },
+      {
+        id: 'final-3', author: { role: 'assistant' },
+        content: { content_type: 'text', parts: ['answer three'] },
+        metadata: { ...inheritedTurnMetadata, parent_id: 'user-3' },
+      },
+      {
+        id: 'orphan-output', author: { role: 'assistant' },
+        content: { content_type: 'text', parts: ['unknown owner'] },
+      },
+    ],
+  });
+  const record = ingestConversationPayload(null, payload, { canonicalComplete: true });
+
+  const timeline = buildConversationRecordTimeline(record);
+  assert.deepEqual(timeline.turns.map((turn) => turn.user.id), ['user-1', 'user-2', 'user-3']);
+  assert.deepEqual(timeline.turns[1].replies.map((reply) => reply.tool?.kind), ['tool-call', 'tool-result']);
+  assert.equal(timeline.unresolved.length, 1);
+  assert.deepEqual(timeline.unresolved[0].replies.map((reply) => reply.id), ['orphan-output']);
 });
 
 test('a genuinely ambiguous parent without semantic identity stays unassigned', () => {
@@ -195,11 +268,11 @@ test('a genuinely ambiguous parent without semantic identity stays unassigned', 
     id: 'ambiguous-child', parent_id: 'shared-parent', author: { role: 'tool', name: 'web.run' }, content: { parts: ['unknown owner'] },
   }, { observationOrdinal: 3 });
 
-  const turns = buildConversationRecordTurns(record);
-  assert.equal(turns[0].replies.some((item) => item.id === 'ambiguous-child'), false);
-  assert.equal(turns[1].replies.some((item) => item.id === 'ambiguous-child'), false);
-  assert.equal(turns.at(-1).source, 'unassigned');
-  assert.deepEqual(turns.at(-1).replies.map((item) => item.id), ['ambiguous-child']);
+  const timeline = buildConversationRecordTimeline(record);
+  assert.equal(timeline.turns[0].replies.some((item) => item.id === 'ambiguous-child'), false);
+  assert.equal(timeline.turns[1].replies.some((item) => item.id === 'ambiguous-child'), false);
+  assert.equal(timeline.unresolved.at(-1).source, 'unassigned');
+  assert.deepEqual(timeline.unresolved.at(-1).replies.map((item) => item.id), ['ambiguous-child']);
 });
 
 test('partial canonical pages remain hidden until the full canonical sync is complete', () => {
@@ -212,10 +285,10 @@ test('partial canonical pages remain hidden until the full canonical sync is com
       a2: { id: 'a2', parent: 'u2', children: [], message: { id: 'a2', author: { role: 'assistant' }, content: { parts: ['middle answer'] } } },
     },
   }, { canonicalComplete: false });
-  const provisionalTurns = buildConversationRecordTurns(record);
-  assert.equal(provisionalTurns.length, 1);
-  assert.equal(provisionalTurns[0].user, null, 'an incomplete page must not invent a historical user turn');
-  assert.deepEqual(provisionalTurns[0].replies.map((reply) => reply.text), ['middle answer']);
+  const provisionalTimeline = buildConversationRecordTimeline(record);
+  assert.equal(provisionalTimeline.turns.length, 0, 'an incomplete page must not invent a historical user turn');
+  assert.equal(provisionalTimeline.unresolved.length, 1);
+  assert.deepEqual(provisionalTimeline.unresolved[0].replies.map((reply) => reply.text), ['middle answer']);
 
   record = ingestConversationPayload(record, {
     id: 'partial-hidden',
@@ -298,10 +371,10 @@ test('an incomplete newest canonical page never fabricates its page head as conv
     ],
   });
   const record = ingestConversationPayload(null, newestOnly, { canonicalComplete: false });
-  const turns = buildConversationRecordTurns(record);
-  assert.equal(turns.length, 1);
-  assert.equal(turns[0].user, null);
-  assert.deepEqual(turns[0].replies.map((reply) => reply.id), ['a3']);
+  const timeline = buildConversationRecordTimeline(record);
+  assert.equal(timeline.turns.length, 0);
+  assert.equal(timeline.unresolved.length, 1);
+  assert.deepEqual(timeline.unresolved[0].replies.map((reply) => reply.id), ['a3']);
 });
 
 test('non-monotonic create_time never changes turn ownership or output-item order', () => {
@@ -794,11 +867,11 @@ test('conflicting semantic aliases fail closed instead of falling back to a misl
     id: 'conflicted-live', parent_id: 'a1', author: { role: 'assistant' }, content: { parts: ['must stay unresolved'] },
   }, { turnAliases: ['turn-one', 'turn-two'], observationOrdinal: 1 });
 
-  const turns = buildConversationRecordTurns(record);
-  assert.equal(turns[0].replies.some((item) => item.id === 'conflicted-live'), false);
-  assert.equal(turns[1].replies.some((item) => item.id === 'conflicted-live'), false);
-  assert.equal(turns.at(-1).source, 'unassigned');
-  assert.equal(turns.at(-1).replies[0].id, 'conflicted-live');
+  const timeline = buildConversationRecordTimeline(record);
+  assert.equal(timeline.turns[0].replies.some((item) => item.id === 'conflicted-live'), false);
+  assert.equal(timeline.turns[1].replies.some((item) => item.id === 'conflicted-live'), false);
+  assert.equal(timeline.unresolved.at(-1).source, 'unassigned');
+  assert.equal(timeline.unresolved.at(-1).replies[0].id, 'conflicted-live');
 });
 
 test('same-id streamed tool arguments accumulate instead of replacing earlier fragments', () => {
@@ -1212,6 +1285,72 @@ test('tool calls and tool results are classified from message structure, not arb
     channel: 'final',
     content: { content_type: 'text', parts: ['Final answer after web search'] },
   }), null, 'tool provenance on a final assistant message must not turn the answer into a tool result');
+});
+
+test('turn-scoped async metadata never reclassifies users, tools, system context, or final output', () => {
+  const inheritedTurnMetadata = {
+    async_source: 'saserver-prod:conversation-turn-semantic-id:EU',
+    cot_version: 'v5',
+  };
+  const view = (id, message) => {
+    const node = {
+      id,
+      parent: null,
+      children: [],
+      message: {
+        id,
+        ...message,
+        metadata: {
+          ...inheritedTurnMetadata,
+          ...(message.metadata || {}),
+        },
+      },
+    };
+    return messageNodeToView(node, { [id]: node });
+  };
+
+  const user = view('corpus-user', {
+    author: { role: 'user' },
+    content: { content_type: 'text', parts: ['real user message'] },
+  });
+  assert.equal(user.role, 'user');
+  assert.equal(user.text, 'real user message');
+  assert.equal(user.thought, null);
+
+  const call = view('corpus-call', {
+    author: { role: 'assistant' },
+    recipient: 'api_tool.call_tool',
+    content: { content_type: 'code', text: '{"name":"read"}' },
+  });
+  assert.equal(call.tool?.kind, 'tool-call');
+  assert.equal(call.tool?.name, 'api_tool.call_tool');
+  assert.equal(call.thought, null);
+
+  const result = view('corpus-result', {
+    author: { role: 'tool', name: 'api_tool.call_tool' },
+    content: { content_type: 'code', text: '{"ok":true}' },
+  });
+  assert.equal(result.role, 'tool');
+  assert.equal(result.tool?.kind, 'tool-result');
+  assert.equal(result.thought, null);
+
+  const final = view('corpus-final', {
+    author: { role: 'assistant' },
+    content: { content_type: 'text', parts: ['final assistant output'] },
+    end_turn: true,
+  });
+  assert.equal(final.role, 'assistant');
+  assert.equal(final.text, 'final assistant output');
+  assert.equal(final.thought, null);
+  assert.equal(final.tool, null);
+
+  const system = view('corpus-system', {
+    author: { role: 'system' },
+    content: { content_type: 'text', parts: ['internal context'] },
+  });
+  assert.equal(system.role, 'system');
+  assert.equal(system.thought, null);
+  assert.equal(system.tool, null);
 });
 
 test('extractThought extracts reasoning from metadata or content parts', () => {

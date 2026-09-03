@@ -1358,14 +1358,17 @@ async function runFixtureSmoke(browser, extensionId) {
   assert.equal(restoredSmokeState.draft, '', 'a conversation without a draft must remain empty after switching back');
   assert.equal(restoredSmokeState.messages.includes('Late live-only DOM answer'), false, 'DOM mutations queued before navigation must retain their source conversation');
   const smokeTailPreviews = await ui.evaluate(`Array.from(document.querySelectorAll('.overview-item')).map((node) => node.textContent?.replace(/\\s+/g, ' ').trim() || '')`);
-  assert.ok(smokeTailPreviews.some((text) => text.includes('Scoped stale smoke answer')), 'late scoped content must remain owned by its source conversation');
-  assert.ok(smokeTailPreviews.some((text) => text.includes('Delayed smoke-only answer')), 'request-scoped content must remain available in its source conversation');
+  assert.equal(smokeTailPreviews.some((text) => text.includes('Scoped stale smoke answer')), false, 'an unbound assistant item must not create an overview page');
+  assert.equal(smokeTailPreviews.some((text) => text.includes('Delayed smoke-only answer')), false, 'a request-scoped assistant item without a user anchor must not create an overview page');
   assert.equal(smokeTailPreviews.some((text) => text.includes('Ambiguous stale answer')), false);
   assert.equal(smokeTailPreviews.some((text) => text.includes('Conflicting stale answer')), false);
-  await ui.evaluate(`Array.from(document.querySelectorAll('.overview-item')).find((node) => node.textContent.includes('Delayed smoke-only answer'))?.click()`);
-  await waitFor(async () => (await ui.evaluate(uiStateExpression())).messages.includes('Delayed smoke-only answer'));
-  await ui.evaluate(`Array.from(document.querySelectorAll('.overview-item')).find((node) => node.textContent.includes('Scoped stale smoke answer'))?.click()`);
-  await waitFor(async () => (await ui.evaluate(uiStateExpression())).messages.includes('Scoped stale smoke answer'));
+  const unresolvedSmokeState = await ui.evaluate(`(() => ({
+    stage: document.querySelector('.message-stage')?.innerText?.replace(/\\s+/g, ' ').trim() || '',
+    notice: !!document.querySelector('.turn-unresolved-notice'),
+  }))()`);
+  assert.ok(unresolvedSmokeState.stage.includes('Scoped stale smoke answer'), 'late scoped content must remain visible in its source conversation');
+  assert.ok(unresolvedSmokeState.stage.includes('Delayed smoke-only answer'), 'request-scoped content must remain visible in its source conversation');
+  assert.equal(unresolvedSmokeState.notice, true, 'unbound output must be labeled instead of becoming a synthetic page');
 
   await top.evaluate(`fetch('/backend-api/messages/smoke-partial').then((response) => response.json())`);
   await waitFor(async () => await ui.evaluate(`Array.from(document.querySelectorAll('.overview-item')).some((node) => node.textContent.includes('Partial tail question'))`));
@@ -1401,7 +1404,6 @@ async function runFixtureSmoke(browser, extensionId) {
   ]);
   delete fixture.onResumeRequest;
   assert.equal(resumeReconnectCount, 2, 'an interrupted resume stream must reconnect exactly once before [DONE]');
-  await ui.evaluate(`Array.from(document.querySelectorAll('.overview-item')).find((node) => node.textContent.includes('Delayed smoke-only answer'))?.click()`);
   await waitFor(async () => (await ui.evaluate(uiStateExpression())).messages.includes('Diverted resume answer'));
 
   await ui.evaluate(`document.querySelector('.new-chat')?.click()`);

@@ -4,6 +4,7 @@
 
   let {
     turns = [],
+    unresolved = [],
     activeIndex = 0,
     conversationKey = 'default',
     onActiveChange = () => {},
@@ -29,6 +30,10 @@
   const activeTurn = $derived(turns[activeIndex] || null);
   const turnCount = $derived(turns.length);
   const lastTurnActive = $derived(turnCount > 0 && activeIndex === turnCount - 1);
+  const showUnresolved = $derived(
+    unresolved.length > 0 && (turnCount === 0 || lastTurnActive)
+  );
+  const hasRenderableContent = $derived(Boolean(activeTurn || showUnresolved));
   const TAIL_STICKY_DISTANCE = 56;
 
   $effect(() => {
@@ -187,7 +192,7 @@
   }
 
   function handleKeydown(event) {
-    if (!activeTurn || !scroller || isEditableTarget(event.target)) return;
+    if (!hasRenderableContent || !scroller || isEditableTarget(event.target)) return;
     if (!['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End'].includes(event.key)) return;
     cancelEdgeSettle();
 
@@ -223,7 +228,7 @@
   }
 
   function handleWheel(event) {
-    if (!activeTurn || !scroller) return;
+    if (!hasRenderableContent || !scroller) return;
     if (Math.abs(event.deltaX) > Math.abs(event.deltaY)) return;
     if (event.deltaY < 0) tailPinned = false;
     cancelEdgeSettle();
@@ -271,10 +276,15 @@
 <svelte:window onkeydown={handleKeydown} />
 
 <div class="single-message-stage conversation-turn-stage">
-  {#if activeTurn}
+  {#if hasRenderableContent}
     <div class="single-message-position" aria-live="polite">
-      <span>{activeIndex + 1} / {turns.length}</span>
-      <span>一轮问答</span>
+      {#if activeTurn}
+        <span>{activeIndex + 1} / {turns.length}</span>
+        <span>一轮问答</span>
+      {:else}
+        <span>未归属输出</span>
+        <span>非问答页</span>
+      {/if}
     </div>
     <div
       class="single-message-scroller"
@@ -284,23 +294,38 @@
       ontouchstart={handleTouchStart}
       ontouchend={handleTouchEnd}
       role="region"
-      aria-label={`问答 ${activeIndex + 1} / ${turns.length}`}
+      aria-label={activeTurn ? `问答 ${activeIndex + 1} / ${turns.length}` : '未归属输出'}
     >
       <div
         class="single-message-content conversation-turn-content"
         bind:this={content}
         style={`transform:translateY(${boundaryOffsetPx}px)`}
       >
-        {#if activeTurn.user}
+        {#if activeTurn}
           <section class="turn-message turn-question">
             <MessageBubble message={activeTurn.user} {onBranch} />
           </section>
+          {#each activeTurn.replies as reply (reply.observationKey || reply.itemId || reply.id || reply.nodeId)}
+            <section class={`turn-message turn-reply role-${reply?.role || 'unknown'}`}>
+              <MessageBubble message={reply} {onBranch} />
+            </section>
+          {/each}
         {/if}
-        {#each activeTurn.replies as reply (reply.observationKey || reply.itemId || reply.id || reply.nodeId)}
-          <section class={`turn-message turn-reply role-${reply?.role || 'unknown'}`}>
-            <MessageBubble message={reply} {onBranch} />
+        {#if showUnresolved}
+          <section class="turn-unresolved-notice" role="status">
+            <strong>未归属输出</strong>
+            <span>这些消息没有可验证的用户消息归属，因此不会创建问答页。</span>
           </section>
-        {/each}
+          {#each unresolved as group (group.id)}
+            <div class="turn-unresolved-group">
+              {#each group.replies as reply (reply.observationKey || reply.itemId || reply.id || reply.nodeId)}
+                <section class={`turn-message turn-reply role-${reply?.role || 'unknown'}`}>
+                  <MessageBubble message={reply} {onBranch} />
+                </section>
+              {/each}
+            </div>
+          {/each}
+        {/if}
       </div>
     </div>
     {#if boundaryDirection}

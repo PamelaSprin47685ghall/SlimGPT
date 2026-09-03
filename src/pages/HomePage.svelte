@@ -20,7 +20,7 @@
   } from '../lib/storage.js';
   import {
     bindConversationTurnUser,
-    buildConversationRecordTurns,
+    buildConversationRecordTimeline,
     buildConversationView,
     contentToText,
     consumeSse,
@@ -96,14 +96,19 @@
   ));
   const currentMeta = $derived(currentConversationId ? conversationMap.get(currentConversationId) : null);
   const displayConversationId = $derived(currentConversationId);
-  const turns = $derived.by(() => {
+  const timeline = $derived.by(() => {
     const id = displayConversationId;
-    if (!id) return [];
+    if (!id) return { turns: [], unresolved: [] };
     const record = conversationRecords.get(id) || null;
     const pending = pendingUser?.conversationId === id ? pendingUser.message : null;
-    return buildConversationRecordTurns(record, pending);
+    return buildConversationRecordTimeline(record, pending);
   });
-  const messages = $derived(turns.flatMap((turn) => [turn.user, ...(turn.replies || [])].filter(Boolean)));
+  const turns = $derived(timeline.turns);
+  const unresolvedTurns = $derived(timeline.unresolved);
+  const messages = $derived(
+    [...turns, ...unresolvedTurns]
+      .flatMap((turn) => [turn.user, ...(turn.replies || [])].filter(Boolean))
+  );
   const liveConnected = $derived(status.bridgeReady && status.captureMode === 'page');
   const statusState = $derived(status.bridgeError ? 'error' : (liveConnected ? 'online' : 'offline'));
   const statusLabel = $derived(status.bridgeError ? '连接失败' : (liveConnected ? (status.takeover === false ? '已连接' : '已接管') : '连接中'));
@@ -1320,9 +1325,10 @@
       </header>
 
       <section class="message-stage">
-        {#if turns.length}
+        {#if turns.length || unresolvedTurns.length}
           <ConversationTurnStage
             {turns}
+            unresolved={unresolvedTurns}
             activeIndex={activeTurnIndex}
             conversationKey={displayConversationId || 'new'}
             onActiveChange={(index) => activeTurnIndex = index}
@@ -1377,6 +1383,7 @@
     >
       <MessageOverview
         {turns}
+        unresolvedCount={unresolvedTurns.reduce((total, turn) => total + turn.replies.length, 0)}
         activeIndex={activeTurnIndex}
         onSelect={selectOverviewMessage}
       />

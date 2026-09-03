@@ -1118,8 +1118,13 @@ function buildCanonicalConversationView(payload, terminalId = null) {
 }
 
 export function groupConversationTurns(messages) {
+  return groupConversationTimeline(messages).turns;
+}
+
+export function groupConversationTimeline(messages) {
   const source = Array.isArray(messages) ? messages.filter(Boolean) : [];
   const turns = [];
+  const unresolved = [];
   let current = null;
 
   for (const message of source) {
@@ -1134,17 +1139,13 @@ export function groupConversationTurns(messages) {
     }
 
     if (!current) {
-      current = {
-        id: `turn-preamble-${message?.id || message?.nodeId || turns.length}`,
-        user: null,
-        replies: [],
-      };
-      turns.push(current);
+      unresolved.push(message);
+      continue;
     }
     appendTurnReply(current, message);
   }
 
-  return turns;
+  return { turns, unresolved };
 }
 
 function appendTurnReply(turn, message) {
@@ -1165,12 +1166,11 @@ function isTransientThinkingMessage(message) {
 
 export function isAsyncReasoningMessage(message) {
   if (!message || typeof message !== "object") return false;
-  const metadata = message.metadata || {};
-  return Boolean(
-    metadata.initial_text ||
-    metadata.finished_text ||
-    (metadata.async_source && metadata.cot_version)
-  );
+  return hasExplicitAsyncReasoningMetadata(message.metadata);
+}
+
+function hasExplicitAsyncReasoningMetadata(metadata) {
+  return Boolean(metadata?.initial_text || metadata?.finished_text);
 }
 
 export function messageTurnIdentity(message) {
@@ -1755,7 +1755,7 @@ function firstNonEmptyString(...values) {
 }
 
 export function contentToText(content, metadata = {}) {
-  if (metadata && (metadata.initial_text || metadata.finished_text || (metadata.async_source && metadata.cot_version))) {
+  if (hasExplicitAsyncReasoningMetadata(metadata)) {
     return "";
   }
 
@@ -2305,11 +2305,16 @@ export function setConversationRecordTerminal(record, terminal) {
 }
 
 export function buildConversationRecordView(record) {
-  return buildConversationRecordTurns(record)
+  const timeline = buildConversationRecordTimeline(record);
+  return [...timeline.turns, ...timeline.unresolved]
     .flatMap((turn) => [turn.user, ...(turn.replies || [])].filter(Boolean));
 }
 
 export function buildConversationRecordTurns(record, pendingUserMessage = null) {
+  return buildConversationRecordTimeline(record, pendingUserMessage).turns;
+}
+
+export function buildConversationRecordTimeline(record, pendingUserMessage = null) {
   const current = createConversationRecord(record);
   const allPayloadRows = current.payload
     ? buildCanonicalConversationView(current.payload, current.terminal || current.payload.current_node)
@@ -2554,7 +2559,11 @@ export function buildConversationRecordTurns(record, pendingUserMessage = null) 
   }
 
   for (const turn of turns) sortTurnReplies(turn);
-  return turns.filter((turn) => turn.user || turn.replies.length);
+  const populated = turns.filter((turn) => turn.user || turn.replies.length);
+  return {
+    turns: populated.filter((turn) => Boolean(turn.user)),
+    unresolved: populated.filter((turn) => !turn.user),
+  };
 }
 
 function groupObservationsByMessageId(observations) {

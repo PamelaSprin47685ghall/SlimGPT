@@ -3,6 +3,7 @@
 
   let {
     turns = [],
+    unresolvedCount = 0,
     activeIndex = 0,
     onSelect = () => {},
   } = $props();
@@ -39,14 +40,16 @@
   <header class="overview-header">
     <div>
       <strong>消息概览</strong>
-      <span>问答轮次</span>
+      <span>{unresolvedCount ? `问答轮次 · ${unresolvedCount} 条未归属输出` : '问答轮次'}</span>
     </div>
     <span class="overview-count">{turns.length}</span>
   </header>
 
   <div class="overview-list" bind:this={listEl}>
     {#if turns.length === 0}
-      <div class="overview-empty">当前对话暂无问答</div>
+      <div class="overview-empty">
+        {unresolvedCount ? '当前只有未归属输出；未创建问答页' : '当前对话暂无问答'}
+      </div>
     {:else}
       {#each turns as turn, index (turn.id || index)}
         <button
