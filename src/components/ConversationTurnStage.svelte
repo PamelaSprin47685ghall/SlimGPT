@@ -66,11 +66,15 @@
     }
     const conversationChanged = key !== previousKey;
     const appendedTurn = !conversationChanged && count > previousTurnCount;
-    if (appendedTurn && tailPinned && index !== count - 1) {
+    if (appendedTurn && index !== count - 1) {
       pendingEdge = 'end';
+      tailPinned = true;
       previousTurnCount = count;
       onActiveChange(count - 1);
       return;
+    }
+    if (appendedTurn) {
+      tailPinned = true;
     }
     const edge = conversationChanged ? 'start' : pendingEdge;
     previousKey = key;
@@ -145,21 +149,15 @@
   }
 
   // Runway honesty: a ready-but-idle overlay must never freeze over content.
-  // ~180ms after the last wheel/touch/key nudge with no further activity, a
-  // ready runway auto-commits the turn change; an unready one decays away.
-  function scheduleBoundarySettle() {
+  // An unready or idle runway decays away. Commits require an explicit follow-up nudge (delta >= 36).
+  function scheduleBoundarySettle(delay = 180) {
     cancelBoundarySettle();
     boundarySettleTimer = setTimeout(() => {
       boundarySettleTimer = null;
       if (!boundaryDirection) return;
       const direction = boundaryDirection;
-      if (boundaryReady && canAdvance(direction)) {
-        resetBoundaryRunway();
-        advance(direction);
-      } else {
-        resetBoundaryRunway();
-      }
-    }, 180);
+      resetBoundaryRunway();
+    }, delay);
   }
 
   function prefersReducedMotion() {
@@ -175,7 +173,7 @@
     return -direction * Math.pow(boundaryProgress, 0.85) * Math.min(180, scroller.clientHeight * 0.25);
   }
 
-  function pushBoundary(direction, amount) {
+  function pushBoundary(direction, amount, settleDelay = 180) {
     if (!scroller || !canAdvance(direction)) {
       resetBoundaryRunway();
       return false;
@@ -190,7 +188,7 @@
       boundaryReady = boundaryProgress >= 1;
       boundaryCommitDelta = 0;
       if (boundaryProgress <= 0.001) resetBoundaryRunway();
-      else scheduleBoundarySettle();
+      else scheduleBoundarySettle(settleDelay);
       return true;
     }
 
@@ -200,7 +198,7 @@
       boundaryOffsetPx = runwayOffset(direction);
       boundaryReady = boundaryProgress >= 1;
       boundaryCommitDelta = 0;
-      scheduleBoundarySettle();
+      scheduleBoundarySettle(settleDelay);
       return true;
     }
 
@@ -209,7 +207,7 @@
       resetBoundaryRunway();
       advance(direction);
     } else {
-      scheduleBoundarySettle();
+      scheduleBoundarySettle(settleDelay);
     }
     return true;
   }
@@ -312,12 +310,41 @@
 
   function handleKeydown(event) {
     if (!hasRenderableContent || !scroller || isEditableTarget(event.target)) return;
+    if (event.target?.closest?.('.conversation-sidebar, .message-overview, .composer-shell, .desktop-chat-header, .mobile-navbar')) {
+      return;
+    }
+    if ((event.ctrlKey || event.metaKey) && (event.key === 'Home' || event.key === 'End')) {
+      event.preventDefault();
+      cancelEdgeSettle();
+      resetBoundaryRunway();
+      const targetIndex = event.key === 'Home' ? 0 : turns.length - 1;
+      if (targetIndex !== activeIndex) {
+        pendingEdge = event.key === 'Home' ? 'start' : 'end';
+        if (event.key === 'Home') tailPinned = false;
+        else tailPinned = true;
+        onActiveChange(targetIndex);
+      } else {
+        scroller.scrollTop = event.key === 'Home'
+          ? 0
+          : Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+        if (event.key === 'Home') tailPinned = false;
+        updateTailPinned();
+      }
+      return;
+    }
     if (event.altKey || event.ctrlKey || event.metaKey) return;
 
     if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
-      // Horizontal arrows still page turns from inside pre/.table-wrap: only a
-      // real text selection or Shift (selection extension) keeps native behavior.
       if (event.shiftKey || selectionActive()) return;
+      const horizontalScrollable = event.target?.closest?.('pre, .table-wrap, .math-block');
+      if (horizontalScrollable) {
+        const { scrollLeft, scrollWidth, clientWidth } = horizontalScrollable;
+        if (scrollWidth > clientWidth + 1) {
+          const remainingRight = scrollWidth - clientWidth - scrollLeft;
+          if (event.key === 'ArrowRight' && remainingRight > 1) return;
+          if (event.key === 'ArrowLeft' && scrollLeft > 1) return;
+        }
+      }
       const direction = event.key === 'ArrowLeft' ? -1 : 1;
       if (canAdvance(direction)) {
         event.preventDefault();
@@ -340,9 +367,9 @@
     cancelEdgeSettle();
 
     if (event.key === 'Home' || event.key === 'End') {
+      event.preventDefault();
       const atTargetEdge = event.key === 'Home' ? atTop() : atBottom();
       if (!atTargetEdge) {
-        event.preventDefault();
         resetBoundaryRunway();
         if (event.key === 'Home') tailPinned = false;
         scroller.scrollTop = event.key === 'Home'
@@ -364,7 +391,7 @@
       const boundaryAmount = event.key === 'PageUp' || event.key === 'PageDown'
         ? Math.max(180, Math.ceil(scroller.clientHeight * 0.55))
         : 72;
-      pushBoundary(direction, boundaryAmount);
+      pushBoundary(direction, boundaryAmount, 360);
       return;
     }
 
@@ -405,6 +432,30 @@
     touchStartY = event.touches?.length === 1 ? event.touches[0].clientY : null;
   }
 
+  function handleTouchMove(event) {
+    if (touchStartY == null || !scroller) return;
+    if (event.touches?.length !== 1) return;
+    const currentY = event.touches[0].clientY;
+    const deltaY = currentY - touchStartY;
+    const direction = deltaY < 0 ? 1 : -1;
+    if (!canAdvance(direction)) return;
+
+    const isAtEdge = direction > 0 ? atBottom() : atTop();
+    if (!boundaryDirection && !isAtEdge) return;
+
+    const distance = Math.max(280, scroller.clientHeight * 0.7);
+    const progress = Math.min(1, Math.abs(deltaY) / distance);
+    boundaryDirection = direction;
+    boundaryProgress = progress;
+    boundaryOffsetPx = runwayOffset(direction);
+    boundaryReady = progress >= 1;
+    if (progress >= 1) {
+      boundaryCommitDelta = Math.abs(deltaY) - distance;
+    } else {
+      boundaryCommitDelta = 0;
+    }
+  }
+
   function handleTouchEnd(event) {
     if (touchStartY == null) return;
     if (event.touches?.length || event.defaultPrevented) {
@@ -414,9 +465,19 @@
     const endY = event.changedTouches?.[0]?.clientY ?? touchStartY;
     const delta = endY - touchStartY;
     touchStartY = null;
+    if (boundaryDirection && boundaryReady) {
+      const direction = boundaryDirection;
+      resetBoundaryRunway();
+      advance(direction);
+      return;
+    }
+    if (boundaryDirection) {
+      scheduleBoundarySettle(120);
+      return;
+    }
     if (Math.abs(delta) < 54) return;
     if (delta > 0) tailPinned = false;
-    if (boundaryDirection || (delta < 0 && atBottom()) || (delta > 0 && atTop())) {
+    if ((delta < 0 && atBottom()) || (delta > 0 && atTop())) {
       pushBoundary(delta < 0 ? 1 : -1, Math.abs(delta) * 1.25);
     }
   }
@@ -429,7 +490,7 @@
 
 <svelte:window onkeydown={handleKeydown} />
 
-<div class="single-message-stage conversation-turn-stage">
+<div class="single-message-stage conversation-turn-stage" class:has-jump-chips={activeTurn && (hasThought || hasTools || hasAnswer)}>
   {#if hasRenderableContent}
     <div class="single-message-position turn-stage-header-badges" aria-live="polite">
       {#if activeTurn}
@@ -501,6 +562,7 @@
       onscroll={updateTailPinned}
       onwheel={handleWheel}
       ontouchstart={handleTouchStart}
+      ontouchmove={handleTouchMove}
       ontouchend={handleTouchEnd}
       role="region"
       aria-label={activeTurn ? `问答 ${activeIndex + 1} / ${turns.length}` : '对话关系同步未完成'}

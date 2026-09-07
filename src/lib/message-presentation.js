@@ -40,7 +40,8 @@ export function shouldSubmitOnEnter(event, composing = false) {
   const isComp = typeof composing === 'function'
     ? composing()
     : Boolean(composing?.isComposing ?? composing);
-  return event?.key === 'Enter' && !event.shiftKey && !event.isComposing &&
+  // altKey (Option on macOS) requests a newline, never a submit.
+  return event?.key === 'Enter' && !event.shiftKey && !event.altKey && !event.isComposing &&
     event.keyCode !== 229 && !isComp;
 }
 

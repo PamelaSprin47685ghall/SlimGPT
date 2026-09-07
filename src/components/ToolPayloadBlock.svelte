@@ -1,6 +1,6 @@
 <script>
   import { onDestroy, onMount } from 'svelte';
-  import { extractToolCallIds, loadToolFormatter, presentToolPayload } from '../lib/tool-presentation.js';
+  import { extractToolCallIds, extractToolKeyArg, loadToolFormatter, presentToolPayload } from '../lib/tool-presentation.js';
   import { copyText } from '../lib/clipboard.js';
 
   let { tool, streaming = false, isError = false } = $props();
@@ -8,7 +8,7 @@
   let manualOpen = $state(false);
   let copied = $state(false);
   let copyError = $state(false);
-  let copiedId = $state(false);
+  let copiedCallId = $state('');
   let rawMode = $state(false);
   let formatter = $state.raw(null);
   let loadFailed = $state(false);
@@ -21,7 +21,7 @@
   const callIds = $derived(extractToolCallIds(tool));
 
   // When streaming prop is explicitly provided (boolean), follow streaming. Otherwise default to true (expanded).
-  let isOpen = $state(true);
+  let isOpen = $state(typeof streaming === 'boolean' ? streaming : true);
 
   function toggleOpen() {
     manualOpen = !isOpen;
@@ -37,35 +37,15 @@
   });
 
   const toolName = $derived(tool?.name || 'tool');
+  const isRunning = $derived(Boolean(streaming || tool?.status === 'in_progress'));
   const isSuccess = $derived(!isError && tool?.status !== 'failed');
-  const summaryStatus = $derived(isSuccess ? '✓' : '✗');
-
-  const keyArg = $derived.by(() => {
-    const payload = tool?.payload;
-    if (!payload) return '';
-    if (typeof payload === 'string') {
-      try {
-        const parsed = JSON.parse(payload);
-        if (typeof parsed === 'object' && parsed !== null) {
-          return extractKeyFromObject(parsed);
-        }
-      } catch {
-        return payload.slice(0, 40).replace(/\s+/g, ' ').trim();
-      }
-    } else if (typeof payload === 'object') {
-      return extractKeyFromObject(payload);
-    }
-    return '';
+  const summaryStatus = $derived.by(() => {
+    if (isRunning) return '⋯';
+    if (isError || tool?.status === 'failed') return '✗';
+    return '✓';
   });
 
-  function extractKeyFromObject(obj) {
-    for (const key of ['query', 'q', 'url', 'search_query', 'command', 'action', 'prompt', 'code']) {
-      if (typeof obj[key] === 'string' && obj[key].trim()) return `${key}: ${obj[key].trim()}`;
-    }
-    const firstKey = Object.keys(obj)[0];
-    if (firstKey && typeof obj[firstKey] === 'string') return `${firstKey}: ${obj[firstKey].trim()}`;
-    return '';
-  }
+  const keyArg = $derived(extractToolKeyArg(tool?.payload, tool));
 
   onMount(() => {
     loadToolFormatter().then((module) => { if (alive) formatter = module; })
@@ -112,20 +92,20 @@
     try {
       await copyText(id);
       if (!alive) return;
-      copiedId = true;
+      copiedCallId = id;
     } catch {
       if (!alive) return;
-      copiedId = false;
+      copiedCallId = '';
     }
     clearTimeout(idCopyTimer);
-    idCopyTimer = setTimeout(() => { copiedId = false; }, 2400);
+    idCopyTimer = setTimeout(() => { copiedCallId = ''; }, 2400);
   }
 </script>
 
 <div class="tool-payload-block" data-tool-kind={tool?.kind || ''} class:collapsed={!isOpen}>
   <div class="tool-summary-bar">
     <button type="button" class="tool-summary-toggle" onclick={toggleOpen} aria-expanded={isOpen}>
-      <span class="tool-summary-status" class:is-error={!isSuccess}>{summaryStatus}</span>
+      <span class="tool-summary-status" class:is-running={isRunning} class:is-error={!isRunning && !isSuccess}>{summaryStatus}</span>
       <span class="tool-summary-name">{toolName}</span>
       {#if keyArg}
         <span class="tool-summary-arg" title={keyArg}>{keyArg}</span>
@@ -144,17 +124,15 @@
           <button
             type="button"
             class="tool-call-id-btn"
+            class:copied={copiedCallId === id}
             onclick={() => copyCallId(id)}
             title={`点击复制调用标识：${id}`}
-            aria-label={`复制调用标识 ${id}`}
+            aria-label={copiedCallId === id ? `已复制调用标识 ${id}` : `复制调用标识 ${id}`}
           >
             <span class="tool-call-id-label">ID:</span>
-            <span class="tool-call-id-val">{id}</span>
+            <span class="tool-call-id-val">{copiedCallId === id ? '已复制' : id}</span>
           </button>
         {/each}
-        {#if copiedId}
-          <span class="tool-id-copied-tip">已复制 ID</span>
-        {/if}
       </div>
     {/if}
     <div class="tool-code-actions">
@@ -208,6 +186,7 @@
   }
   .tool-summary-status { font-weight: 700; color: #22735e; }
   .tool-summary-status.is-error { color: var(--slim-danger); }
+  .tool-summary-status.is-running { color: var(--f7-theme-color); font-weight: 700; letter-spacing: -0.05em; }
   .tool-summary-name { font-weight: 600; font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   .tool-summary-arg { font-size: 10.5px; color: var(--slim-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: min(50vw, 400px); }
   .tool-summary-toggle-text { margin-left: auto; font-size: 10px; color: var(--slim-muted); flex: none; }
@@ -233,7 +212,7 @@
     white-space: nowrap;
     transition: color 0.15s ease, border-color 0.15s ease;
   }
-  .tool-call-id-btn:hover { color: var(--f7-theme-color); border-color: var(--f7-theme-color); }
+  .tool-call-id-btn:hover, .tool-call-id-btn.copied { color: var(--f7-theme-color); border-color: var(--f7-theme-color); }
   .tool-call-id-label { opacity: 0.65; flex: none; }
   .tool-call-id-val { overflow: hidden; text-overflow: ellipsis; }
   .tool-id-copied-tip { font-size: 9.5px; color: var(--f7-theme-color); flex: none; }

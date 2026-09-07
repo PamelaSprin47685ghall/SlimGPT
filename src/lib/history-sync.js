@@ -25,6 +25,19 @@ export function isHistorySyncRetryable(state) {
   return state.status !== 401 && state.status !== 403;
 }
 
+export function historySyncPillLabel(state, transactionError = null) {
+  if (transactionError) return '分页缺失';
+  if (!state) return '';
+  if (state.state === 'loading') return '正在同步…';
+  if (state.state === 'complete') return '历史已同步';
+  if (state.state !== 'error') return '';
+  if (state.status === 401 || state.status === 403) return '需重新登录';
+  if (state.status === 429 || state.code === 'backoff' || state.code === 'rate-limit' || state.code === 'rate_limit') return '请求受限';
+  if (state.code === 'timeout' || state.status === 408 || state.status === 504) return '同步超时';
+  if (typeof state.status === 'number' && state.status >= 500) return '服务异常';
+  return '同步异常';
+}
+
 export function historySyncStatusLabel(state, transactionError = null) {
   if (transactionError) return '分页缺失';
   if (!state) return '';

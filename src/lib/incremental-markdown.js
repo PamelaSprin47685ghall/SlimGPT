@@ -124,7 +124,9 @@ function createParser(root) {
         } else if (node.getAttribute('title') && node.getAttribute('href')) {
           try {
             const u = new URL(node.getAttribute('href'));
-            node.setAttribute('title', `${node.getAttribute('title')} (${u.hostname})`);
+            if (!node.getAttribute('title').includes(`(${u.hostname})`)) {
+              node.setAttribute('title', `${node.getAttribute('title')} (${u.hostname})`);
+            }
           } catch {}
         }
       }
@@ -197,7 +199,14 @@ function setSafeAttribute(data, type, value) {
       node.removeAttribute('href');
       node.classList.add('link-sanitized');
       node.tabIndex = 0;
-      node.setAttribute('title', '已拦截不安全或不受支持的链接协议');
+      node.setAttribute('title', '已拦截不安全或不受支持的链接协议 [已拦截]');
+      if (!node.querySelector('.link-sanitized-badge')) {
+        const badge = document.createElement('span');
+        badge.className = 'link-sanitized-badge';
+        badge.textContent = ' [已拦截]';
+        badge.setAttribute('aria-hidden', 'true');
+        node.appendChild(badge);
+      }
     }
     if (url && destination.title) node.setAttribute('title', destination.title);
     else if (url) node.removeAttribute('title');
@@ -301,6 +310,11 @@ function wrapTable(table) {
 function renderMath(node, displayMode) {
   const replacement = document.createElement(displayMode ? 'div' : 'span');
   replacement.className = displayMode ? 'math-block' : 'math-inline';
+  if (displayMode) {
+    replacement.tabIndex = 0;
+    replacement.setAttribute('role', 'region');
+    replacement.setAttribute('aria-label', '数学公式，可水平滚动');
+  }
   const expression = String(node.textContent || '').trim();
   replacement.textContent = expression;
   node.replaceWith(replacement);

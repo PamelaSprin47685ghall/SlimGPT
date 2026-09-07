@@ -37,6 +37,19 @@ function messageSection(message, level = 2) {
   if (message.role === 'assistant' && message.model) {
     parts.push(`> 模型：${heading(message.model)}`);
   }
+  const rawTime = message.createTime ?? message.create_time ?? message.timestamp;
+  if (rawTime != null && rawTime !== '') {
+    const date = typeof rawTime === 'number'
+      ? new Date(rawTime < 10_000_000_000 ? rawTime * 1000 : rawTime)
+      : new Date(rawTime);
+    if (!Number.isNaN(date.getTime())) {
+      parts.push(`> 时间：${date.toISOString()}`);
+    }
+  }
+  if ((message.siblingCount || 0) > 1) {
+    const branchIndex = typeof message.siblingIndex === 'number' ? message.siblingIndex + 1 : 1;
+    parts.push(`> 分支：第 ${branchIndex} / ${message.siblingCount} 个分支`);
+  }
   if (message.error || /^(?:failed|error)$/.test(message.status || '')) parts.push('> 生成异常。');
   else if (/^(?:cancelled|canceled|interrupted|incomplete|aborted|stopped)$/.test(message.status || '')) parts.push('> 此项生成已中断或未完成。');
   if (message.cacheRedacted) parts.push('> 此项来自本地缓存，其中的凭据字段已省略。');
@@ -78,6 +91,7 @@ export function buildConversationMarkdown(title, messages = [], options = {}) {
   const footerLines = [];
   footerLines.push(`导出时间: ${new Date().toISOString()}`);
   if (options.conversationId) footerLines.push(`会话标识: ${options.conversationId}`);
+  if (options.model) footerLines.push(`模型: ${options.model}`);
   if (options.createTime) footerLines.push(`创建时间: ${options.createTime}`);
   if (options.updateTime) footerLines.push(`更新时间: ${options.updateTime}`);
   if (options.historyComplete === false) {

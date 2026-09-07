@@ -20,6 +20,14 @@ export function nestedScrollerCanConsume(target, boundary, delta, styleOf = glob
       typeof clientHeight === 'number' &&
       scrollHeight > clientHeight + 1
     ) {
+      if (
+        node?.classList?.contains?.('table-wrap') &&
+        typeof node.scrollWidth === 'number' &&
+        typeof node.clientWidth === 'number' &&
+        node.scrollWidth > node.clientWidth + 1
+      ) {
+        return false;
+      }
       let scrollable = hasKnownVerticalScrollAffordance(node);
       if (!scrollable) {
         try {

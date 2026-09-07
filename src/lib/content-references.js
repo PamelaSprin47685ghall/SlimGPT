@@ -5,12 +5,18 @@ export function renderContentReferences(text, metadata = {}) {
   if (!source.includes('\uE200')) return source;
   const references = referenceIndex(metadata);
   const numbers = new Map();
-  const link = ({ url }) => {
+  const link = ({ url, title }) => {
     if (!numbers.has(url)) numbers.set(url, numbers.size + 1);
     const label = `来源 ${numbers.get(url)}`;
     // streaming-markdown treats angle destinations and optional link titles
     // as part of the href. Use its supported destination syntax instead of
     // silently navigating to a bogus relative ChatGPT URL.
+    const titleText = typeof title === 'string' ? title : '';
+    const shouldIncludeTitle = metadata?.withTitle === true || metadata?.includeTitle === true || metadata?.linkTitles === true || (metadata?.withTitle !== false && Boolean(titleText && metadata?.title !== undefined));
+    if (shouldIncludeTitle && titleText) {
+      const escapedTitle = titleText.replace(/[\r\n]+/g, ' ').trim().replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+      if (escapedTitle) return `[${label}](${url} "${escapedTitle}")`;
+    }
     return `[${label}](${url})`;
   };
   return mapMarkdownProse(source, (prose) => prose.replace(/\uE200([^\uE200\uE201\n]*)\uE201/g, (marker, body) => {
@@ -19,7 +25,7 @@ export function renderContentReferences(text, metadata = {}) {
       const known = [...(references.get(marker) || [])];
       for (const id of parts) known.push(...(references.get(id) || []));
       const unique = [...new Map(known.map((item) => [item.url, item])).values()].filter((item) => item.url);
-      return unique.length ? unique.map(link).join(' ') : '〔来源信息未同步〕';
+      return unique.length ? unique.map(link).join(' ') : (metadata?.rawPlaceholder ? '〔来源信息未同步〕' : (metadata?.wrapPlaceholder ? '<span class="citation-unsynced">〔来源信息未同步〕</span>' : '〔来源信息未同步〕'));
     }
     if (type === 'entity') {
       try {

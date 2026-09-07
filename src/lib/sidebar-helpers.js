@@ -81,6 +81,14 @@ export function formatSidebarTime(value, now = new Date()) {
   if (isSameDay) {
     return timeFormatter.format(date);
   }
+  const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+  const isYesterday =
+    date.getFullYear() === yesterday.getFullYear() &&
+    date.getMonth() === yesterday.getMonth() &&
+    date.getDate() === yesterday.getDate();
+  if (isYesterday) {
+    return '昨天';
+  }
 
   // Older: month/day/weekday (with year if different year)
   const isSameYear = date.getFullYear() === now.getFullYear();
@@ -97,13 +105,17 @@ export function fullSidebarDateTime(value) {
 
 export function filterConversations(conversations = [], query = '', limit = 100) {
   const needle = String(query || '').trim().toLocaleLowerCase();
-  const matched = !needle
-    ? conversations
-    : conversations.filter((item) => {
-        const titleMatch = String(item?.title || '').toLocaleLowerCase().includes(needle);
-        const snippetMatch = String(item?.last || '').toLocaleLowerCase().includes(needle);
-        return titleMatch || snippetMatch;
-      });
+  if (!needle) {
+    const visible = conversations.slice(0, limit);
+    return { needle: '', total: conversations.length, visible, isCapped: conversations.length > limit };
+  }
+  const tokens = needle.split(/\s+/).filter(Boolean);
+  const matched = conversations.filter((item) => {
+    const title = String(item?.title || '').toLocaleLowerCase();
+    const snippet = String(item?.last || '').toLocaleLowerCase();
+    const combined = `${title} ${snippet}`;
+    return tokens.every((token) => combined.includes(token));
+  });
   const visible = matched.slice(0, limit);
   return {
     needle,

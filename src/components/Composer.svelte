@@ -1,6 +1,5 @@
 <script>
   import { Button, Segmented } from 'framework7-svelte';
-  import { tick } from 'svelte';
   import { THINKING_LEVELS } from '../lib/storage.js';
   import { shouldSubmitOnEnter, createImeTracker } from '../lib/message-presentation.js';
 
@@ -15,15 +14,20 @@
     error = false,
     onThinkingLevelChange = () => {},
     onSend = () => {},
+    onStop = () => {},
   } = $props();
 
   let textareaEl = $state(null);
   let dismissedStatus = $state(null);
+  // Local refusal notice: status/error are parent-owned one-way props and
+  // must never be mutated from here.
+  let localNotice = $state('');
+  let localNoticeTimer = null;
   const ime = createImeTracker();
   const MIN_HEIGHT = 34;
   const MAX_HEIGHT = 160;
 
-  const canSubmit = $derived(!disabled && !loading && !busy && Boolean(value.trim()));
+  const canSubmit = $derived(!disabled && !loading && !busy && !generating && Boolean(value.trim()));
 
   const currentLevelObj = $derived(
     THINKING_LEVELS.find((item) => item.level === thinkingLevel) || THINKING_LEVELS[1]
@@ -35,14 +39,20 @@
     adjustHeight();
   });
 
-  async function adjustHeight() {
-    await tick();
+  // Runs synchronously: the $effect above and oninput both fire after the DOM
+  // already reflects the current value. Only writes style when it changed.
+  function adjustHeight() {
     if (!textareaEl) return;
+    const prevHeight = textareaEl.style.height;
+    const prevOverflow = textareaEl.style.overflowY;
     textareaEl.style.height = 'auto';
     const contentHeight = textareaEl.scrollHeight;
-    const newHeight = Math.min(MAX_HEIGHT, Math.max(MIN_HEIGHT, contentHeight));
-    textareaEl.style.height = `${newHeight}px`;
-    textareaEl.style.overflowY = contentHeight > MAX_HEIGHT ? 'auto' : 'hidden';
+    const nextHeight = `${Math.min(MAX_HEIGHT, Math.max(MIN_HEIGHT, contentHeight))}px`;
+    const nextOverflow = contentHeight > MAX_HEIGHT ? 'auto' : 'hidden';
+    // Restoring an identical value is a no-op for layout; a differing value
+    // is the only real write.
+    textareaEl.style.height = nextHeight !== prevHeight ? nextHeight : prevHeight;
+    if (nextOverflow !== prevOverflow) textareaEl.style.overflowY = nextOverflow;
   }
 
   export function focus() {
@@ -52,8 +62,17 @@
   }
 
   function submit() {
+    if (generating) {
+      showLocalNotice('正在生成回答，请稍候…');
+      return;
+    }
+    if (busy) {
+      showLocalNotice('正在提交上一条消息，请稍候…');
+      return;
+    }
     const message = value.trim();
-    if (!message || disabled || loading || busy) return;
+    if (!message || disabled || loading) return;
+    clearLocalNotice();
     onSend(message, {
       thinkingLevel,
       reasoningEffort: currentLevelObj.effort,
@@ -64,8 +83,12 @@
   function onKeydown(event) {
     if (shouldSubmitOnEnter(event, ime)) {
       event.preventDefault();
+      if (generating) {
+        showLocalNotice('正在生成回答，请稍候…');
+        return;
+      }
       if (busy) {
-        onSendRefused('正在提交上一条消息，请稍候…');
+        showLocalNotice('正在提交上一条消息，请稍候…');
         return;
       }
       if (canSubmit) {
@@ -107,11 +130,24 @@
     return ['即时', '标准', '深入', '专家', 'Pro'][level - 1] || '';
   }
 
-  function onSendRefused(message) {
-    dismissedStatus = null;
-    // Status honesty
-    status = message;
-    error = true;
+  function showLocalNotice(message) {
+    localNotice = message;
+    clearTimeout(localNoticeTimer);
+    localNoticeTimer = setTimeout(() => {
+      if (localNotice === message) localNotice = '';
+    }, 4000);
+  }
+
+  function clearLocalNotice() {
+    localNotice = '';
+    clearTimeout(localNoticeTimer);
+    localNoticeTimer = null;
+  }
+
+  function onTextareaInput() {
+    // Typing dismisses the transient refusal notice and any faded status.
+    clearLocalNotice();
+    adjustHeight();
   }
 </script>
 
@@ -157,9 +193,15 @@
         {status}
       </div>
     {/if}
-    <!-- Always provide .composer-status element if status is present or for querySelector test compatibility -->
+    {#if localNotice}
+      <div class="composer-status local-notice" role="status" title={localNotice}>
+        {localNotice}
+      </div>
+    {/if}
+    <!-- Query-compat mirror of the error alert: the alert announces once, so
+      this shim stays hidden from assistive tech (no live role). -->
     {#if error && status && dismissedStatus !== status}
-      <div class="composer-status error sr-only" role="status" aria-live="polite" title={status}>{status}</div>
+      <div class="composer-status error sr-only" aria-hidden="true" title={status}>{status}</div>
     {/if}
   </div>
 
@@ -184,7 +226,7 @@
       onkeyup={(e) => ime.onKeyup(e)}
       oncompositionstart={() => ime.onCompositionStart()}
       oncompositionend={() => ime.onCompositionEnd()}
-      oninput={adjustHeight}
+      oninput={onTextareaInput}
       disabled={disabled || loading}
       readonly={busy}
       aria-busy={busy || generating}
@@ -207,6 +249,15 @@
       onClick={submit}
       aria-label="发送"
     >↑</Button>
+    {#if generating}
+      <Button
+        class="stop-button"
+        outline
+        round
+        onClick={onStop}
+        aria-label="停止回答"
+      >■ 停止回答</Button>
+    {/if}
   </div>
   <div class="composer-hint">Enter 发送 · Shift+Enter 换行 · 失败不会自动重发</div>
 </div>

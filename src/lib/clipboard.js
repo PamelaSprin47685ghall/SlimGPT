@@ -29,13 +29,20 @@ export async function copyText(value, environment = globalThis) {
     : null;
   const textarea = document.createElement('textarea');
   textarea.value = text;
-  textarea.readOnly = true;
+  // iOS Safari refuses to copy from a readonly textarea; keep it editable but
+  // off-screen, and use setSelectionRange so the selection is real.
+  textarea.readOnly = false;
   textarea.style.cssText = 'position:fixed;left:-10000px;top:0;opacity:0;pointer-events:none';
   textarea.setAttribute('aria-hidden', 'true');
   document.body.appendChild(textarea);
   try {
     textarea.focus({ preventScroll: true });
-    textarea.select();
+    try {
+      textarea.setSelectionRange(0, textarea.value.length);
+    } catch {}
+    try {
+      textarea.select();
+    } catch {}
     let success = false;
     try {
       success = Boolean(document.execCommand('copy'));

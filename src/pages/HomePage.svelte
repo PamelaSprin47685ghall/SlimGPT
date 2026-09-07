@@ -11,6 +11,7 @@
   import { matchesPendingTurn } from '../lib/pending-turn.js';
   import { prioritizeBanners, createStalenessTracker, trapModalKeydown, getScrimAriaLabel } from '../lib/shell-helpers.js';
   import { downloadConversationMarkdown, hasExportableMessage } from '../lib/export.js';
+  import { isTerminalMessage } from '../lib/message-presentation.js';
   import {
     loadConversationIndex,
     loadObservationLedgerState,
@@ -119,6 +120,7 @@
 
   const conversations = $derived([...conversationMap.values()]);
   const currentRecord = $derived(currentConversationId ? conversationRecords.get(currentConversationId) || null : null);
+  const isViewingAlternativeBranch = $derived(Boolean(currentPayload && currentConversationId && currentRecord?.terminal && currentPayload?.current_node && currentRecord.terminal !== currentPayload.current_node));
   const cacheNotice = $derived(cacheOmissions.get(currentConversationId) || cacheOmissions.get('*') || null);
   const currentPayload = $derived(currentRecord?.payload || null);
   const currentHasRenderableContent = $derived(Boolean(
@@ -173,6 +175,11 @@
       ? 'starting'
       : (currentConversationId ? (workStates.get(currentConversationId) || 'unknown') : newChatWorkState)
   );
+  const hasActiveLiveGeneration = $derived.by(() => {
+    const live = currentRecord?.observations || [];
+    const last = [...live].reverse().find((m) => m?.role !== 'user');
+    return Boolean(last && !isTerminalMessage(last));
+  });
   const conversationWorkLabel = $derived(workStateLabel(conversationWorkState));
   const conversationActivelyWorking = $derived(conversationWorkState === 'running' || conversationWorkState === 'starting');
   const conversationThinkingDepth = $derived.by(() => {
@@ -257,6 +264,21 @@
       }
       const isEditing = event.target?.closest?.('input, textarea, [contenteditable="true"]');
       if (isEditing) return;
+      if ((event.metaKey || event.ctrlKey) && event.shiftKey && (event.key === 'O' || event.key === 'o')) {
+        event.preventDefault();
+        newChat();
+        return;
+      }
+      if ((event.metaKey || event.ctrlKey) && (event.key === 'K' || event.key === 'k')) {
+        event.preventDefault();
+        if (compactLayout && mobilePanel !== 'sidebar') {
+          toggleSidebar();
+        }
+        queueMicrotask(() => {
+          document.querySelector('.conversation-search input')?.focus?.();
+        });
+        return;
+      }
       if ((event.key === '?' || (event.key === '/' && (event.metaKey || event.ctrlKey)))) {
         event.preventDefault();
         if (showShortcutsModal) closeShortcutsModal(); else openShortcutsModal();
@@ -301,6 +323,14 @@
     } catch {
       setComposerStatus('无法读取本地会话索引；当前聊天仍可正常使用', true);
     }
+  }
+
+  function resetToLatestBranch() {
+    if (!currentPayload || !currentConversationId) return;
+    const next = new Map(conversationRecords);
+    next.set(currentConversationId, setConversationRecordTerminal(next.get(currentConversationId), currentPayload.current_node));
+    conversationRecords = next;
+    setComposerStatus('已回到最新分支');
   }
 
   async function restoreObservationLedger() {
@@ -427,6 +457,9 @@
     }
     else if (message.type === 'takeover-state') {
       status = { ...status, takeover: message.active };
+      if (message.active) {
+        queueMicrotask(focusComposer);
+      }
     }
     else if (message.type === 'page-execution-state') {
       applyExecutionState(message);
@@ -1010,6 +1043,9 @@
     newChatWorkState = 'unknown';
     finishConversationLoading();
     pendingUser = null;
+    // Always empty, even when already on the null conversation: the
+    // debounced draft effect only persists on change, so clear directly.
+    draft = '';
     draftsByConversation.set(null, '');
     clearPendingLiveEvents();
     closeMobilePanels();
@@ -1152,6 +1188,12 @@
       setComposerStatus('当前正在只读查看其他分支；请切回最新分支，或在官方界面继续该分支', true);
       return;
     }
+    if (conversationWorkState === 'running' && hasActiveLiveGeneration) {
+      // Refuse locally: dispatching here would ride the send watchdog and
+      // mark a message failed that was never actually submitted.
+      setComposerStatus('正在生成回答，请稍候…');
+      return;
+    }
     if (sendInFlight) {
       setComposerStatus('上一条消息仍在提交；SlimGPT 不会重复发送', true);
       return;
@@ -1272,12 +1314,58 @@
   }
 
   function handleRetrySend(targetMessage) {
-    const textToRetry = targetMessage?.text || pendingUser?.text || '';
+    // Assistant/tool retries resend the turn's USER text, never assistant
+    // output. User/pending retries keep the message's own text.
+    let textToRetry = '';
+    if (!targetMessage || targetMessage?.role === 'user' || targetMessage?.pending || targetMessage?.failed) {
+      textToRetry = targetMessage?.text || pendingUser?.text || '';
+    } else {
+      const groups = [...turns, ...unresolvedTurns];
+      const owner = groups.find((group) => (group?.replies || []).some((reply) =>
+        reply === targetMessage || messageIdentityMatches(reply, targetMessage)));
+      textToRetry = owner?.user?.text || '';
+      if (!textToRetry) return;
+    }
     if (!textToRetry) return;
     if (pendingUser) {
       pendingUser = null;
     }
     sendMessage(textToRetry);
+  }
+
+  function messageIdentityMatches(a, b) {
+    if (!a || !b) return false;
+    for (const key of ['id', 'nodeId', 'itemId', 'observationKey']) {
+      const left = a[key];
+      const right = b[key];
+      if (left && right && String(left) === String(right)) return true;
+    }
+    return false;
+  }
+
+  function handleEditMessage(message) {
+    // onEdit only fires for user-role messages (MessageBubble renders the
+    // edit button on user bubbles, including the failed pending card).
+    const text = String(message?.text || '');
+    if (!text) return;
+    if (
+      pendingUser?.failed &&
+      (message?.failed || message?.text === pendingUser.text ||
+        (message?.id && message.id === pendingUser.message?.id))
+    ) {
+      pendingUser = null;
+    }
+    draft = text;
+    draftsByConversation.set(currentConversationId, text);
+    queueMicrotask(focusComposer);
+  }
+
+  function handleStopGeneration() {
+    if (conversationWorkState !== 'running') return;
+    transport.stopGeneration();
+    // A missing official stop control reports back as a command-error and
+    // overwrites this optimistic notice; success flips the work state.
+    setComposerStatus('正在请求停止生成…');
   }
 
   function handleDismissPendingUser() {
@@ -1395,10 +1483,65 @@
     else setComposerStatus('已回到最新分支');
   }
 
+  const DRAFT_STORAGE_KEY = 'slimgpt-drafts-v1';
+  let composerStatusTimer = null;
+  let draftPersistTimer = null;
+
   function setComposerStatus(text, error = false) {
     composerStatus = text;
     composerError = error;
+    clearTimeout(composerStatusTimer);
+    composerStatusTimer = null;
+    if (text && !error) {
+      // Transient confirmations fade on their own; errors stay until dismissed.
+      const snapshot = text;
+      composerStatusTimer = setTimeout(() => {
+        if (composerStatus === snapshot && !composerError) composerStatus = '';
+      }, 4000);
+    }
   }
+
+  function persistDraftsSoon(snapshot, key) {
+    clearTimeout(draftPersistTimer);
+    draftPersistTimer = setTimeout(() => {
+      try {
+        draftsByConversation.set(key, snapshot);
+        const entries = [...draftsByConversation.entries()].map(([entryKey, value]) => [
+          entryKey === null || entryKey === undefined ? '\0' : String(entryKey),
+          String(value || ''),
+        ]);
+        sessionStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(entries));
+      } catch {}
+    }, 300);
+  }
+
+  function restoreDrafts() {
+    try {
+      const raw = sessionStorage.getItem(DRAFT_STORAGE_KEY);
+      if (!raw) return;
+      const entries = JSON.parse(raw);
+      if (!Array.isArray(entries)) return;
+      for (const [key, value] of entries) {
+        if (typeof value !== 'string') continue;
+        draftsByConversation.set(key === '\0' ? null : String(key), value);
+      }
+      const restored = draftsByConversation.get(currentConversationId);
+      if (typeof restored === 'string' && restored) draft = restored;
+    } catch {}
+  }
+
+  onMount(() => {
+    restoreDrafts();
+  });
+
+  $effect(() => {
+    // Drafts persist (debounced) and the next keystroke clears a transient
+    // non-error status. Reading composerStatus here only ever clears it.
+    const snapshot = draft;
+    const key = currentConversationId;
+    persistDraftsSoon(snapshot, key);
+    if (snapshot && composerStatus && !composerError) composerStatus = '';
+  });
 
   function schedulePersist() {
     if (persistInFlight) {
@@ -1650,10 +1793,16 @@
     <NavRight>
       <button
         type="button"
+        class="button button-small mobile-shortcuts-button"
+        title="快捷键指南"
+        onclick={(event) => openShortcutsModal(event.currentTarget)}
+      >快捷键</button>
+      <button
+        type="button"
         class="button button-small mobile-official-button"
-        title="暂时切换至官方页面（可点击宿主页面右下角的 SlimGPT 浮动按钮随时返回）"
+        title="查看官方界面（可点击宿主页面右下角的 SlimGPT 浮动按钮随时返回）"
         onclick={() => transport.openOfficial(currentConversationId)}
-      >官方</button>
+      >官方界面</button>
       <button
         type="button"
         class="button button-small mobile-overview-button"
@@ -1673,6 +1822,8 @@
       class:open={compactLayout && mobilePanel === 'sidebar'}
       class="sidebar-host"
       hidden={compactLayout && mobilePanel !== 'sidebar'}
+      tabindex="-1"
+      onkeydown={(event) => { if (compactLayout && mobilePanel === 'sidebar') trapModalKeydown(event, event.currentTarget, closeMobilePanels); }}
     >
       <ConversationSidebar
         {conversations}
@@ -1690,6 +1841,8 @@
         {statusLabel}
         {statusState}
         {captures}
+        cachedCount={conversationRecords.size}
+        omissionCount={cacheOmissions.size}
         workState={conversationWorkState}
         onShowOfficial={() => transport.send({ type: 'open-official', conversationId: currentConversationId })}
         onExportMarkdown={exportMarkdown}
@@ -1709,7 +1862,7 @@
             <span class="work-dot" class:working={conversationActivelyWorking} aria-hidden="true"></span>
             {conversationWorkLabel}
           </span>
-          <Button small onClick={() => transport.openOfficial(currentConversationId)} title="暂时切换至官方页面（可点击宿主页面右下角的 SlimGPT 浮动按钮随时返回）">暂时显示官方界面</Button>
+          <Button small onClick={() => transport.openOfficial(currentConversationId)} title="查看官方界面（可点击宿主页面右下角的 SlimGPT 浮动按钮随时返回）">查看官方界面</Button>
           <button
             type="button"
             class="button button-small header-shortcuts-button"
@@ -1730,6 +1883,7 @@
             onActiveChange={(index) => activeTurnIndex = index}
             onBranch={stepBranch}
             onRetry={handleRetrySend}
+            onEdit={handleEditMessage}
             onDismiss={handleDismissPendingUser}
             streaming={conversationActivelyWorking}
           />
@@ -1756,21 +1910,16 @@
             <span>{conversationTimedOut ? '完整历史尚未同步；可重新点击侧栏中的该会话重试' : (currentMeta?.title || '正在同步 ChatGPT 完整会话…')}</span>
             <div class="conversation-loading-actions">
               <Button small outline disabled={!status.bridgeReady} onClick={retryHistorySync}>重试同步</Button>
-              <Button small outline onClick={() => transport.openOfficial(currentConversationId)}>在官方界面查看</Button>
+              <Button small outline onClick={() => transport.openOfficial(currentConversationId)}>查看官方界面</Button>
               <Button small outline onClick={newChat}>新建对话</Button>
             </div>
-          </div>
-        {:else if conversationHistoryPending}
-          <div class="history-sync-notice interactive" role="status" aria-live="polite">
-            {conversationTimedOut ? '完整历史同步暂未完成；当前仅显示已确认属于本轮的实时内容。' : '正在补齐完整历史；局部窗口不会被当作会话开头。'}
-            <Button small outline disabled={!status.bridgeReady} onClick={retryHistorySync}>重新同步</Button>
           </div>
         {/if}
 
         {#if activeBanners.length}
           <div class="stage-banner-stack" role="region" aria-label="状态提醒">
             {#if topBanner}
-              <div class={`stage-guide-banner ${topBanner.level}${topBanner.actionKey === 'sync-error' ? ' history-sync-error' : ''}`} role={topBanner.level === 'error' ? 'alert' : 'status'}>
+              <div class={`stage-guide-banner ${topBanner.level}${topBanner.actionKey === 'sync-error' ? ' history-sync-error' : ''}${topBanner.id === 'cache-notice' ? ' cache-integrity-notice' : ''}`} role={topBanner.level === 'error' ? 'alert' : 'status'}>
                 <div class="banner-text">
                   <strong>{topBanner.title}</strong>
                   <span>{topBanner.message}</span>
@@ -1780,7 +1929,7 @@
                     <Button small outline onClick={() => transport.openOfficial(currentConversationId)}>查看官方界面</Button>
                   {:else if topBanner.actionKey === 'offline'}
                     <Button small outline onClick={() => transport.send({ type: 'request-status' })}>重新检查连接</Button>
-                    <Button small outline onClick={() => transport.openOfficial(currentConversationId)}>查看官方页面</Button>
+                    <Button small outline onClick={() => transport.openOfficial(currentConversationId)}>查看官方界面</Button>
                   {:else if topBanner.actionKey === 'sync-error' || topBanner.actionKey === 'resync'}
                     <Button small outline disabled={!status.bridgeReady} onClick={retryHistorySync}>重试同步</Button>
                   {/if}
@@ -1793,7 +1942,7 @@
               </button>
               {#if expandedBanners}
                 {#each secondaryBanners as banner (banner.id)}
-                  <div class={`stage-guide-banner ${banner.level}`} role="status">
+                  <div class={`stage-guide-banner ${banner.level}${banner.actionKey === 'sync-error' ? ' history-sync-error' : ''}${banner.id === 'cache-notice' ? ' cache-integrity-notice' : ''}`} role="status">
                     <div class="banner-text">
                       <strong>{banner.title}</strong>
                       <span>{banner.message}</span>
@@ -1808,17 +1957,17 @@
         {#if conversationWorkState === 'running' && !conversationBlockingLoad}
           <div class="work-indicator" role="status" aria-live="polite">
             <span class="work-indicator-spinner" aria-hidden="true"></span>
-            <span>对话执行中：已观测到官方页面仍在生成或服务端 turn 尚未结束…</span>
-          </div>
-        {/if}
-        {#if cacheNotice}
-          <div class="history-sync-notice cache-integrity-notice" role="status">
-            {cacheNotice === 'read-failed'
-              ? '本地缓存未能读取；请等待完整历史同步，当前取得的内容仍可导出。'
-              : '本会话的本地输出缓存未完整保存；当前页面内容未被裁剪。刷新后需要重新同步历史，尚未同步的内容可先导出。'}
+            <span>对话执行中：官方页面仍在生成，请稍候…</span>
           </div>
         {/if}
       </section>
+
+      {#if isViewingAlternativeBranch}
+        <div class="branch-return-banner" role="status" style="display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 14px; margin: 0 auto 6px; width: min(1100px, calc(100% - 32px)); border: 1px solid var(--slim-warning); border-radius: 8px; background: var(--slim-warning-bg); color: var(--slim-warning); font-size: 11.5px; box-sizing: border-box;">
+          <span>正在查看历史分支（只读）</span>
+          <button type="button" class="button button-small" onclick={resetToLatestBranch} style="padding: 2px 8px; font-size: 10.5px; border: 1px solid currentColor; border-radius: 4px; background: transparent; color: inherit; cursor: pointer;">切回最新分支</button>
+        </div>
+      {/if}
 
       <Composer
         bind:this={composerRef}
@@ -1828,10 +1977,11 @@
         disabled={!transport.supportsLiveChat || !status.bridgeReady}
         loading={conversationPending}
         busy={sendInFlight}
-        generating={conversationWorkState === 'running'}
+        generating={conversationWorkState === 'running' && hasActiveLiveGeneration}
         status={composerStatus}
         error={composerError}
         onSend={sendMessage}
+        onStop={handleStopGeneration}
       />
     </main>
 
@@ -1840,6 +1990,8 @@
       class:open={compactLayout && mobilePanel === 'overview'}
       class="overview-host"
       hidden={compactLayout && mobilePanel !== 'overview'}
+      tabindex="-1"
+      onkeydown={(event) => { if (compactLayout && mobilePanel === 'overview') trapModalKeydown(event, event.currentTarget, closeMobilePanels); }}
     >
       <MessageOverview
         {turns}
@@ -1851,7 +2003,13 @@
     </div>
 
     {#if compactLayout && mobilePanel !== 'none'}
-      <button class="sidebar-scrim" aria-label={getScrimAriaLabel(mobilePanel)} onclick={closeMobilePanels}></button>
+      <button
+        type="button"
+        class="sidebar-scrim"
+        aria-label={getScrimAriaLabel(mobilePanel)}
+        onpointerdown={(event) => { event.preventDefault(); closeMobilePanels(); }}
+        onclick={(event) => { event.preventDefault(); closeMobilePanels(); }}
+      ></button>
     {/if}
   </div>
 
@@ -1878,6 +2036,14 @@
             <span>在输入框中换行</span>
           </div>
           <div class="shortcut-row">
+            <kbd>Ctrl / ⌘ + Shift + O</kbd>
+            <span>新建对话</span>
+          </div>
+          <div class="shortcut-row">
+            <kbd>Ctrl / ⌘ + K</kbd>
+            <span>聚焦侧栏搜索框</span>
+          </div>
+          <div class="shortcut-row">
             <kbd>← / →</kbd>
             <span>在问答轮次间前后翻页</span>
           </div>
@@ -1900,10 +2066,6 @@
           <div class="shortcut-row">
             <kbd>? / Ctrl + /</kbd>
             <span>打开 / 关闭本快捷键指南</span>
-          </div>
-          <div class="shortcut-row">
-            <kbd>Esc</kbd>
-            <span>关闭指南并返回焦点</span>
           </div>
         </div>
       </div>

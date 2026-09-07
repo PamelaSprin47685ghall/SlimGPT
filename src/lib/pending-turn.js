@@ -24,6 +24,13 @@ export function matchesPendingTurn(pending, conversationId, evidence = {}) {
   if (aliases.some((id) => expectedAliases.includes(id))) return true;
   // Bootstrap only once from the actual intercepted submission. Generic
   // broadcasts and same-text historical messages never establish ownership.
+  // A null-pending turn carrying no conversationId (or a provisional one)
+  // must never bind to a real server-issued conversation id without corroboration.
+  if (isProvisionalConversationId(pending.conversationId) && !isProvisionalConversationId(conversationId)) {
+    return false;
+  }
   return evidence.conversationRequest === true &&
     expectedUsers.length === 0 && expectedTransport.length === 0 && expectedAliases.length === 0;
 }
+
+export const isProvisionalConversationId = (id) => !id || /^new$/i.test(String(id).trim()) || /^WEB:/i.test(String(id).trim());

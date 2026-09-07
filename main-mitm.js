@@ -3055,6 +3055,25 @@
       case "send-message":
         await handleSendCommand(payload);
         return;
+      case "stop-generation": {
+        // Reuse the existing execution-state stop-control finder: the only
+        // supported stop is a click on the official control, never a synthetic
+        // request. Failures report precisely instead of going silent.
+        const composer = findComposerElement();
+        const stopControl = composer ? findExecutionStopControl(composer) : null;
+        if (stopControl) {
+          stopControl.click();
+        } else {
+          emit({
+            type: "command-error",
+            command: "stop-generation",
+            error: composer
+              ? "官方页面当前没有可点击的停止按钮，生成可能已结束"
+              : "找不到官方输入框，无法停止生成；请检查官方页面状态",
+          });
+        }
+        return;
+      }
       case "navigate-conversation": {
         const route = payload.route === "uc" ? "uc" : "c";
         navigate(`/${route}/${encodeURIComponent(payload.conversationId || "")}`);
@@ -3084,6 +3103,18 @@
         return;
       }
       case "open-official":
+        if (typeof payload?.conversationId === "string") {
+          const targetId = payload.conversationId.trim();
+          if (targetId && !isProvisionalConversationId(targetId)) {
+            const currentId = conversationIdFromUrl(location.href);
+            if (currentId !== targetId) {
+              const route = location.pathname.startsWith('/uc/') ? 'uc' : 'c';
+              navigate(`/${route}/${encodeURIComponent(targetId)}`);
+            }
+          }
+        }
+        hideTakeover();
+        return;
       case "focus-authority":
         hideTakeover();
         return;
@@ -3486,18 +3517,37 @@
     restore.id = RESTORE_ID;
     restore.type = "button";
     restore.textContent = "SlimGPT";
+    restore.setAttribute("aria-label", "返回 SlimGPT 轻量界面");
+    restore.setAttribute("title", "返回 SlimGPT 轻量界面");
+    const isDarkMode = window.matchMedia?.("(prefers-color-scheme: dark)").matches ||
+      document.documentElement?.classList.contains("dark") ||
+      document.documentElement?.getAttribute("data-color-mode") === "dark";
+    const bg = isDarkMode ? "#222220" : "#ffffff";
+    const fg = isDarkMode ? "#ecece8" : "#20201e";
+    const border = isDarkMode ? "1px solid rgba(255,255,255,.2)" : "1px solid rgba(0,0,0,.15)";
+    const shadow = isDarkMode ? "0 4px 20px rgba(0,0,0,.5)" : "0 4px 20px rgba(0,0,0,.18)";
     Object.assign(restore.style, {
       position: "fixed",
       right: "12px",
       bottom: "12px",
       zIndex: "2147483647",
-      border: "1px solid rgba(255,255,255,.25)",
+      border,
       borderRadius: "999px",
       padding: "8px 12px",
-      background: "#111",
-      color: "#fff",
+      background: bg,
+      color: fg,
       font: "600 13px system-ui, sans-serif",
-      boxShadow: "0 4px 20px rgba(0,0,0,.28)",
+      boxShadow: shadow,
+      cursor: "pointer",
+      outline: "none",
+      transition: "outline 0.15s ease",
+    });
+    restore.addEventListener("focus", () => {
+      restore.style.outline = isDarkMode ? "2px solid #58b99a" : "2px solid #22735e";
+      restore.style.outlineOffset = "2px";
+    });
+    restore.addEventListener("blur", () => {
+      restore.style.outline = "none";
     });
     restore.addEventListener("click", () => {
       showTakeover();

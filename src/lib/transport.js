@@ -49,6 +49,10 @@ class TakeoverTransport {
     this.send({ type: 'open-official', conversationId });
   }
 
+  stopGeneration() {
+    this.send({ type: 'stop-generation' });
+  }
+
   focusAuthority() {
     this.send({ type: 'focus-authority' });
   }

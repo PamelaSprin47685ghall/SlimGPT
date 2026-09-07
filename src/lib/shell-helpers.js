@@ -60,9 +60,7 @@ export function prioritizeBanners({
       priority: 4,
       level: 'warning',
       title: '本地缓存提示',
-      message: cacheNotice === 'read-failed'
-        ? '本地缓存未能读取；请等待完整历史同步，当前取得的内容仍可导出。'
-        : '本会话的本地输出缓存未完整保存；当前页面内容未被裁剪。刷新后需要重新同步历史，尚未同步的内容可先导出。',
+      message: formatLedgerOmissionMessage(cacheNotice),
       actionKey: null,
     });
   } else if (currentHistorySyncState?.state === 'loading' && canonicalSyncError) {
@@ -81,13 +79,44 @@ export function prioritizeBanners({
       level: 'info',
       title: '历史补齐中',
       message: conversationTimedOut
-        ? '完整历史同步暂未完成；当前仅显示已确认属于本轮的实时内容。'
-        : '正在补齐完整历史；局部窗口不会被当作会话开头。',
+        ? '完整历史暂未完全同步；当前仅显示已确认的最新实时内容。'
+        : '正在同步完整历史；当前已有内容不会被当作会话开头。',
       actionKey: 'resync',
     });
   }
 
   return banners;
+}
+
+/**
+ * Returns human-readable explanation for ledger omission reasons.
+ */
+export function formatLedgerOmissionMessage(reason) {
+  if (reason === 'read-failed') {
+    return '本地缓存未能读取；请等待完整历史同步，当前取得的内容仍可导出。';
+  }
+  if (reason === 'budget') {
+    return '本会话数据量超过本地暂存上限（4 MiB），未写入本地缓存；当前页面内容完整无损，可随时导出。';
+  }
+  if (reason === 'conversation-limit') {
+    return '本地暂存的会话数量已达上限（最多保留 24 个会话），早期会话已让位；当前页面内容未受裁剪。';
+  }
+  if (reason === 'structure-limit') {
+    return '会话结构超出本地暂存限制，已跳过本地缓存；当前页面内容保持完整，可先导出。';
+  }
+  if (reason === 'write-failed') {
+    return '本会话的本地输出缓存未完整保存；当前页面内容未被裁剪。刷新后需要重新同步历史，尚未同步的内容可先导出。';
+  }
+  return '本会话的本地输出缓存未完整保存；当前页面内容未被裁剪。刷新后需要重新同步历史，尚未同步的内容可先导出。';
+}
+
+/**
+ * Formats ledger omission count for the sidebar footer contract.
+ */
+export function formatLedgerOmissionNotice(omissionCount) {
+  const count = Number(omissionCount) || 0;
+  if (count <= 0) return '';
+  return `本地暂存省略 ${count} 项`;
 }
 
 /**

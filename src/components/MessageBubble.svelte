@@ -103,7 +103,17 @@
     if (!copyBtn) return;
     const codeBlock = copyBtn.closest('.code-block');
     const code = codeBlock?.querySelector('pre code')?.textContent || '';
-    if (!code) return;
+    if (!code || !code.trim()) {
+      copyBtn.textContent = '无代码';
+      copyBtn.setAttribute('aria-label', '代码内容为空');
+      clearTimeout(codeCopyTimers.get(copyBtn));
+      codeCopyTimers.set(copyBtn, setTimeout(() => {
+        copyBtn.textContent = '复制';
+        copyBtn.setAttribute('aria-label', '复制代码');
+        codeCopyTimers.delete(copyBtn);
+      }, 2400));
+      return;
+    }
     let succeeded = false;
     try {
       await copyText(code);
@@ -114,10 +124,12 @@
     }
     if (!copyBtn.isConnected) return;
     copyBtn.textContent = succeeded ? '已复制' : '复制失败';
+    copyBtn.setAttribute('aria-label', succeeded ? '已复制代码' : '复制代码失败');
     copyBtn.classList.toggle('copied', succeeded);
     clearTimeout(codeCopyTimers.get(copyBtn));
     codeCopyTimers.set(copyBtn, setTimeout(() => {
       copyBtn.textContent = '复制';
+      copyBtn.setAttribute('aria-label', '复制代码');
       copyBtn.classList.remove('copied');
       codeCopyTimers.delete(copyBtn);
     }, 2400));
@@ -138,7 +150,7 @@
 
   // Long assistant bubbles get a bottom toolbar
   const showBottomToolbar = $derived.by(() => {
-    if (message?.tool) return false;
+    if (message?.tool) return isError;
     if (isUser && isError) return true;
     if (!isUser && ((hasText && (message?.text?.length || 0) > 300) || isError)) return true;
     return false;
@@ -244,37 +256,33 @@
     <div class="message-bubble" onclick={handleBubbleClick}>
       {#if hasThought}
         <div class="thought-block" class:open={thoughtOpen}>
-          <div
-            class="thought-header"
-            onclick={toggleThought}
-            onkeydown={(e) => {
-              if (e.key === 'Enter' || e.key === ' ') {
-                e.preventDefault();
-                toggleThought();
-              }
-            }}
-            role="button"
-            tabindex="0"
-            aria-expanded={thoughtOpen}
-          >
-            <span class="thought-icon">💭</span>
-            <span class="thought-title">思考过程</span>
-            {#if message?.thinkingDuration}
-              <span class="thought-duration">（用时 {message.thinkingDuration}）</span>
-            {/if}
+          <div class="thought-header">
+            <button
+              type="button"
+              class="thought-toggle-btn"
+              onclick={toggleThought}
+              aria-expanded={thoughtOpen}
+            >
+              <span class="thought-icon">💭</span>
+              <span class="thought-title">思考过程</span>
+              {#if message?.thinkingDuration}
+                <span class="thought-duration">（用时 {message.thinkingDuration}）</span>
+              {/if}
+              <span class="thought-toggle">{thoughtOpen ? '收起 ▲' : '展开 ▼'}</span>
+            </button>
             <button
               type="button"
               class="thought-copy-btn"
               class:copied={thoughtCopied}
               onclick={copyThought}
-              aria-label="复制思考过程"
+              aria-label={thoughtCopied ? '已复制思考过程' : thoughtCopyError ? '复制失败' : '复制思考过程'}
+              aria-live="polite"
               title="复制思考过程"
             >{thoughtCopied ? '已复制' : thoughtCopyError ? '复制失败' : '复制思考过程'}</button>
-            <span class="thought-toggle">{thoughtOpen ? '收起 ▲' : '展开 ▼'}</span>
           </div>
-          {#if thoughtOpen}
+          <div class="thought-content-wrapper" hidden={!thoughtOpen} aria-hidden={!thoughtOpen}>
             <IncrementalMarkdown class="thought-content" source={message.thought} streaming={isStreaming} />
-          {/if}
+          </div>
         </div>
       {/if}
 
@@ -301,7 +309,7 @@
         <div class="empty-notice">（无文字内容）</div>
       {/if}
 
-      {#if isError && !message?.tool}
+      {#if isError}
         <div class="error-footer-banner" role="alert">
           <div class="error-banner-main">
             <span class="error-banner-icon">⚠️</span>
@@ -341,6 +349,24 @@
 <style>
   .message-bubble {
     position: relative;
+  }
+  .thought-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+  }
+  .thought-toggle-btn {
+    display: inline-flex;
+    align-items: center;
+    background: transparent;
+    border: none;
+    padding: 0;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+    flex: 1;
+    text-align: left;
   }
   .thought-copy-btn {
     display: inline-flex;

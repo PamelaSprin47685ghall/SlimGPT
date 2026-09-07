@@ -1,7 +1,7 @@
 <script>
   import { Button } from 'framework7-svelte';
   import { formatModelLabel } from '../lib/message-presentation.js';
-  import { historySyncStatusLabel, isHistorySyncRetryable } from '../lib/history-sync.js';
+  import { historySyncStatusLabel, historySyncPillLabel, isHistorySyncRetryable } from '../lib/history-sync.js';
   import { formatSidebarTime, fullSidebarDateTime, filterConversations } from '../lib/sidebar-helpers.js';
 
   let {
@@ -13,6 +13,8 @@
     statusLabel = '未连接',
     statusState = 'offline',
     captures = 0,
+    cachedCount = null,
+    omissionCount = 0,
     workState = 'unknown',
     sendInFlight = false,
     historyComplete = true,
@@ -37,13 +39,20 @@
   const activelyWorking = $derived(workState === 'running' || workState === 'starting');
 
   let query = $state('');
+  let pageLimit = $state(100);
 
-  const searchResult = $derived(filterConversations(conversations, query, 100));
+  $effect(() => {
+    const _ = query;
+    pageLimit = 100;
+  });
+
+  const searchResult = $derived(filterConversations(conversations, query, pageLimit));
   const filtered = $derived(searchResult.visible);
   const totalMatches = $derived(searchResult.total);
   const isCapped = $derived(searchResult.isCapped);
 
-  const syncLabel = $derived(historySyncStatusLabel(historySyncState));
+  const syncPill = $derived(historySyncPillLabel(historySyncState));
+  const syncFull = $derived(historySyncStatusLabel(historySyncState));
   const syncRetryable = $derived(isHistorySyncRetryable(historySyncState));
   const syncLoading = $derived(historySyncState?.state === 'loading');
 
@@ -158,8 +167,8 @@
   <div class="sidebar-section-title">
     <span>会话</span>
     {#if isCapped}
-      <span class="count-hint" title={`共找到 ${totalMatches} 条结果，当前展示前 100 条`}>
-        显示 100 / 全部 {totalMatches}
+      <span class="count-hint" title={`共找到 ${totalMatches} 条结果，当前展示前 ${filtered.length} 条`}>
+        显示 {filtered.length} / 全部 {totalMatches}
       </span>
     {:else}
       <span>{totalMatches}</span>
@@ -189,11 +198,13 @@
         {@const isLoading = conversation.id === loadingConversationId}
         {@const isTimedOut = conversation.id === navigationTimedOutId}
         {@const modelLabel = formatModel(conversation)}
+        {@const snippet = preview(conversation)}
         <button
           type="button"
           class:active={isCurrent}
           class:pending={isLoading}
           class:timed-out={isTimedOut}
+          aria-current={isCurrent ? 'page' : undefined}
           class="conversation-item"
           onclick={() => handleSelect(conversation.id)}
           title={isTimedOut ? `${conversation.title || 'Untitled'}（加载超时，点击重试）` : (conversation.title || 'Untitled')}
@@ -216,27 +227,41 @@
             {#if modelLabel}
               <span class="conversation-model" title={conversation.model || ''}>{modelLabel}</span>
             {/if}
-            <span class="conversation-preview" title={preview(conversation)}>{preview(conversation)}</span>
+            <span class="conversation-preview" class:empty-preview={!snippet} title={snippet || '暂无消息预览'}>
+              {snippet || '暂无消息预览'}
+            </span>
           </span>
         </button>
       {/each}
+      {#if isCapped}
+        <div class="load-more-container">
+          <button type="button" class="load-more-btn" onclick={() => pageLimit += 50}>
+            加载更多 (+50)
+          </button>
+        </div>
+      {/if}
     {/if}
   </div>
 
   <footer class="sidebar-footer">
     <div class="sync-status-row">
-      <span class="captures-count">已同步 {captures} 次</span>
-      {#if syncLabel}
-        <span class="sync-label" class:sync-error={historySyncState?.state === 'error'}>
-          {syncLabel}
+      <span class="captures-count" title={`共 ${conversations.length} 个会话`}>
+        共 {conversations.length} 个会话{#if typeof cachedCount === 'number' && cachedCount > 0}（缓存 {cachedCount}/24）{/if}
+      </span>
+      {#if omissionCount > 0}
+        <span class="ledger-omissions-note" title={`本地暂存省略 ${omissionCount} 项`}>省略 {omissionCount} 项</span>
+      {/if}
+      {#if syncPill}
+        <span class="sync-label" class:sync-error={historySyncState?.state === 'error'} title={syncFull}>
+          {syncPill}
         </span>
       {/if}
       <button
         type="button"
         class="refresh-history-btn"
-        disabled={syncLoading || !statusState.startsWith('online') && statusState !== 'online'}
+        disabled={!currentId || syncLoading || !statusState.startsWith('online') && statusState !== 'online'}
         onclick={onRetryHistorySync}
-        title={syncLoading ? '正在同步…' : '刷新历史'}
+        title={!currentId ? '新对话暂无历史记录可同步' : (syncLoading ? '正在同步…' : '刷新历史')}
       >
         {syncLoading ? '同步中…' : '刷新历史'}
       </button>
@@ -442,6 +467,26 @@
   .refresh-history-btn:disabled {
     opacity: 0.5;
     cursor: not-allowed;
+  }
+  .load-more-container {
+    padding: 8px 6px;
+    text-align: center;
+  }
+  .load-more-btn {
+    width: 100%;
+    padding: 6px 12px;
+    font-size: 11px;
+    color: var(--f7-theme-color, #22735e);
+    background: var(--slim-soft);
+    border: 1px solid var(--slim-line);
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .load-more-btn:hover {
+    background: var(--slim-surface);
+  }
+  .conversation-preview.empty-preview {
+    opacity: 0.55;
   }
   .footer-security-note {
     font-size: 9.5px;
