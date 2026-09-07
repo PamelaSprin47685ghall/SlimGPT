@@ -17,8 +17,12 @@ export async function copyText(value, environment = globalThis) {
   const active = document.activeElement;
   const selection = document.getSelection?.();
   const ranges = [];
-  for (let index = 0; index < (selection?.rangeCount || 0); index += 1) {
-    ranges.push(selection.getRangeAt(index).cloneRange());
+  if (selection && typeof selection.getRangeAt === 'function') {
+    for (let index = 0; index < (selection.rangeCount || 0); index += 1) {
+      try {
+        ranges.push(selection.getRangeAt(index).cloneRange());
+      } catch {}
+    }
   }
   const inputSelection = active && typeof active.selectionStart === 'number'
     ? [active.selectionStart, active.selectionEnd, active.selectionDirection]
@@ -32,16 +36,32 @@ export async function copyText(value, environment = globalThis) {
   try {
     textarea.focus({ preventScroll: true });
     textarea.select();
-    if (!document.execCommand('copy')) throw new Error('复制失败，请手动选择并复制');
-  } finally {
-    textarea.remove();
-    if (active?.isConnected) {
-      active.focus?.({ preventScroll: true });
-      if (inputSelection) active.setSelectionRange?.(...inputSelection);
+    let success = false;
+    try {
+      success = Boolean(document.execCommand('copy'));
+    } catch {
+      success = false;
     }
-    if (selection && ranges.length) {
-      selection.removeAllRanges();
-      for (const range of ranges) selection.addRange(range);
+    if (!success) throw new Error('复制失败，请手动选择并复制');
+  } finally {
+    try { textarea.remove?.(); } catch { try { textarea.parentNode?.removeChild(textarea); } catch {} }
+    if (active?.isConnected && typeof active.focus === 'function') {
+      try {
+        active.focus({ preventScroll: true });
+      } catch {
+        try { active.focus(); } catch {}
+      }
+      if (inputSelection && typeof active.setSelectionRange === 'function') {
+        try {
+          active.setSelectionRange(...inputSelection);
+        } catch {}
+      }
+    }
+    if (selection && ranges.length && typeof selection.removeAllRanges === 'function') {
+      try {
+        selection.removeAllRanges();
+        for (const range of ranges) selection.addRange(range);
+      } catch {}
     }
   }
 }

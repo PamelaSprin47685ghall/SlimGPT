@@ -1,4 +1,4 @@
-const strings = (values) => [...new Set(values.filter((value) => typeof value === 'string' && value.trim()).map((value) => value.trim()))];
+const strings = (values) => [...new Set((values || []).filter((value) => typeof value === 'string' && value.trim()).map((value) => value.trim()))];
 
 /** Pending UI ownership must be established before enriching its identity.
  * A foreign event cannot teach the pending turn its own id and then "match". */

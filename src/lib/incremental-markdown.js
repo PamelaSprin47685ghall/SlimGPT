@@ -332,7 +332,7 @@ function highlightCode(source, language) {
     });
   }
   const keywords = 'const|let|var|function|return|if|else|for|while|class|new|import|from|export|async|await|true|false|null|undefined|def|in|and|or|not|elif|is|lambda|with|as|yield|pass|raise|except|None|True|False|package|func|struct|go|chan|defer|fn|mut|pub|impl|trait|match|enum|self|Self|int|char|float|double|void|bool|public|private|protected|static|final|SELECT|FROM|WHERE|INSERT|INTO|UPDATE|DELETE|JOIN|LEFT|RIGHT|INNER|OUTER|ON|GROUP|BY|ORDER|HAVING|LIMIT|OFFSET|CREATE|TABLE|DROP|ALTER|INDEX';
-  const pattern = new RegExp(`(["'\\x60])(?:\\\\.|(?!\\1)[\\s\\S])*\\1|\\b(?:${keywords})\\b|\\b\\d+(?:\\.\\d+)?\\b`, 'g');
+  const pattern = new RegExp(`(["'\\x60])(?:\\\\[\\s\\S]|(?!\\1)[^\\\\])*\\1|\\b(?:${keywords})\\b|\\b\\d+(?:\\.\\d+)?\\b`, 'g');
   return highlightMatches(source, pattern, (match) => {
     const token = match[0];
     const className = /^["'`]/.test(token) ? 'tok-str' : /^\d/.test(token) ? 'tok-num' : 'tok-key';

@@ -26,3 +26,15 @@ export function presentToolPayload(payload, { formatter = null, raw = false } = 
   }
   return { format: 'RAW', text: formatRawToolPayload(payload), html: '', failed: false };
 }
+
+export function extractToolCallIds(tool, message = null) {
+  const ids = [
+    tool?.callId,
+    tool?.toolCallId,
+    ...(tool?.callIds || []),
+    message?.callId,
+    message?.toolCallId,
+    ...(message?.callIds || []),
+  ].filter((id) => typeof id === 'string' && id.trim());
+  return [...new Set(ids)];
+}

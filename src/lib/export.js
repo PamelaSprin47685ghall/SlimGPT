@@ -94,6 +94,12 @@ export function markdownFilename(title) {
 }
 
 export function downloadConversationMarkdown(title, messages = [], options = {}) {
+  if (!messages || !messages.length) {
+    const hasUnresolved = (options.unresolved || []).some((group) => group.replies?.some(hasExportableMessage));
+    if (!hasUnresolved) {
+      throw new Error('没有可导出的对话内容');
+    }
+  }
   const content = buildConversationMarkdown(title, messages, options);
   const filename = markdownFilename(title);
   const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' });

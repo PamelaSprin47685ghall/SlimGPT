@@ -25,14 +25,16 @@
   }
 
   function preview(turn) {
-    const question = clean(turn?.user?.text);
-    const answer = clean(
-      turn?.replies?.find((message) => message?.role === 'assistant' && !message?.tool)?.text ||
-      turn?.replies?.find((message) => !message?.tool)?.text ||
-      turn?.replies?.[0]?.text,
-    );
+    const question = clean(turn?.user?.text || turn?.user?.thought);
+    const answerMsg = turn?.replies?.find((message) => message?.role === 'assistant' && !message?.tool && (message?.text || message?.thought)) ||
+      turn?.replies?.find((message) => !message?.tool && (message?.text || message?.thought)) ||
+      turn?.replies?.find((message) => message?.text || message?.thought);
+    const answer = clean(answerMsg?.text || answerMsg?.thought);
     if (question && answer) return `${question}  →  ${answer}`;
-    return question || answer || '（空对话轮次）';
+    if (question) return question;
+    if (answer) return answer;
+    if (turn?.replies?.some((message) => message?.tool)) return '（工具调用）';
+    return '（空对话轮次）';
   }
 </script>
 
@@ -68,3 +70,17 @@
     {/if}
   </div>
 </aside>
+
+<style>
+  .overview-list {
+    scrollbar-gutter: stable;
+  }
+  .overview-item {
+    transition: background-color 0.12s ease;
+  }
+  .overview-preview {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+</style>

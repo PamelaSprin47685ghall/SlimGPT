@@ -69,6 +69,8 @@
   let pendingCommandConversationId = null;
   let compactLayout = $state(true);
   let mobilePanel = $state('none');
+  let lastActiveMobileTrigger = null;
+  let showShortcutsModal = $state(false);
   let panelPointerIntent = null;
   let activeTurnIndex = $state(0);
   let saveTimer = null;
@@ -121,7 +123,13 @@
   );
   const liveConnected = $derived(status.bridgeReady && status.captureMode === 'page');
   const statusState = $derived(status.bridgeError ? 'error' : (liveConnected ? 'online' : 'offline'));
-  const statusLabel = $derived(status.bridgeError ? '连接失败' : (liveConnected ? (status.takeover === false ? '已连接' : '已接管') : '连接中'));
+  const statusLabel = $derived(
+  status.bridgeError
+    ? '连接失败'
+    : (status.takeover === false
+        ? (liveConnected ? '已连接（官方界面可见）' : '未连接')
+        : (liveConnected ? '已接管' : '连接中'))
+  );
   const conversationHistoryPending = $derived(Boolean(currentConversationId && !currentRecord?.canonicalComplete));
   const currentHistorySyncState = $derived(historySyncStates.get(currentConversationId));
   const historySyncProblem = $derived(historySyncMessage(currentHistorySyncState,
@@ -203,6 +211,27 @@
     layoutQuery.addEventListener?.('change', syncLayout);
     window.addEventListener('resize', syncLayout);
     window.visualViewport?.addEventListener('resize', syncLayout);
+    const handleGlobalKeydown = (event) => {
+      if (event.key === 'Escape') {
+        if (showShortcutsModal) {
+          event.preventDefault();
+          showShortcutsModal = false;
+          return;
+        }
+        if (compactLayout && mobilePanel !== 'none') {
+          event.preventDefault();
+          closeMobilePanels();
+          return;
+        }
+      }
+      const isEditing = event.target?.closest?.('input, textarea, [contenteditable="true"]');
+      if (isEditing) return;
+      if ((event.key === '?' || (event.key === '/' && (event.metaKey || event.ctrlKey)))) {
+        event.preventDefault();
+        showShortcutsModal = !showShortcutsModal;
+      }
+    };
+    window.addEventListener('keydown', handleGlobalKeydown);
     const flushWhenHidden = () => {
       if (document.visibilityState === 'hidden') void flushPersist();
     };
@@ -228,6 +257,7 @@
       layoutQuery.removeEventListener?.('change', syncLayout);
       window.removeEventListener('resize', syncLayout);
       window.visualViewport?.removeEventListener('resize', syncLayout);
+      window.removeEventListener('keydown', handleGlobalKeydown);
       document.removeEventListener('visibilitychange', flushWhenHidden);
     };
   });
@@ -1389,12 +1419,20 @@
 
   function toggleSidebar() {
     if (!compactLayout) return;
+    if (mobilePanel !== 'sidebar') lastActiveMobileTrigger = document.querySelector('.mobile-sidebar-button');
     mobilePanel = mobilePanel === 'sidebar' ? 'none' : 'sidebar';
+    if (mobilePanel === 'none' && lastActiveMobileTrigger) {
+      lastActiveMobileTrigger.focus?.();
+    }
   }
 
   function toggleOverview() {
     if (!compactLayout) return;
+    if (mobilePanel !== 'overview') lastActiveMobileTrigger = document.querySelector('.mobile-overview-button');
     mobilePanel = mobilePanel === 'overview' ? 'none' : 'overview';
+    if (mobilePanel === 'none' && lastActiveMobileTrigger) {
+      lastActiveMobileTrigger.focus?.();
+    }
   }
 
   function beginPanelPointer(event, panel) {
@@ -1436,8 +1474,14 @@
   }
 
   function closeMobilePanels() {
+    const prev = mobilePanel;
     mobilePanel = 'none';
     panelPointerIntent = null;
+    if (prev !== 'none' && lastActiveMobileTrigger) {
+      const trigger = lastActiveMobileTrigger;
+      lastActiveMobileTrigger = null;
+      queueMicrotask(() => trigger?.focus?.());
+    }
   }
 </script>
 
@@ -1467,6 +1511,12 @@
       ></span>
     </div>
     <NavRight>
+      <button
+        type="button"
+        class="button button-small mobile-official-button"
+        title="暂时切换至官方页面"
+        onclick={() => transport.openOfficial(currentConversationId)}
+      >官方</button>
       <button
         type="button"
         class="button button-small mobile-overview-button"
@@ -1513,6 +1563,12 @@
             {conversationWorkLabel}
           </span>
           <Button small onClick={() => transport.openOfficial(currentConversationId)}>暂时显示官方界面</Button>
+          <button
+            type="button"
+            class="button button-small header-shortcuts-button"
+            title="查看键盘快捷键 (?)"
+            onclick={() => showShortcutsModal = true}
+          >快捷键</button>
         </div>
       </header>
 
@@ -1532,6 +1588,14 @@
             <div class="empty-logo">S</div>
             <h2>更轻的 ChatGPT 界面</h2>
             <p>登录、网络和发送仍由当前 ChatGPT 页面处理；SlimGPT 负责会话呈现，并在覆盖显示时暂停官方界面的布局和绘制。</p>
+            <div class="empty-actions">
+              <Button outline small onClick={newChat}>开始新对话</Button>
+              <Button outline small onClick={() => transport.openOfficial(currentConversationId)}>查看官方界面</Button>
+              <Button outline small onClick={() => showShortcutsModal = true}>快捷键指南</Button>
+            </div>
+            <div class="empty-shortcuts-hint">
+              提示：在下方输入框输入消息按 Enter 即可发送，Shift + Enter 换行
+            </div>
           </div>
         {/if}
 
@@ -1540,10 +1604,48 @@
             <span class="conversation-loading-spinner" aria-hidden="true"></span>
             <strong>{conversationTimedOut ? '对话暂未加载' : '正在加载对话'}</strong>
             <span>{conversationTimedOut ? '完整历史尚未同步；可重新点击侧栏中的该会话重试' : (currentMeta?.title || '正在同步 ChatGPT 完整会话…')}</span>
+            <div class="conversation-loading-actions">
+              <Button small outline disabled={!status.bridgeReady} onClick={retryHistorySync}>重试同步</Button>
+              <Button small outline onClick={() => transport.openOfficial(currentConversationId)}>在官方界面查看</Button>
+              <Button small outline onClick={newChat}>新建对话</Button>
+            </div>
           </div>
         {:else if conversationHistoryPending}
-          <div class="history-sync-notice" role="status" aria-live="polite">
+          <div class="history-sync-notice interactive" role="status" aria-live="polite">
             {conversationTimedOut ? '完整历史同步暂未完成；当前仅显示已确认属于本轮的实时内容。' : '正在补齐完整历史；局部窗口不会被当作会话开头。'}
+            <Button small outline disabled={!status.bridgeReady} onClick={retryHistorySync}>重新同步</Button>
+          </div>
+        {/if}
+
+        {#if status.bridgeError}
+          <div class="stage-guide-banner error" role="alert">
+            <div class="banner-text">
+              <strong>ChatGPT 页面连接失败</strong>
+              <span>桥接脚本未就绪或被官方界面拦截；请检查官方页面是否正常登录或刷新页面重试。</span>
+            </div>
+            <div class="banner-actions">
+              <Button small outline onClick={() => transport.openOfficial(currentConversationId)}>查看官方界面</Button>
+            </div>
+          </div>
+        {:else if !liveConnected}
+          <div class="stage-guide-banner offline" role="status">
+            <div class="banner-text">
+              <strong>未接管官方界面</strong>
+              <span>当前正连接 ChatGPT 页面，或者官方界面正处于活动状态。</span>
+            </div>
+            <div class="banner-actions">
+              <Button small outline onClick={() => transport.send({ type: 'request-status' })}>重新检查连接</Button>
+              <Button small outline onClick={() => transport.openOfficial(currentConversationId)}>查看官方页面</Button>
+            </div>
+          </div>
+        {/if}
+
+        {#if status.takeover === false && liveConnected}
+          <div class="takeover-restore-pill" role="status">
+            <span>官方界面正处于显示状态</span>
+            <button type="button" class="restore-action-btn" onclick={() => transport.send({ type: 'connect' })}>
+              回到 SlimGPT
+            </button>
           </div>
         {/if}
 
@@ -1602,4 +1704,50 @@
       <button class="sidebar-scrim" aria-label="关闭侧栏" onclick={closeMobilePanels}></button>
     {/if}
   </div>
+
+  {#if showShortcutsModal}
+    <div
+      class="shortcuts-modal-backdrop"
+      role="presentation"
+      onclick={(event) => { if (event.target === event.currentTarget) showShortcutsModal = false; }}
+      onkeydown={(event) => { if (event.target === event.currentTarget && (event.key === 'Escape' || event.key === 'Enter' || event.key === ' ')) showShortcutsModal = false; }}
+    >
+      <div class="shortcuts-modal" role="dialog" aria-modal="true" aria-labelledby="shortcuts-title">
+        <div class="shortcuts-modal-header">
+          <strong id="shortcuts-title">键盘快捷键指南</strong>
+          <button type="button" class="shortcuts-close-btn" aria-label="关闭" onclick={() => showShortcutsModal = false}>✕</button>
+        </div>
+        <div class="shortcuts-grid">
+          <div class="shortcut-row">
+            <kbd>Enter</kbd>
+            <span>发送消息（输入框聚焦时）</span>
+          </div>
+          <div class="shortcut-row">
+            <kbd>Shift + Enter</kbd>
+            <span>在输入框中换行</span>
+          </div>
+          <div class="shortcut-row">
+            <kbd>↑ / ↓</kbd>
+            <span>在当前问答卡片中滚动内容</span>
+          </div>
+          <div class="shortcut-row">
+            <kbd>PageUp / PageDown</kbd>
+            <span>跨屏快速翻页浏览</span>
+          </div>
+          <div class="shortcut-row">
+            <kbd>Home / End</kbd>
+            <span>跳至当前轮次顶部或底部</span>
+          </div>
+          <div class="shortcut-row">
+            <kbd>Esc</kbd>
+            <span>关闭打开的侧栏、概览抽屉或弹窗</span>
+          </div>
+          <div class="shortcut-row">
+            <kbd>?</kbd>
+            <span>打开 / 关闭本快捷键指南</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  {/if}
 </Page>

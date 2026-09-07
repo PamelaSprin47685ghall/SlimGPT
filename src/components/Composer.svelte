@@ -21,6 +21,8 @@
   const MIN_HEIGHT = 34;
   const MAX_HEIGHT = 160;
 
+  const canSubmit = $derived(!disabled && !loading && !busy && Boolean(value.trim()));
+
   const currentLevelObj = $derived(
     THINKING_LEVELS.find((item) => item.level === thinkingLevel) || THINKING_LEVELS[1]
   );
@@ -39,6 +41,12 @@
     const newHeight = Math.min(MAX_HEIGHT, Math.max(MIN_HEIGHT, contentHeight));
     textareaEl.style.height = `${newHeight}px`;
     textareaEl.style.overflowY = contentHeight > MAX_HEIGHT ? 'auto' : 'hidden';
+  }
+
+  export function focus() {
+    if (!disabled && !loading && textareaEl?.isConnected) {
+      try { textareaEl.focus({ preventScroll: true }); } catch { try { textareaEl.focus(); } catch {} }
+    }
   }
 
   function submit() {
@@ -146,7 +154,7 @@
       class="send-button"
       fill
       round
-      disabled={disabled || loading || busy || !value.trim()}
+      disabled={!canSubmit}
       onClick={submit}
       aria-label="发送"
     >↑</Button>

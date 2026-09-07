@@ -1,19 +1,22 @@
 <script>
   import { onDestroy, onMount } from 'svelte';
-  import { loadToolFormatter, presentToolPayload } from '../lib/tool-presentation.js';
+  import { extractToolCallIds, loadToolFormatter, presentToolPayload } from '../lib/tool-presentation.js';
   import { copyText } from '../lib/clipboard.js';
 
   let { tool } = $props();
   let copied = $state(false);
   let copyError = $state(false);
+  let copiedId = $state(false);
   let rawMode = $state(false);
   let formatter = $state.raw(null);
   let loadFailed = $state(false);
   let copyTimer = null;
+  let idCopyTimer = null;
   let alive = true;
 
   const presentation = $derived(presentToolPayload(tool?.payload, { formatter, raw: rawMode }));
   const displayRaw = $derived(presentation.format === 'RAW');
+  const callIds = $derived(extractToolCallIds(tool));
 
   onMount(() => {
     loadToolFormatter().then((module) => { if (alive) formatter = module; })
@@ -34,7 +37,11 @@
     clearTimeout(copyTimer);
   }
 
-  onDestroy(() => { alive = false; clearTimeout(copyTimer); });
+  onDestroy(() => {
+    alive = false;
+    clearTimeout(copyTimer);
+    clearTimeout(idCopyTimer);
+  });
 
   async function copyToml() {
     const text = presentation.text;
@@ -51,6 +58,19 @@
     clearTimeout(copyTimer);
     copyTimer = setTimeout(() => { copied = false; copyError = false; }, 2400);
   }
+
+  async function copyCallId(id) {
+    try {
+      await copyText(id);
+      if (!alive) return;
+      copiedId = true;
+    } catch {
+      if (!alive) return;
+      copiedId = false;
+    }
+    clearTimeout(idCopyTimer);
+    idCopyTimer = setTimeout(() => { copiedId = false; }, 2400);
+  }
 </script>
 
 <div class="tool-payload-block" data-tool-kind={tool?.kind || ''}>
@@ -59,6 +79,25 @@
     <span class="tool-code-name" title={tool?.title || tool?.name || 'tool'}>
       {tool?.name || 'tool'}{tool?.title ? ` · ${tool.title}` : ''}
     </span>
+    {#if callIds.length > 0}
+      <div class="tool-call-ids" title="调用标识">
+        {#each callIds as id}
+          <button
+            type="button"
+            class="tool-call-id-btn"
+            onclick={() => copyCallId(id)}
+            title={`点击复制调用标识：${id}`}
+            aria-label={`复制调用标识 ${id}`}
+          >
+            <span class="tool-call-id-label">ID:</span>
+            <span class="tool-call-id-val">{id}</span>
+          </button>
+        {/each}
+        {#if copiedId}
+          <span class="tool-id-copied-tip">已复制 ID</span>
+        {/if}
+      </div>
+    {/if}
     <div class="tool-code-actions">
       <button type="button" class="tool-code-copy tool-format-toggle" onclick={toggleFormat}
         disabled={!formatter || presentation.failed}
@@ -83,4 +122,27 @@
 <style>
   .tool-code-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
   .tool-format-notice { padding: 8px 12px; font-size: 12px; color: var(--slim-muted); }
+  .tool-call-ids { display: inline-flex; align-items: center; gap: 6px; overflow: hidden; }
+  .tool-call-id-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    height: 20px;
+    max-width: 160px;
+    padding: 0 6px;
+    border: 1px solid var(--slim-line);
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--slim-surface) 80%, transparent);
+    color: var(--slim-muted);
+    font: 500 9.5px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    cursor: pointer;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    transition: color 0.15s ease, border-color 0.15s ease;
+  }
+  .tool-call-id-btn:hover { color: var(--f7-theme-color); border-color: var(--f7-theme-color); }
+  .tool-call-id-label { opacity: 0.65; flex: none; }
+  .tool-call-id-val { overflow: hidden; text-overflow: ellipsis; }
+  .tool-id-copied-tip { font-size: 9.5px; color: var(--f7-theme-color); flex: none; }
 </style>

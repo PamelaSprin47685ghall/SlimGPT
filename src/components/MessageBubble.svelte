@@ -36,6 +36,7 @@
   const isStreaming = $derived(isMessageStreaming(message));
   const isError = $derived(Boolean(message?.error || message?.status === 'failed'));
   const unrecognized = $derived(Boolean(!hasText && !hasThought && !message?.tool && !isThinking && !isError && message?.unrecognized));
+  const isUser = $derived(message?.role === 'user');
 
   const thoughtOpen = $derived(userToggled ? thoughtManualState : (!hasText || isThinking));
 
@@ -52,7 +53,7 @@
 
   async function copyMessage() {
     const key = messageKey;
-    const text = String(message?.text || message?.thought || '');
+    const text = String(message?.text || (message?.thought ? `【思考过程】\n${message.thought}` : ''));
     if (!text) return;
     try {
       await copyText(text);
@@ -136,11 +137,11 @@
           {/if}
         </span>
 
-        {#if message?.thinkingLevel}
+        {#if !isUser && !message?.tool && message?.thinkingLevel && (hasThought || message?.reasoningEffort)}
           <span class="meta-badge thinking-badge" title={message.thinkingLevel.tip}>
             {message.thinkingLevel.icon} {message.thinkingLevel.label}
           </span>
-        {:else if message?.model}
+        {:else if !isUser && message?.model}
           <span class="meta-badge model-badge" title={message.model}>{formatModelLabel(message.model)}</span>
         {/if}
 
@@ -216,24 +217,24 @@
         <ToolPayloadBlock tool={message.tool} />
       {:else if hasText}
         <IncrementalMarkdown source={message.text} streaming={isStreaming} />
-      {:else if hasThought && isStreaming && !message?.endTurn}
+      {:else if !message?.tool && hasThought && isStreaming && !message?.endTurn}
         <div class="thinking-indicator" role="status" aria-live="polite">
           <span class="thinking-spinner" aria-hidden="true"></span>
           <span>思考中…</span>
         </div>
-      {:else if isThinking}
+      {:else if !message?.tool && isThinking}
         <div class="thinking-indicator" role="status" aria-live="polite">
           <span class="thinking-spinner" aria-hidden="true"></span>
           <span>ChatGPT 正在思考与生成…</span>
         </div>
-      {:else if unrecognized}
+      {:else if !message?.tool && unrecognized}
         <div class="unrecognized-notice">
           <strong>官方消息（非文本内容）</strong>
           <span>这条消息包含 SlimGPT 尚未识别的内容类型，已原样保留。可点击「暂时显示官方界面」查看完整内容。</span>
         </div>
-      {:else if isError}
+      {:else if !message?.tool && isError}
         <div class="error-notice">⚠️ 消息生成失败或被官方界面中断</div>
-      {:else if !hasThought}
+      {:else if !message?.tool && !hasThought}
         <div class="empty-notice">（无文字内容）</div>
       {/if}
       {#if message?.cacheRedacted}
@@ -242,3 +243,15 @@
     </div>
   </div>
 </div>
+
+<style>
+  .message-bubble {
+    position: relative;
+  }
+  .role-user .message-meta {
+    flex-direction: row-reverse;
+  }
+  .role-user .message-meta-left {
+    flex-direction: row-reverse;
+  }
+</style>

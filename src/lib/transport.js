@@ -49,6 +49,10 @@ class TakeoverTransport {
     this.send({ type: 'open-official', conversationId });
   }
 
+  focusAuthority() {
+    this.send({ type: 'focus-authority' });
+  }
+
   #handleMessage = (event) => {
     if (event.source !== window.parent || event.origin !== HOST_ORIGIN) return;
     const message = event.data;

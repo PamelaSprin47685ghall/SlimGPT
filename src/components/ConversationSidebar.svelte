@@ -1,5 +1,6 @@
 <script>
   import { Button } from 'framework7-svelte';
+  import { formatModelLabel } from '../lib/message-presentation.js';
 
   let {
     conversations = [],
@@ -32,14 +33,39 @@
 
   function formatTime(value) {
     const numeric = Number(value || 0);
-    if (!numeric) return '';
-    const date = new Date(numeric < 10_000_000_000 ? numeric * 1000 : numeric);
-    return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', weekday: 'short' }).format(date);
+    if (!numeric || numeric <= 0) return '';
+    const ms = numeric < 10_000_000_000 ? numeric * 1000 : numeric;
+    const date = new Date(ms);
+    if (Number.isNaN(date.getTime())) return '';
+    const now = new Date();
+    const isSameYear = date.getFullYear() === now.getFullYear();
+    return new Intl.DateTimeFormat(undefined, {
+      ...(isSameYear ? {} : { year: 'numeric' }),
+      month: 'short',
+      day: 'numeric',
+      weekday: 'short',
+    }).format(date);
+  }
+
+  function fullDateTime(value) {
+    const numeric = Number(value || 0);
+    if (!numeric || numeric <= 0) return '';
+    const ms = numeric < 10_000_000_000 ? numeric * 1000 : numeric;
+    const date = new Date(ms);
+    if (Number.isNaN(date.getTime())) return '';
+    return new Intl.DateTimeFormat(undefined, {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      weekday: 'short',
+      hour: '2-digit',
+      minute: '2-digit',
+    }).format(date);
   }
 
   function formatModel(item) {
     const raw = String(item?.model || '').trim();
-    if (raw) return raw.replace(/^text-/, '').replace(/-latest$/, '').slice(0, 18);
+    if (raw) return formatModelLabel(raw).slice(0, 20);
     return item?.route === 'uc' ? 'Mobile' : 'Web';
   }
 
@@ -90,8 +116,20 @@
 
   <div class="conversation-list">
     {#if filtered.length === 0}
-      <div class="empty-list">
-        {query ? '未找到匹配的会话' : '捕获到官方会话索引后，这里会显示历史对话。'}
+      <div class="empty-list" role="status">
+        {#if query}
+          <div class="empty-title">未找到匹配的会话</div>
+          <div class="empty-hint">没有找到包含“{query.trim()}”的对话标题，可尝试其他关键词。</div>
+          <button type="button" class="empty-action-btn" onclick={() => query = ''}>清除搜索词</button>
+        {:else if captures === 0}
+          <div class="empty-title">等待同步官方会话</div>
+          <div class="empty-hint">捕获到官方会话索引后，这里会显示历史对话。请确保已在当前 ChatGPT 标签页登录。</div>
+          <button type="button" class="empty-action-btn" onclick={onNewChat}>发起新对话</button>
+        {:else}
+          <div class="empty-title">暂无历史会话</div>
+          <div class="empty-hint">当前未发现历史对话记录，随时可以开始新的对话。</div>
+          <button type="button" class="empty-action-btn" onclick={onNewChat}>发起新对话</button>
+        {/if}
       </div>
     {:else}
       {#each filtered as conversation (conversation.id)}
@@ -100,14 +138,20 @@
           class:active={conversation.id === currentId}
           class="conversation-item"
           onclick={() => onSelect(conversation.id)}
+          title={conversation.title || 'Untitled'}
         >
           <span class="conversation-item-topline">
             <span class="conversation-title">{conversation.title || 'Untitled'}</span>
-            <span class="conversation-time">{formatTime(conversation.update_time || conversation.updatedAt)}</span>
+            <span
+              class="conversation-time"
+              title={fullDateTime(conversation.update_time || conversation.updatedAt)}
+            >
+              {formatTime(conversation.update_time || conversation.updatedAt)}
+            </span>
           </span>
           <span class="conversation-item-bottomline">
-            <span class="conversation-model">{formatModel(conversation)}</span>
-            <span class="conversation-preview">{preview(conversation)}</span>
+            <span class="conversation-model" title={conversation.model || ''}>{formatModel(conversation)}</span>
+            <span class="conversation-preview" title={preview(conversation)}>{preview(conversation)}</span>
           </span>
         </button>
       {/each}
@@ -119,3 +163,27 @@
     <span>登录凭据不会离开 ChatGPT 页面</span>
   </footer>
 </aside>
+
+<style>
+  .empty-title {
+    font-weight: 600;
+    color: var(--slim-text, inherit);
+    margin-bottom: 4px;
+  }
+  .empty-hint {
+    margin-bottom: 10px;
+  }
+  .empty-action-btn {
+    display: inline-block;
+    padding: 4px 10px;
+    font-size: 11px;
+    border: 1px solid var(--slim-line);
+    border-radius: 6px;
+    background: var(--slim-soft);
+    color: var(--f7-theme-color, #4facfe);
+    cursor: pointer;
+  }
+  .empty-action-btn:hover {
+    background: var(--slim-surface);
+  }
+</style>

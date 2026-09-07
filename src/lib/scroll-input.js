@@ -9,11 +9,16 @@ export function wheelDeltaPixels(event, viewportHeight, lineHeight = 20) {
 
 export function nestedScrollerCanConsume(target, boundary, delta, styleOf = globalThis.getComputedStyle) {
   if (!delta || !target || !boundary || typeof styleOf !== 'function') return false;
-  let node = target.nodeType === 1 ? target : target.parentElement;
+  let node = target.nodeType === 1 ? target : target?.parentElement;
   while (node && node !== boundary) {
-    if (node.scrollHeight > node.clientHeight + 1 && /^(auto|scroll|overlay)$/.test(styleOf(node).overflowY)) {
-      const remaining = node.scrollHeight - node.clientHeight - node.scrollTop;
-      if (delta < 0 ? node.scrollTop > 1 : remaining > 1) return true;
+    try {
+      const style = styleOf(node);
+      if (style && node.scrollHeight > node.clientHeight + 1 && /^(auto|scroll|overlay)$/.test(style.overflowY)) {
+        const remaining = node.scrollHeight - node.clientHeight - node.scrollTop;
+        if (delta < 0 ? node.scrollTop > 1 : remaining > 1) return true;
+      }
+    } catch {
+      // Ignore uncomputable nodes
     }
     node = node.parentElement;
   }
