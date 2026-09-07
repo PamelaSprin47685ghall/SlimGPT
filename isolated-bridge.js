@@ -10,6 +10,7 @@
   const STORAGE_KEYS = new Set([
     'conversationIndex',
     'observationLedger',
+    'observationLedgerOmissions',
     'userSettings',
     'cachedModels',
     'executionPulse',
@@ -64,6 +65,7 @@
       ? payload.conversationId.trim()
       : '';
     if (!conversationId || /^WEB:/i.test(conversationId) || !chrome.storage?.local) return;
+    if (!['running', 'stopped', 'unknown'].includes(payload.state)) return;
     try {
       await chrome.storage.local.set({
         executionPulse: {
@@ -72,8 +74,10 @@
           payload: {
             type: 'page-execution-state',
             conversationId,
-            state: payload.state === 'running' ? 'running' : 'stopped',
+            state: payload.state,
             source: String(payload.source || 'cross-window'),
+            turnUserMessageId: typeof payload.turnUserMessageId === 'string' ? payload.turnUserMessageId : null,
+            turnAliases: Array.isArray(payload.turnAliases) ? [...new Set(payload.turnAliases.filter((id) => typeof id === 'string' && id))] : [],
             observedAt: Number(payload.observedAt) || Date.now(),
           },
         },

@@ -3,6 +3,7 @@ import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
+import assert from 'node:assert/strict';
 
 const extensionPath = resolve('dist-extension');
 const chromePath = await findChrome();
@@ -98,10 +99,10 @@ async function runVisualScenarios(browser, extensionId) {
   await captureScreenshot(top, '01-empty-state-desktop.png');
 
   // Trigger conversation loading
-  await top.evaluate(`Promise.all([
-    fetch('/backend-api/conversations?offset=0').then((r) => r.json()),
-    fetch('/backend-api/conversation/smoke').then((r) => r.json())
-  ])`);
+  await top.evaluate(`(() => {
+    history.replaceState(history.state, '', '/c/smoke');
+    return fetch('/backend-api/me').then((response) => response.json());
+  })()`);
   await waitFor(async () => {
     const text = await ui.evaluate(`document.querySelector('.message-stage')?.innerText || ''`);
     return text.includes('Python');
@@ -112,6 +113,11 @@ async function runVisualScenarios(browser, extensionId) {
   await ui.evaluate(`document.querySelector('[data-overview-index="0"]')?.click()`);
   await waitFor(async () => (await ui.evaluate(`document.querySelector('.message-stage')?.innerText || ''`)).includes('KaTeX'));
   await sleep(300);
+  const titledLink = await ui.evaluate(`(() => {
+    const link = [...document.querySelectorAll('.message-markdown a')].find((node) => node.textContent.includes('项目链接'));
+    return link ? { href: link.href, title: link.title } : null;
+  })()`);
+  assert.deepEqual(titledLink, { href: 'https://github.com/example/slimgpt', title: 'Project source' });
 
   // Scenario 2: Rich conversation in desktop three-column light mode
   await captureScreenshot(top, '02-rich-conversation-top.png');
@@ -122,25 +128,19 @@ async function runVisualScenarios(browser, extensionId) {
   await captureScreenshot(top, '02b-thought-block-expanded.png');
 
   // Scenario 2c: Thinking slider selection in composer (switch to High & Pro)
-  await ui.evaluate(`(() => {
-    const tickButtons = document.querySelectorAll('.thinking-tick-btn');
-    if (tickButtons && tickButtons[2]) tickButtons[2].click(); // Select High (Level 3)
-  })()`);
+  await ui.evaluate(`document.querySelector('[data-thinking-level="3"]').click()`);
   await sleep(300);
+  assert.equal(await ui.evaluate(`document.querySelector('[data-thinking-level="3"]').getAttribute('aria-checked')`), 'true');
   await captureScreenshot(top, '02c-thinking-slider-high.png');
 
-  await ui.evaluate(`(() => {
-    const tickButtons = document.querySelectorAll('.thinking-tick-btn');
-    if (tickButtons && tickButtons[3]) tickButtons[3].click(); // Select Extra High (Level 4)
-  })()`);
+  await ui.evaluate(`document.querySelector('[data-thinking-level="4"]').click()`);
   await sleep(300);
+  assert.equal(await ui.evaluate(`document.querySelector('[data-thinking-level="4"]').getAttribute('aria-checked')`), 'true');
   await captureScreenshot(top, '02d-thinking-slider-extra-high.png');
 
-  await ui.evaluate(`(() => {
-    const tickButtons = document.querySelectorAll('.thinking-tick-btn');
-    if (tickButtons && tickButtons[4]) tickButtons[4].click(); // Select Pro (Level 5)
-  })()`);
+  await ui.evaluate(`document.querySelector('[data-thinking-level="5"]').click()`);
   await sleep(300);
+  assert.equal(await ui.evaluate(`document.querySelector('[data-thinking-level="5"]').getAttribute('aria-checked')`), 'true');
   await captureScreenshot(top, '02e-thinking-slider-pro.png');
 
   // Scenario 3: Scroll inside the current question+answer turn only
@@ -165,8 +165,32 @@ async function runVisualScenarios(browser, extensionId) {
   await sleep(300);
   await captureScreenshot(top, '05-turn-switch-python.png');
 
+  // Exercise real Svelte event handlers without writing to the OS clipboard.
+  await ui.evaluate(`(() => {
+    window.__clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, 'clipboard');
+    window.__execCommandOriginal = document.execCommand;
+    Object.defineProperty(navigator, 'clipboard', { configurable: true,
+      value: { writeText: async (text) => { window.__copiedCode = text; } } });
+    document.querySelector('.code-copy-btn').click();
+  })()`);
+  await waitFor(async () => (await ui.evaluate(`document.querySelector('.code-copy-btn')?.textContent`)) === '已复制');
+  assert.equal(await ui.evaluate(`window.__copiedCode`), await ui.evaluate(`document.querySelector('pre code').textContent`));
+  await ui.evaluate(`(() => {
+    Object.defineProperty(navigator, 'clipboard', { configurable: true,
+      value: { writeText: async () => { throw new Error('test permission denied'); } } });
+    document.execCommand = () => false;
+    document.querySelector('.code-copy-btn').click();
+  })()`);
+  await waitFor(async () => (await ui.evaluate(`document.querySelector('.code-copy-btn')?.textContent`)) === '复制失败');
+  await ui.evaluate(`(() => {
+    if (window.__clipboardDescriptor) Object.defineProperty(navigator, 'clipboard', window.__clipboardDescriptor);
+    else delete navigator.clipboard;
+    document.execCommand = window.__execCommandOriginal;
+  })()`);
+
   // Scenario 6: Mobile viewport (390x844)
   await top.call('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 2, mobile: true });
+  await top.call('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 });
   await top.evaluate(`(() => {
     const frame = document.getElementById('slimgpt-takeover-frame');
     if (!frame) return;
@@ -175,24 +199,48 @@ async function runVisualScenarios(browser, extensionId) {
     frame.style.height = '844px';
   })()`);
   await sleep(500);
+  const mobileLayout = await ui.evaluate(`(() => {
+    const editor = document.querySelector('.composer-shell textarea').getBoundingClientRect();
+    return { width: innerWidth, scrollWidth: document.documentElement.scrollWidth,
+      editorLeft: editor.left, editorRight: editor.right, editorWidth: editor.width };
+  })()`);
+  assert.ok(mobileLayout.scrollWidth <= mobileLayout.width + 1, 'mobile page must not overflow horizontally');
+  assert.ok(mobileLayout.editorWidth > 100 && mobileLayout.editorLeft >= 0 && mobileLayout.editorRight <= mobileLayout.width + 1);
   await captureScreenshot(top, '06-mobile-chat.png');
 
+  const tapMobileControl = async (label) => {
+    const point = await ui.evaluate(`(() => {
+      const button = [...document.querySelectorAll('.mobile-navbar .button')].find((node) => node.textContent.includes(${JSON.stringify(label)}));
+      if (!button) return null;
+      const rect = button.getBoundingClientRect();
+      return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    })()`);
+    assert.ok(point, `missing mobile control: ${label}`);
+    await top.call('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ ...point, radiusX: 1, radiusY: 1, force: 1, id: 1 }] });
+    await top.call('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  };
+
   // Scenario 7: Mobile sidebar open
-  await ui.evaluate(`document.querySelector('.mobile-navbar .button')?.click()`);
+  await tapMobileControl('☰');
+  await waitFor(async () => await ui.evaluate(`document.querySelector('.sidebar-host')?.classList.contains('open')`));
   await sleep(500);
   await captureScreenshot(top, '07-mobile-sidebar-open.png');
   await ui.evaluate(`document.querySelector('.sidebar-scrim')?.click()`);
+  await waitFor(async () => !(await ui.evaluate(`document.querySelector('.sidebar-host')?.classList.contains('open')`)));
   await sleep(300);
 
   // Scenario 8: Mobile overview drawer open
-  await ui.evaluate(`[...document.querySelectorAll('.mobile-navbar .button')].find((button) => button.textContent.includes('概览'))?.click()`);
+  await tapMobileControl('概览');
+  await waitFor(async () => await ui.evaluate(`document.querySelector('.overview-host')?.classList.contains('open')`));
   await sleep(500);
   await captureScreenshot(top, '08-mobile-overview-open.png');
   await ui.evaluate(`document.querySelector('.sidebar-scrim')?.click()`);
+  await waitFor(async () => !(await ui.evaluate(`document.querySelector('.overview-host')?.classList.contains('open')`)));
   await sleep(300);
 
   // Reset viewport to desktop
   await top.call('Emulation.setDeviceMetricsOverride', { width: 1200, height: 800, deviceScaleFactor: 2, mobile: false });
+  await top.call('Emulation.setTouchEmulationEnabled', { enabled: false });
   await top.evaluate(`(() => {
     const frame = document.getElementById('slimgpt-takeover-frame');
     if (!frame) return;
@@ -246,6 +294,7 @@ function makeRichFixture() {
     } else if (index === 3) {
       content = '这是 Python 示例：\n\n```python\ndef greet(name: str) -> str:\n    return f"Hello, {name}!"\n\nprint(greet("World"))\n```';
     }
+    if (index === 1) content = content.replace('[SlimGPT 项目链接](https://github.com/example/slimgpt)', '[SlimGPT 项目链接](<https://github.com/example/slimgpt> "Project source")');
     mapping[parent].children.push(id);
     mapping[id] = {
       id,
@@ -271,7 +320,7 @@ function makeRichFixture() {
   };
 
   return {
-    document: '<!doctype html><html><head><meta charset="utf-8"><title>Fixture ChatGPT</title></head><body><main id="official">Official fixture</main></body></html>',
+    document: '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Fixture ChatGPT</title></head><body><main id="official">Official fixture</main></body></html>',
     list: {
       items: [
         { id: 'smoke', title: 'Rich Markdown & Branch Demo', update_time: 2 },
@@ -284,17 +333,25 @@ function makeRichFixture() {
 
 async function fulfillFixtureRequest(client, event, fixture) {
   const url = event.request.url;
-  console.log('FETCH REQUEST PAUSED:', url);
+  const parsed = new URL(url);
+  const pathname = parsed.pathname;
   let body = null;
   let contentType = 'text/plain; charset=utf-8';
   if (event.resourceType === 'Document') {
     body = fixture.document;
     contentType = 'text/html; charset=utf-8';
-  } else if (url.includes('/backend-api/conversations')) {
-    body = JSON.stringify(fixture.list);
-    contentType = 'application/json; charset=utf-8';
-  } else if (url.includes('/backend-api/conversation/smoke') || url.includes('/backend-api/conversation/rich-demo')) {
+  } else if (/^\/backend-api\/conversations?\/(?:smoke|rich-demo)(?:\/messages)?$/.test(pathname)) {
     body = JSON.stringify(fixture.conversation);
+    contentType = 'application/json; charset=utf-8';
+  } else if (pathname === '/backend-api/conversations') {
+    body = JSON.stringify({ ...fixture.list, total: fixture.list.items.length,
+      items: Number(parsed.searchParams.get('offset') || 0) ? [] : fixture.list.items });
+    contentType = 'application/json; charset=utf-8';
+  } else if (pathname === '/backend-api/me') {
+    body = JSON.stringify({ id: 'visual-fixture-user' });
+    contentType = 'application/json; charset=utf-8';
+  } else if (pathname.startsWith('/backend-api/')) {
+    body = '{}';
     contentType = 'application/json; charset=utf-8';
   }
 

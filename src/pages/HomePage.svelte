@@ -6,10 +6,13 @@
   import MessageOverview from '../components/MessageOverview.svelte';
   import Composer from '../components/Composer.svelte';
   import { createTransport } from '../lib/transport.js';
-  import { downloadConversationMarkdown } from '../lib/export.js';
+  import { createConversationStreamReader } from '../lib/conversation-stream.js';
+  import { historySyncMessage } from '../lib/history-sync.js';
+  import { matchesPendingTurn } from '../lib/pending-turn.js';
+  import { downloadConversationMarkdown, hasExportableMessage } from '../lib/export.js';
   import {
     loadConversationIndex,
-    loadObservationLedger,
+    loadObservationLedgerState,
     saveConversationIndex,
     saveObservationLedger,
     loadUserSettings,
@@ -24,7 +27,7 @@
     buildConversationView,
     contentToText,
     consumeSse,
-    createConversationSseDecoder,
+    captureMessageContext,
     conversationIdFromPayload,
     conversationIdFromUrl,
     conversationThinkingLevel,
@@ -34,6 +37,7 @@
     findConversationPayload,
     findMessageEvents,
     fingerprintCapture,
+    finishCanonicalSync,
     getToolMessageInfo,
     hydrateConversationObservations,
     ingestConversationMessage,
@@ -50,10 +54,12 @@
   let status = $state({ bridgeReady: false, captureMode: null });
   let conversationMap = $state(new Map());
   let conversationRecords = $state(new Map());
+  let cacheOmissions = $state(new Map());
   let pendingUser = $state(null);
   let currentConversationId = $state(null);
   let loadingConversationId = $state(null);
   let navigationTimedOutId = $state(null);
+  let historySyncStates = $state(new Map());
   let captures = $state(0);
   let composerStatus = $state('');
   let composerError = $state(false);
@@ -80,7 +86,6 @@
   // Main-world recovery is MutationObserver-driven but can traverse the
   // official root error boundary before it confirms the conversation request.
   const SEND_COMMAND_WATCHDOG_MS = 30_000;
-  const sseBuffers = new Map();
   const sseDecoders = new Map();
   const xhrBuffers = new Map();
   const captureConversationIds = new Map();
@@ -94,6 +99,7 @@
 
   const conversations = $derived([...conversationMap.values()]);
   const currentRecord = $derived(currentConversationId ? conversationRecords.get(currentConversationId) || null : null);
+  const cacheNotice = $derived(cacheOmissions.get(currentConversationId) || cacheOmissions.get('*') || null);
   const currentPayload = $derived(currentRecord?.payload || null);
   const currentHasRenderableContent = $derived(Boolean(
     currentConversationId && hasRenderableConversationContent(currentConversationId)
@@ -117,6 +123,9 @@
   const statusState = $derived(status.bridgeError ? 'error' : (liveConnected ? 'online' : 'offline'));
   const statusLabel = $derived(status.bridgeError ? '连接失败' : (liveConnected ? (status.takeover === false ? '已连接' : '已接管') : '连接中'));
   const conversationHistoryPending = $derived(Boolean(currentConversationId && !currentRecord?.canonicalComplete));
+  const currentHistorySyncState = $derived(historySyncStates.get(currentConversationId));
+  const historySyncProblem = $derived(historySyncMessage(currentHistorySyncState,
+    currentHistorySyncState?.state === 'loading' ? null : currentRecord?.canonicalSyncError));
   const conversationPending = $derived(Boolean(conversationHistoryPending && navigationTimedOutId !== currentConversationId));
   const conversationBlockingLoad = $derived(Boolean(conversationHistoryPending && !messages.length));
   const conversationTimedOut = $derived(Boolean(conversationHistoryPending && navigationTimedOutId === currentConversationId));
@@ -141,6 +150,10 @@
     const live = currentConversationId ? conversationRecords.get(currentConversationId)?.observations || [] : [];
     const lastAssistant = [...live].reverse().find((message) => message?.role !== 'user' && message?.role !== 'tool');
     window.__SLIMGPT_DEBUG__ = {
+      canonicalComplete: currentRecord?.canonicalComplete === true,
+      canonicalSyncError: currentRecord?.canonicalSyncError || null,
+      turnCount: turns.length,
+      unresolvedCount: unresolvedTurns.length,
       workState: conversationWorkState,
       lastAssistant: lastAssistant ? {
         id: lastAssistant.id,
@@ -204,7 +217,6 @@
       clearTimeout(saveTimer);
       clearTimeout(sendTimer);
       clearTimeout(navigationTimer);
-      sseBuffers.clear();
       sseDecoders.clear();
       xhrBuffers.clear();
       captureConversationIds.clear();
@@ -229,8 +241,9 @@
 
   async function restoreObservationLedger() {
     try {
-      const entries = await loadObservationLedger();
+      const { entries, omissions } = await loadObservationLedgerState();
       mergeObservationLedger(entries);
+      applyCacheOmissions(omissions);
     } catch {
       // The server/canonical conversation remains authoritative if the local
       // observation cache cannot be restored.
@@ -249,12 +262,20 @@
     if (!update || typeof update !== 'object') return;
     if (Array.isArray(update.conversationIndex)) mergeConversationIndex(update.conversationIndex);
     if (Array.isArray(update.observationLedger)) mergeObservationLedger(update.observationLedger);
+    if (Array.isArray(update.observationLedgerOmissions)) applyCacheOmissions(update.observationLedgerOmissions);
     if (update.executionPulse?.payload?.type === 'page-execution-state') {
       applyExecutionState(update.executionPulse.payload);
     }
     if (update.userSettings && typeof update.userSettings === 'object') {
       userSettings = { ...DEFAULT_SETTINGS, ...userSettings, ...update.userSettings };
     }
+  }
+
+  function applyCacheOmissions(omissions) {
+    const known = new Set(['budget', 'conversation-limit', 'structure-limit', 'invalid-value', 'read-failed', 'write-failed']);
+    cacheOmissions = new Map((omissions || [])
+      .filter((item) => typeof item?.id === 'string' && known.has(item.reason))
+      .map((item) => [item.id, item.reason]));
   }
 
   function mergeConversationIndex(items, { promote = true } = {}) {
@@ -353,6 +374,7 @@
       schedulePersist();
     }
     else if (message.type === 'page-location') handlePageLocation(message.url);
+    else if (message.type === 'canonical-sync-status') handleHistorySyncStatus(message);
     else if (message.type === 'page-capture' || message.type === 'canonical-capture') handleCapture(message);
     else if (message.type === 'composer-result') handleComposerResult(message);
     else if (message.type === 'capture-warning') setComposerStatus(`页面启动过快，${message.dropped || 1} 个早期同步事件未能保留；可刷新页面重新同步`, true);
@@ -360,6 +382,44 @@
       status = { ...status, bridgeError: message.command === 'install-page-hook' };
       setComposerStatus(message.error || '命令失败', true);
     }
+  }
+
+  function handleHistorySyncStatus(message) {
+    const id = typeof message.conversationId === 'string' ? message.conversationId.trim() : '';
+    if (!id || !['loading', 'error', 'complete'].includes(message.state)) return;
+    const states = new Map(historySyncStates);
+    const previous = states.get(id);
+    if (message.state !== 'loading' && previous?.canonicalSyncId && message.canonicalSyncId && previous.canonicalSyncId !== message.canonicalSyncId) return;
+    if (message.state === 'complete') {
+      const before = conversationRecords.get(id);
+      const record = finishCanonicalSync(before, message.canonicalSyncId);
+      if (record !== before) {
+        const records = new Map(conversationRecords);
+        records.set(id, record);
+        conversationRecords = records;
+      }
+      // The sender's success does not prove that every bridged page arrived.
+      if (!record?.canonicalComplete || record.canonicalSyncError || !record.canonicalRetiredSyncIds?.includes(message.canonicalSyncId)) {
+        states.set(id, { state: 'error', code: 'invalid-history' });
+      } else states.set(id, { state: 'complete', canonicalSyncId: message.canonicalSyncId });
+    } else states.set(id, { ...previous, ...message });
+    while (states.size > MAX_CACHED_CONVERSATIONS) {
+      const oldest = [...states.keys()].find((key) => key !== currentConversationId && key !== id);
+      if (!oldest) break;
+      states.delete(oldest);
+    }
+    historySyncStates = states;
+    if (id === currentConversationId && states.get(id)?.state === 'error') {
+      clearTimeout(navigationTimer);
+      navigationTimer = null;
+      navigationTimedOutId = id;
+    }
+  }
+
+  function retryHistorySync() {
+    if (!currentConversationId || !status.bridgeReady || currentHistorySyncState?.state === 'loading') return;
+    // The page hook enforces server backoff; a click never forces a retry loop.
+    transport.send({ type: 'refresh-conversation', conversationId: currentConversationId });
   }
 
   function handleCapture(capture) {
@@ -380,27 +440,22 @@
     const isEventStream = capture.transport === 'sse' || String(capture.mimeType || '').includes('text/event-stream');
     if (isEventStream) {
       const key = capture.requestId || capture.url || 'sse';
-      const decoder = sseDecoders.get(key) || createConversationSseDecoder();
+      const decoder = sseDecoders.get(key) || createConversationStreamReader({ maxBufferedChars: MAX_CAPTURE_BUFFER });
       sseDecoders.set(key, decoder);
-      const { rest, frames } = consumeSse(sseBuffers.get(key) || '', text, capture.phase === 'complete');
+      const { values, error, failed } = decoder.push(text, capture.phase === 'complete');
       if (capture.phase === 'complete') {
-        sseBuffers.delete(key);
         sseDecoders.delete(key);
-      } else {
-        sseBuffers.set(key, rest);
       }
-
-      for (const frame of frames) {
-        if (frame.data === '[DONE]') {
-          // [DONE] terminates this SSE segment only. It is not evidence that
-          // the conversation turn has stopped; async/tool work may continue.
-          continue;
-        }
-        try {
-          const decoded = decoder.decode(frame);
-          if (decoded && typeof decoded === 'object') processStructured(decoded, capture);
-        } catch {
-          setComposerStatus('官方增量事件无法解码；将以完整会话同步结果为准', true);
+      for (const value of values) processStructured(value, capture);
+      if (error) {
+        setComposerStatus(error === 'buffer-limit'
+          ? '一个流式事件超出解析上限，已停止合并这段响应，正在同步完整会话'
+          : '响应流不完整或无法解码，已停止合并后续增量，正在同步完整会话', true);
+      }
+      if (error || (failed && capture.phase === 'complete')) {
+        const scope = resolveCapturedConversation(capture);
+        if (!scope.conflicted && scope.conversationId) {
+          transport.send({ type: 'refresh-conversation', conversationId: scope.conversationId });
         }
       }
       if (capture.phase === 'complete') {
@@ -490,7 +545,10 @@
       return;
     }
 
-    for (const event of findMessageEvents(value)) {
+    // Both ordinary message events and decoded v1 deltas contain snapshots.
+    // Appending them heuristically corrupts replacements, truncations and
+    // repeated text in reasoning/tool arguments.
+    for (const event of findMessageEvents(value, { textMode: 'snapshot' })) {
       const scope = resolveCapturedConversation(
         capture,
         event.conversationId,
@@ -508,23 +566,17 @@
   function acceptMessageEvent(id, event, capture) {
     maybeActivateCapturedConversation(id, capture);
     bindPendingTurnIdentity(id, capture);
-    const turnAliases = [...new Set([
-      ...(event.turnAliases || []),
-      ...(capture.turnAliases || []),
-    ].filter(Boolean))];
+    const turnContext = captureMessageContext(event, capture);
     const next = new Map(conversationRecords);
     next.set(id, ingestConversationMessage(next.get(id), event.message, {
-      textMode: capture.transport === 'dom' ? 'snapshot' : 'progressive',
-      semanticTurnId: event.turnId || capture.turnId || null,
-      turnAliases,
-      transportTurnId: capture.transportTurnId || capture.transportSessionId || null,
-      turnUserMessageId: capture.turnUserMessageId || event.turnUserMessageId || null,
-      turnParentMessageId: capture.turnParentMessageId || event.turnParentMessageId || null,
+      textMode: 'snapshot',
+      ...turnContext,
       captureId: capture.requestId || null,
       captureTransport: capture.transport || null,
       observationOrdinal: ++observationOrdinal,
       sequenceNumber: event.sequenceNumber ?? null,
       outputIndex: event.outputIndex ?? null,
+      contentIndex: event.contentIndex ?? null,
       responseId: event.responseId || null,
       itemId: event.itemId || null,
       callId: event.callId || null,
@@ -543,7 +595,7 @@
     if (
       !pendingUser ||
       pendingUser.conversationId !== null ||
-      capture.conversationRequest !== true
+      capture.conversationRequest !== true || !matchesPendingTurn(pendingUser, null, capture)
     ) {
       return false;
     }
@@ -574,8 +626,14 @@
   function flushPendingLiveEvents(id) {
     if (!id || !pendingLiveEventCount) return;
     const queued = [];
-    for (const entries of pendingLiveEvents.values()) queued.push(...entries);
-    clearPendingLiveEvents();
+    for (const [key, entries] of pendingLiveEvents) {
+      const matching = entries.filter((entry) => matchesPendingTurn(pendingUser, id, entry.capture));
+      const retained = entries.filter((entry) => !matching.includes(entry));
+      queued.push(...matching);
+      pendingLiveEventCount -= matching.length;
+      if (retained.length) pendingLiveEvents.set(key, retained);
+      else pendingLiveEvents.delete(key);
+    }
     for (const entry of queued) {
       acceptMessageEvent(id, entry.event, {
         ...entry.capture,
@@ -616,32 +674,6 @@
       ...(capture.turnAliases || []),
       capture.turnId,
     ].filter(Boolean))];
-    const pendingAliases = [...new Set([
-      ...(pendingUser?.turnAliases || []),
-      pendingUser?.turnId,
-      pendingUser?.message?.turnId,
-      ...(pendingUser?.message?.turnAliases || []),
-    ].filter(Boolean))];
-    const transportIds = new Set([
-      lifecycle.transportSessionId,
-      lifecycle.transportTurnId,
-      capture.transportSessionId,
-      capture.transportTurnId,
-    ].filter(Boolean));
-    const pendingTransportIds = [
-      pendingUser?.transportSessionId,
-      pendingUser?.transportTurnId,
-      pendingUser?.message?.transportSessionId,
-      pendingUser?.message?.transportTurnId,
-    ].filter(Boolean);
-    const correlated = capture.conversationRequest === true ||
-      Boolean(
-        (lifecycle.turnUserMessageId || capture.turnUserMessageId) &&
-        pendingUser?.userMessageId === (lifecycle.turnUserMessageId || capture.turnUserMessageId)
-      ) ||
-      pendingTransportIds.some((id) => transportIds.has(id)) ||
-      (turnAliases.length > 0 && pendingAliases.some((alias) => turnAliases.includes(alias)));
-
     const identityCapture = {
       ...capture,
       turnId: lifecycle.turnId || capture.turnId || null,
@@ -650,7 +682,10 @@
       transportTurnId: lifecycle.transportTurnId || capture.transportTurnId || null,
       turnUserMessageId: lifecycle.turnUserMessageId || capture.turnUserMessageId || null,
       turnParentMessageId: lifecycle.turnParentMessageId || capture.turnParentMessageId || null,
+      turnExchangeId: lifecycle.turnExchangeId || capture.turnExchangeId || null,
     };
+    const correlated = matchesPendingTurn(pendingUser, id, identityCapture);
+    if (!correlated) return;
     bindPendingTurnIdentity(id, identityCapture);
     if (
       pendingUser?.conversationId === null &&
@@ -669,6 +704,7 @@
       return;
     }
     if (pendingUser.conversationId && pendingUser.conversationId !== id) return;
+    if (!matchesPendingTurn(pendingUser, id, capture)) return;
     const turnAliases = capture.turnAliases?.length
       ? capture.turnAliases
       : (pendingUser.turnAliases || []);
@@ -676,6 +712,7 @@
       ...pendingUser,
       turnId: capture.turnId || pendingUser.turnId || null,
       turnAliases,
+      turnExchangeId: capture.turnExchangeId || pendingUser.turnExchangeId || null,
       transportSessionId: capture.transportSessionId || pendingUser.transportSessionId || null,
       transportTurnId: capture.transportTurnId || pendingUser.transportTurnId || null,
       userMessageId: capture.turnUserMessageId || pendingUser.userMessageId || null,
@@ -757,10 +794,12 @@
   }
 
   function maybeActivateCapturedConversation(id, capture) {
+    const correlated = matchesPendingTurn(pendingUser, id, capture);
     bindPendingTurnIdentity(id, capture);
     if (id === currentConversationId) return;
     if (
       capture.conversationRequest === true &&
+      correlated &&
       pendingUser?.conversationId === null &&
       (!currentConversationId || isProvisionalConversationId(currentConversationId))
     ) {
@@ -770,10 +809,13 @@
 
   function acceptConversationPayload(id, payload, capture = {}) {
     const nextRecords = new Map(conversationRecords);
-    const record = ingestConversationPayload(nextRecords.get(id), payload, {
+    const previousRecord = nextRecords.get(id);
+    const record = ingestConversationPayload(previousRecord, payload, {
       canonicalComplete: capture.canonicalComplete === true,
       canonicalSyncId: capture.canonicalSyncId || null,
       canonicalPageIndex: capture.canonicalPageIndex ?? null,
+      canonicalPageCount: capture.canonicalPageCount,
+      conversationId: id,
     });
     const mergedPayload = record.payload;
     nextRecords.set(id, record);
@@ -791,6 +833,17 @@
     }
 
     conversationRecords = nextRecords;
+    if (capture.canonicalSyncId && !record.canonicalSyncId && !record.canonicalSyncError &&
+        record.canonicalComplete && record.payload !== previousRecord?.payload) {
+      const states = new Map(historySyncStates);
+      states.set(id, { state: 'complete', canonicalSyncId: capture.canonicalSyncId });
+      historySyncStates = states;
+    }
+    if (record.canonicalSyncError && id === currentConversationId) {
+      clearTimeout(navigationTimer);
+      navigationTimer = null;
+      navigationTimedOutId = id;
+    }
     if (!mergedPayload) {
       schedulePersist();
       return;
@@ -984,18 +1037,22 @@
   }
 
   function exportMarkdown() {
-    if (conversationPending) {
-      setComposerStatus('当前对话尚未加载完成，暂不能导出', true);
-      return;
-    }
-    const exportable = messages.filter((message) => !message?.pending && String(message?.text || '').trim());
-    if (!exportable.length) {
-      setComposerStatus('当前对话暂无可导出的消息', true);
+    const exportable = turns.flatMap((turn) => [turn.user, ...turn.replies]).filter(hasExportableMessage);
+    const hasUnresolved = unresolvedTurns.some((group) => group.replies?.some(hasExportableMessage));
+    if (!exportable.length && !hasUnresolved) {
+      setComposerStatus(conversationHistoryPending ? '当前对话尚未加载，暂无可导出的内容' : '当前对话暂无可导出的消息', true);
       return;
     }
     const title = currentMeta?.title || 'ChatGPT Conversation';
-    const { filename } = downloadConversationMarkdown(title, exportable);
-    setComposerStatus(`已导出 ${filename}`);
+    try {
+      const { filename } = downloadConversationMarkdown(title, exportable, {
+        unresolved: unresolvedTurns,
+        historyComplete: currentRecord?.canonicalComplete === true,
+      });
+      setComposerStatus(conversationHistoryPending ? `已导出当前已取得的内容（历史不完整）：${filename}` : `已导出 ${filename}`);
+    } catch {
+      setComposerStatus('导出失败，未生成完整文件；当前聊天内容仍保留在页面中', true);
+    }
   }
 
   function sendMessage(text, options = {}) {
@@ -1243,11 +1300,13 @@
     persistInFlight = true;
     const indexSnapshot = [...conversations];
     const recordsSnapshot = new Map(conversationRecords);
+    const omissions = [];
     try {
       await Promise.all([
         saveConversationIndex(indexSnapshot),
-        saveObservationLedger(recordsSnapshot),
+        saveObservationLedger(recordsSnapshot, { onOmitted: (item) => omissions.push(item) }),
       ]);
+      applyCacheOmissions(omissions);
     } catch {
       setComposerStatus('无法保存本地会话缓存；当前聊天不受影响', true);
     } finally {
@@ -1485,10 +1544,26 @@
           </div>
         {/if}
 
+        {#if historySyncProblem}
+          <div class="history-sync-notice history-sync-error" role="status" aria-live="polite">
+            <span>{historySyncProblem}</span>
+            <Button small disabled={!status.bridgeReady} onClick={retryHistorySync}>重试同步</Button>
+          </div>
+        {:else if currentHistorySyncState?.state === 'loading' && currentRecord?.canonicalSyncError}
+          <div class="history-sync-notice" role="status">正在重新读取完整历史，已有内容保持不变。</div>
+        {/if}
+
         {#if conversationWorkState === 'running' && !conversationBlockingLoad}
           <div class="work-indicator" role="status" aria-live="polite">
             <span class="work-indicator-spinner" aria-hidden="true"></span>
             <span>对话执行中：已观测到官方页面仍在生成或服务端 turn 尚未结束…</span>
+          </div>
+        {/if}
+        {#if cacheNotice}
+          <div class="history-sync-notice cache-integrity-notice" role="status">
+            {cacheNotice === 'read-failed'
+              ? '本地缓存未能读取；请等待完整历史同步，当前取得的内容仍可导出。'
+              : '本会话的本地输出缓存未完整保存；当前页面内容未被裁剪。刷新后需要重新同步历史，尚未同步的内容可先导出。'}
           </div>
         {/if}
       </section>

@@ -2,6 +2,8 @@
   import { onDestroy } from 'svelte';
   import IncrementalMarkdown from './IncrementalMarkdown.svelte';
   import ToolPayloadBlock from './ToolPayloadBlock.svelte';
+  import { copyText } from '../lib/clipboard.js';
+  import { formatModelLabel, isMessageStreaming, isTerminalMessage } from '../lib/message-presentation.js';
 
   let {
     message,
@@ -9,14 +11,29 @@
   } = $props();
 
   let copied = $state(false);
+  let copyError = $state(false);
   let userToggled = $state(false);
   let thoughtManualState = $state(false);
   let copyTimer = null;
+  const codeCopyTimers = new Map();
+  let previousMessageKey = null;
+  const messageKey = $derived(message?.observationKey || message?.itemId || message?.nodeId || message?.id || null);
+
+  $effect(() => {
+    const key = messageKey;
+    if (key === previousMessageKey) return;
+    previousMessageKey = key;
+    userToggled = false;
+    thoughtManualState = false;
+    copied = false;
+    copyError = false;
+    clearTimeout(copyTimer);
+  });
 
   const hasText = $derived(Boolean(String(message?.text || '').trim()));
   const hasThought = $derived(Boolean(String(message?.thought || '').trim()));
-  const isThinking = $derived(Boolean(message?.isThinking));
-  const isStreaming = $derived(Boolean(message?.live && message?.status !== 'finished_successfully' && message?.status !== 'finished'));
+  const isThinking = $derived(Boolean(message?.isThinking && !message?.error && !isTerminalMessage(message)));
+  const isStreaming = $derived(isMessageStreaming(message));
   const isError = $derived(Boolean(message?.error || message?.status === 'failed'));
   const unrecognized = $derived(Boolean(!hasText && !hasThought && !message?.tool && !isThinking && !isError && message?.unrecognized));
 
@@ -29,76 +46,60 @@
 
   onDestroy(() => {
     clearTimeout(copyTimer);
+    for (const timer of codeCopyTimers.values()) clearTimeout(timer);
+    codeCopyTimers.clear();
   });
 
   async function copyMessage() {
+    const key = messageKey;
     const text = String(message?.text || message?.thought || '');
     if (!text) return;
     try {
-      if (navigator.clipboard) {
-        await navigator.clipboard.writeText(text);
-      } else {
-        const textarea = document.createElement('textarea');
-        textarea.value = text;
-        document.body.appendChild(textarea);
-        textarea.select();
-        document.execCommand('copy');
-        textarea.remove();
-      }
+      await copyText(text);
+      if (key !== messageKey) return;
       copied = true;
-      clearTimeout(copyTimer);
-      copyTimer = setTimeout(() => { copied = false; }, 1800);
+      copyError = false;
     } catch {
-      // Ignore clipboard write failures
+      if (key !== messageKey) return;
+      copied = false;
+      copyError = true;
     }
+    clearTimeout(copyTimer);
+    copyTimer = setTimeout(() => { copied = false; copyError = false; }, 2400);
   }
 
-  function handleBubbleClick(event) {
-    const copyBtn = event.target.closest('.code-copy-btn');
+  async function handleBubbleClick(event) {
+    const copyBtn = event.target?.closest?.('.code-copy-btn');
     if (!copyBtn) return;
     const codeBlock = copyBtn.closest('.code-block');
     const code = codeBlock?.querySelector('pre code')?.textContent || '';
     if (!code) return;
+    let succeeded = false;
     try {
-      if (navigator.clipboard) {
-        navigator.clipboard.writeText(code).then(() => {
-          showCopySuccess(copyBtn);
-        });
-      } else {
-        const textarea = document.createElement('textarea');
-        textarea.value = code;
-        document.body.appendChild(textarea);
-        textarea.select();
-        document.execCommand('copy');
-        textarea.remove();
-        showCopySuccess(copyBtn);
-      }
-    } catch {}
-  }
-
-  function showCopySuccess(btn) {
-    btn.textContent = '已复制';
-    btn.classList.add('copied');
-    setTimeout(() => {
-      btn.textContent = '复制';
-      btn.classList.remove('copied');
-    }, 1800);
-  }
-
-  function formatModelBadge(raw) {
-    if (!raw) return '';
-    const str = String(raw).toLowerCase();
-    if (str.includes('pro')) return 'GPT-5.6 Pro';
-    if (str.includes('luna')) return 'GPT-5.6 Luna';
-    if (str.includes('sol') || str.includes('5.6') || str.includes('gpt-5')) return 'GPT-5.6';
-    return String(raw)
-      .replace(/^text-/, '')
-      .replace(/-latest$/, '')
-      .slice(0, 16);
+      await copyText(code);
+      succeeded = true;
+    } catch {
+      // Report failure rather than silently claiming success or rejecting an
+      // unobserved clipboard promise.
+    }
+    if (!copyBtn.isConnected) return;
+    copyBtn.textContent = succeeded ? '已复制' : '复制失败';
+    copyBtn.classList.toggle('copied', succeeded);
+    clearTimeout(codeCopyTimers.get(copyBtn));
+    codeCopyTimers.set(copyBtn, setTimeout(() => {
+      copyBtn.textContent = '复制';
+      copyBtn.classList.remove('copied');
+      codeCopyTimers.delete(copyBtn);
+    }, 2400));
   }
 </script>
 
-<div class={`message-card role-${message?.role || 'unknown'} ${message?.tool?.kind || ''} ${isError ? 'is-error' : ''}`}>
+<div
+  class={`message-card role-${message?.role || 'unknown'} ${message?.tool?.kind || ''} ${isError ? 'is-error' : ''}`}
+  data-message-id={message?.id}
+  data-item-id={message?.itemId || undefined}
+  data-message-phase={message?.phase || undefined}
+>
   <div class="message-avatar" aria-hidden="true">
     {#if message?.tool?.kind === 'tool-call'}
       ↗
@@ -139,7 +140,7 @@
             {message.thinkingLevel.icon} {message.thinkingLevel.label}
           </span>
         {:else if message?.model}
-          <span class="meta-badge model-badge">{formatModelBadge(message.model)}</span>
+          <span class="meta-badge model-badge" title={message.model}>{formatModelLabel(message.model)}</span>
         {/if}
 
         {#if message?.tool}
@@ -157,14 +158,14 @@
           <span class="branch-control">
             <button
               type="button"
-              aria-label="Previous branch"
+              aria-label="上一分支"
               disabled={message.siblingIndex <= 0}
               onclick={() => onBranch(message.nodeId, -1)}
             >‹</button>
             <span>{message.siblingIndex + 1}/{message.siblingCount}</span>
             <button
               type="button"
-              aria-label="Next branch"
+              aria-label="下一分支"
               disabled={message.siblingIndex >= message.siblingCount - 1}
               onclick={() => onBranch(message.nodeId, 1)}
             >›</button>
@@ -180,7 +181,8 @@
             class:copied
             onclick={copyMessage}
             aria-label="复制消息"
-          >{copied ? '已复制' : '复制'}</button>
+            aria-live="polite"
+          >{copied ? '已复制' : copyError ? '复制失败' : '复制'}</button>
         {/if}
       </div>
     </div>
@@ -232,6 +234,9 @@
         <div class="error-notice">⚠️ 消息生成失败或被官方界面中断</div>
       {:else if !hasThought}
         <div class="empty-notice">（无文字内容）</div>
+      {/if}
+      {#if message?.cacheRedacted}
+        <div class="unrecognized-notice" role="note">此项来自本地缓存，其中的凭据字段已省略；重新同步后可查看服务器提供的内容。</div>
       {/if}
     </div>
   </div>

@@ -182,7 +182,7 @@ test('extension storage loads migrate the prior iframe-local cache once', async 
         storage: {
           local: {
             async get(key) {
-              return { [key]: stored[key] };
+              return Object.fromEntries((Array.isArray(key) ? key : [key]).map((name) => [name, stored[name]]));
             },
             async set(values) {
               Object.assign(stored, values);

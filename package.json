@@ -12,6 +12,7 @@
     "live:smoke": "npm run build:extension && node scripts/live-smoke.mjs",
     "live:smoke:real": "npm run build:extension && node scripts/live-smoke.mjs --live",
     "test": "node --test tests/*.test.js",
+    "test:markdown": "node scripts/markdown-smoke.mjs",
     "check": "node --check main-mitm.js && node --check isolated-bridge.js && node --check core.js && node --check src/lib/incremental-markdown.js && node --check scripts/build.mjs && node --check scripts/live-smoke.mjs && node --check scripts/visual-verify.mjs && node -e \"const fs=require('node:fs'); for (const f of ['manifest.json','manifest.firefox.json','manifest.orion.json']) JSON.parse(fs.readFileSync(f,'utf8'))\""
   },
   "dependencies": {

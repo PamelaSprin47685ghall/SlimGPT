@@ -1,6 +1,7 @@
 <script>
   import { onDestroy, tick } from 'svelte';
   import MessageBubble from './MessageBubble.svelte';
+  import { nestedScrollerCanConsume, wheelDeltaPixels } from '../lib/scroll-input.js';
 
   let {
     turns = [],
@@ -188,7 +189,7 @@
 
   function isEditableTarget(target) {
     if (!(target instanceof Element)) return false;
-    return Boolean(target.closest('input, textarea, select, button, a, [contenteditable="true"], [role="textbox"]'));
+    return Boolean(target.closest('input, textarea, select, button, a, pre, .table-wrap, [contenteditable="true"], [role="textbox"]'));
   }
 
   function handleKeydown(event) {
@@ -229,23 +230,24 @@
 
   function handleWheel(event) {
     if (!hasRenderableContent || !scroller) return;
-    if (Math.abs(event.deltaX) > Math.abs(event.deltaY)) return;
-    if (event.deltaY < 0) tailPinned = false;
+    const delta = wheelDeltaPixels(event, scroller.clientHeight);
+    if (!delta || nestedScrollerCanConsume(event.target, scroller, delta)) return;
+    if (delta < 0) tailPinned = false;
     cancelEdgeSettle();
 
     if (boundaryDirection) {
       event.preventDefault();
-      pushBoundary(event.deltaY >= 0 ? 1 : -1, Math.abs(event.deltaY));
+      pushBoundary(delta >= 0 ? 1 : -1, Math.abs(delta));
       return;
     }
-    if (event.deltaY > 0 && atBottom()) {
+    if (delta > 0 && atBottom()) {
       event.preventDefault();
-      pushBoundary(1, Math.abs(event.deltaY));
+      pushBoundary(1, Math.abs(delta));
       return;
     }
-    if (event.deltaY < 0 && atTop()) {
+    if (delta < 0 && atTop()) {
       event.preventDefault();
-      pushBoundary(-1, Math.abs(event.deltaY));
+      pushBoundary(-1, Math.abs(delta));
       return;
     }
     resetBoundaryRunway();
@@ -253,11 +255,15 @@
 
   function handleTouchStart(event) {
     cancelEdgeSettle();
-    touchStartY = event.touches?.[0]?.clientY ?? null;
+    touchStartY = event.touches?.length === 1 ? event.touches[0].clientY : null;
   }
 
   function handleTouchEnd(event) {
     if (touchStartY == null) return;
+    if (event.touches?.length || event.defaultPrevented) {
+      touchStartY = null;
+      return;
+    }
     const endY = event.changedTouches?.[0]?.clientY ?? touchStartY;
     const delta = endY - touchStartY;
     touchStartY = null;

@@ -2,6 +2,7 @@
   import { Button, Segmented } from 'framework7-svelte';
   import { tick } from 'svelte';
   import { THINKING_LEVELS } from '../lib/storage.js';
+  import { shouldSubmitOnEnter } from '../lib/message-presentation.js';
 
   let {
     value = $bindable(''),
@@ -16,6 +17,7 @@
   } = $props();
 
   let textareaEl = $state(null);
+  let composing = false;
   const MIN_HEIGHT = 34;
   const MAX_HEIGHT = 160;
 
@@ -50,7 +52,7 @@
   }
 
   function onKeydown(event) {
-    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+    if (shouldSubmitOnEnter(event, composing)) {
       event.preventDefault();
       submit();
     }
@@ -131,12 +133,14 @@
       bind:this={textareaEl}
       bind:value
       onkeydown={onKeydown}
+      oncompositionstart={() => { composing = true; }}
+      oncompositionend={() => { composing = false; }}
       oninput={adjustHeight}
       disabled={disabled || loading}
       aria-busy={busy}
       rows="1"
       placeholder={loading ? '正在加载对话…' : (disabled ? 'ChatGPT 页面桥尚未就绪…' : (busy ? '正在提交上一条消息…' : '发消息…'))}
-      aria-label="Message"
+      aria-label="消息"
     ></textarea>
     <Button
       class="send-button"
@@ -144,7 +148,7 @@
       round
       disabled={disabled || loading || busy || !value.trim()}
       onClick={submit}
-      aria-label="Send"
+      aria-label="发送"
     >↑</Button>
   </div>
   <div class="composer-hint">Enter 发送 · Shift+Enter 换行 · 失败不会自动重发</div>

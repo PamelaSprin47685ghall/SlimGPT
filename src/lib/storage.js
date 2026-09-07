@@ -2,14 +2,15 @@ const INDEX_KEY = 'slimgpt:conversation-index:v1';
 const SETTINGS_KEY = 'slimgpt:user-settings:v1';
 const MODELS_CACHE_KEY = 'slimgpt:models-cache:v1';
 const OBSERVATION_LEDGER_KEY = 'slimgpt:observation-ledger:v1';
+const LEDGER_OMISSIONS_KEY = 'slimgpt:observation-ledger-omissions:v1';
 const STORAGE_BRIDGE_CHANNEL = 'slimgpt-ui-v1';
 const STORAGE_BRIDGE_HOST_ORIGIN = 'https://chatgpt.com';
 const STORAGE_BRIDGE_TIMEOUT = 10_000;
 const MAX_LEDGER_CONVERSATIONS = 24;
 const MAX_LEDGER_BYTES = 4 * 1024 * 1024;
-const MAX_LEDGER_STRING = 512 * 1024;
-const MAX_LEDGER_ARRAY = 256;
-const MAX_LEDGER_OBJECT_KEYS = 160;
+const MAX_LEDGER_DEPTH = 64;
+const MAX_LEDGER_NODES = 200_000;
+const ledgerEncoder = new TextEncoder();
 
 let storageBridgeRequestCounter = 0;
 let storageBridgeWindow = null;
@@ -52,6 +53,8 @@ const PERSISTED_METADATA_KEYS = new Set([
   'inline_cot_expandable_content',
   'aggregate_result',
   'attachments',
+  'content_references',
+  'citations',
   'is_error',
   'error',
 ]);
@@ -143,59 +146,97 @@ export async function saveConversationIndex(items) {
 }
 
 export async function loadObservationLedger() {
+  return (await loadObservationLedgerState()).entries;
+}
+
+export async function loadObservationLedgerState() {
   let stored = [];
+  let omissions = [];
+  let migrationStorage = null;
   try {
     const storage = storageArea();
     if (storage) {
-      const value = await storage.get('observationLedger');
+      // Read payload and omission manifest together, so a concurrent save
+      // cannot pair one cache revision with another revision's warnings.
+      const value = await storage.get(['observationLedger', 'observationLedgerOmissions']);
+      omissions = value.observationLedgerOmissions || [];
       if (Array.isArray(value.observationLedger)) stored = value.observationLedger;
       else {
         stored = readLegacyJson(OBSERVATION_LEDGER_KEY, []);
-        if (stored.length) await storage.set({ observationLedger: compactObservationLedger(stored) });
+        if (stored.length) migrationStorage = storage;
       }
     } else {
       stored = readLegacyJson(OBSERVATION_LEDGER_KEY, []);
+      omissions = readLegacyJson(LEDGER_OMISSIONS_KEY, []);
     }
   } catch {
-    return [];
+    return { entries: [], omissions: [{ id: '*', reason: 'read-failed' }] };
   }
-  return compactObservationLedger(stored);
+  const revalidatedOmissions = [];
+  const entries = compactObservationLedger(stored, { onOmitted: (item) => revalidatedOmissions.push(item) });
+  omissions = [...(Array.isArray(omissions) ? omissions : []), ...revalidatedOmissions];
+  if (migrationStorage) {
+    try {
+      await migrationStorage.set({ observationLedger: entries, observationLedgerOmissions: omissions });
+    } catch {
+      // A failed migration write must not throw away a successful read.
+      omissions.push({ id: '*', reason: 'write-failed' });
+    }
+  }
+  return { entries, omissions };
 }
 
-export async function saveObservationLedger(records) {
-  const compact = compactObservationLedger(records);
+export async function saveObservationLedger(records, options = {}) {
+  const omissions = [];
+  const compact = compactObservationLedger(records, { onOmitted: (item) => {
+    omissions.push(item);
+    options.onOmitted?.(item);
+  } });
   const storage = storageArea();
   if (storage) {
-    await storage.set({ observationLedger: compact });
+    await storage.set({ observationLedger: compact, observationLedgerOmissions: omissions });
     return compact;
   }
   localStorage.setItem(OBSERVATION_LEDGER_KEY, JSON.stringify(compact));
+  localStorage.setItem(LEDGER_OMISSIONS_KEY, JSON.stringify(omissions));
   return compact;
 }
 
-export function compactObservationLedger(records) {
+export function compactObservationLedger(records, { onOmitted } = {}) {
   const source = normalizeLedgerSource(records);
   const output = [];
   let usedBytes = 2;
 
-  for (const entry of source.slice(0, MAX_LEDGER_CONVERSATIONS)) {
+  for (const entry of source) {
     const id = String(entry?.id || '').trim();
     const observations = Array.isArray(entry?.observations)
       ? entry.observations
       : [];
     if (!id || !observations.length) continue;
 
-    const kept = observations.map(compactObservation).filter(Boolean);
+    if (output.length >= MAX_LEDGER_CONVERSATIONS) {
+      onOmitted?.({ id, reason: 'conversation-limit' });
+      continue;
+    }
+    const context = { nodes: 0, bytes: 0, ancestors: new Set(), redacted: false };
+    let kept;
+    try {
+      kept = observations.map((item) => compactObservation(item, context)).filter(Boolean);
+    } catch (error) {
+      onOmitted?.({ id, reason: error.code || 'invalid-value' });
+      continue;
+    }
     if (!kept.length) continue;
     const compactEntry = { id, observations: kept };
-    const entryBytes = JSON.stringify(compactEntry).length + 1;
+    const entryBytes = ledgerEncoder.encode(JSON.stringify(compactEntry)).byteLength + 1;
     // Persistence is all-or-nothing per conversation. Never create a hidden
     // message-level sliding window just to satisfy a storage budget.
-    if (entryBytes + 2 > MAX_LEDGER_BYTES) continue;
-    if (usedBytes + entryBytes > MAX_LEDGER_BYTES) continue;
+    if (entryBytes + 2 > MAX_LEDGER_BYTES || usedBytes + entryBytes > MAX_LEDGER_BYTES) {
+      onOmitted?.({ id, reason: 'budget' });
+      continue;
+    }
     output.push(compactEntry);
     usedBytes += entryBytes;
-    if (usedBytes >= MAX_LEDGER_BYTES) break;
   }
   return output;
 }
@@ -230,12 +271,16 @@ function ledgerRecency(entry) {
   return latest;
 }
 
-function compactObservation(observation) {
+function compactObservation(observation, context) {
   if (!observation?.id) return null;
+  context.redacted = false;
   const compact = compactValue({
     id: observation.id,
     nodeId: observation.nodeId,
     itemId: observation.itemId,
+    contentIndex: observation.contentIndex,
+    lastSequenceNumber: observation.lastSequenceNumber,
+    cacheRedacted: observation.cacheRedacted,
     contentType: observation.contentType,
     role: observation.role,
     name: observation.name,
@@ -281,7 +326,8 @@ function compactObservation(observation) {
     observationMode: observation.observationMode,
     firstSeenAt: observation.firstSeenAt,
     lastSeenAt: observation.lastSeenAt,
-  });
+  }, context);
+  if (context.redacted) compact.cacheRedacted = true;
   return compact && typeof compact === 'object' ? compact : null;
 }
 
@@ -289,29 +335,54 @@ function compactMetadata(metadata) {
   if (!metadata || typeof metadata !== 'object') return {};
   const output = {};
   for (const key of PERSISTED_METADATA_KEYS) {
-    if (metadata[key] == null) continue;
-    output[key] = compactValue(metadata[key]);
+    if (!Object.hasOwn(metadata, key)) continue;
+    // Null is meaningful: it can clear a previously observed error/value.
+    output[key] = metadata[key];
   }
   return output;
 }
 
-function compactValue(value, depth = 0) {
-  if (value == null || typeof value === 'number' || typeof value === 'boolean') return value;
+function rejectLedgerValue(code) {
+  const error = new Error('Conversation cannot be cached without changing its content');
+  error.code = code;
+  throw error;
+}
+
+function compactValue(value, context, depth = 0) {
+  context.nodes += 1;
+  if (context.nodes > MAX_LEDGER_NODES || depth > MAX_LEDGER_DEPTH) rejectLedgerValue('structure-limit');
+  if (value == null || typeof value === 'boolean') return value;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) rejectLedgerValue('invalid-value');
+    return value;
+  }
   if (typeof value === 'string') {
-    if (value.length <= MAX_LEDGER_STRING) return value;
-    return `${value.slice(0, MAX_LEDGER_STRING)}\n… [SlimGPT local cache truncated oversized field]`;
+    if (value.length > MAX_LEDGER_BYTES) rejectLedgerValue('budget');
+    context.bytes += ledgerEncoder.encode(value).byteLength;
+    if (context.bytes > MAX_LEDGER_BYTES) rejectLedgerValue('budget');
+    return value;
   }
-  if (depth >= 10) return null;
-  if (Array.isArray(value)) {
-    return value.slice(0, MAX_LEDGER_ARRAY).map((item) => compactValue(item, depth + 1));
+  if (typeof value !== 'object') rejectLedgerValue('invalid-value');
+  if (context.ancestors.has(value)) rejectLedgerValue('invalid-value');
+  context.ancestors.add(value);
+  try {
+    if (Array.isArray(value)) return value.map((item) => compactValue(item, context, depth + 1));
+    const pairs = [];
+    for (const [key, child] of Object.entries(value)) {
+      if (child === undefined) continue;
+      if (/^(?:authorization|cookie|set-cookie|access_token|refresh_token|session_token|resume_token|conduit_token|credential|credentials)$/i.test(key)) {
+        context.redacted = true;
+        continue;
+      }
+      context.bytes += ledgerEncoder.encode(key).byteLength;
+      if (context.bytes > MAX_LEDGER_BYTES) rejectLedgerValue('budget');
+      pairs.push([key, compactValue(child, context, depth + 1)]);
+    }
+    // __proto__ and constructor are legitimate payload keys, not setters.
+    return Object.fromEntries(pairs);
+  } finally {
+    context.ancestors.delete(value);
   }
-  if (typeof value !== 'object') return null;
-  const output = {};
-  for (const [key, child] of Object.entries(value).slice(0, MAX_LEDGER_OBJECT_KEYS)) {
-    if (/^(?:authorization|cookie|set-cookie|access_token|refresh_token|session_token|resume_token|conduit_token|credential|credentials)$/i.test(key)) continue;
-    output[key] = compactValue(child, depth + 1);
-  }
-  return output;
 }
 
 export async function loadUserSettings() {
@@ -490,6 +561,7 @@ export function subscribeStorageChanges(
         const update = {};
         if (changes?.conversationIndex) update.conversationIndex = changes.conversationIndex.newValue;
         if (changes?.observationLedger) update.observationLedger = changes.observationLedger.newValue;
+        if (changes?.observationLedgerOmissions) update.observationLedgerOmissions = changes.observationLedgerOmissions.newValue;
         if (changes?.userSettings) update.userSettings = changes.userSettings.newValue;
         if (changes?.executionPulse) update.executionPulse = changes.executionPulse.newValue;
         if (Object.keys(update).length) listener(update);
@@ -510,6 +582,7 @@ export function subscribeStorageChanges(
     try {
       if (event.key === INDEX_KEY) update.conversationIndex = JSON.parse(event.newValue || '[]');
       else if (event.key === OBSERVATION_LEDGER_KEY) update.observationLedger = JSON.parse(event.newValue || '[]');
+      else if (event.key === LEDGER_OMISSIONS_KEY) update.observationLedgerOmissions = JSON.parse(event.newValue || '[]');
       else if (event.key === SETTINGS_KEY) update.userSettings = JSON.parse(event.newValue || '{}');
     } catch {
       return;

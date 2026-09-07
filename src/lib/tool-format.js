@@ -4,6 +4,8 @@ import { stringify } from 'smol-toml';
 
 hljs.registerLanguage('toml', ini);
 
+export { formatRawToolPayload } from './tool-payload.js';
+
 export function formatToolPayloadAsToml(payload) {
   const parsed = parseJsonPayload(payload);
   const normalized = normalizeTomlValue(parsed);
@@ -22,7 +24,11 @@ export function formatToolPayloadAsToml(payload) {
 }
 
 export function highlightToml(toml) {
-  return hljs.highlight(String(toml || ''), { language: 'toml', ignoreIllegals: true }).value;
+  const text = String(toml || '');
+  // Long logs must remain inspectable without making every stream update
+  // spend unbounded time in a syntax highlighter. Preserve all of the text.
+  if (text.length > 200_000) return text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+  return hljs.highlight(text, { language: 'toml', ignoreIllegals: true }).value;
 }
 
 export function parseJsonPayload(payload) {
@@ -63,7 +69,9 @@ function normalizeTomlValue(value, seen = new WeakSet()) {
   }
   const result = {};
   for (const [key, item] of Object.entries(value)) {
-    result[key] = normalizeTomlValue(item, seen);
+    Object.defineProperty(result, key, {
+      value: normalizeTomlValue(item, seen), enumerable: true, writable: true, configurable: true,
+    });
   }
   seen.delete(value);
   return result;

@@ -928,7 +928,7 @@ test('conversation record keeps non-canonical tool observations in protocol orde
     metadata: { source: 'optimized-conversation' },
     mapping: {
       a2: {
-        id: 'a2', parent: null, children: [],
+        id: 'a2', parent: 'a1', children: [],
         message: {
           id: 'a2',
           author: { role: 'assistant' },
@@ -945,7 +945,7 @@ test('conversation record keeps non-canonical tool observations in protocol orde
   assert.equal(rows[3].tool?.kind, 'tool-result');
 });
 
-test('partial conversation payloads extend cached history instead of replacing it', () => {
+test('disconnected partial conversation payloads are retained without inventing a branch connection', () => {
   const partial = {
     id: 'conv-1',
     current_node: 'a4',
@@ -967,12 +967,13 @@ test('partial conversation payloads extend cached history instead of replacing i
   };
 
   const merged = mergeConversationPayload(payload, partial);
-  assert.equal(merged.mapping.u3.parent, 'a2');
-  assert.ok(merged.mapping.a2.children.includes('u3'));
-  assert.equal(merged.current_node, 'a4');
+  assert.equal(merged.mapping.u3.parent, null);
+  assert.equal(merged.mapping.a2.children.includes('u3'), false);
+  assert.equal(merged.current_node, 'a2');
+  assert.ok(merged.mapping.a4, 'the disconnected page is retained, not discarded');
   assert.deepEqual(
     buildConversationView(merged).map((message) => message.text),
-    ['hello', 'branch two', 'new question', 'new answer'],
+    ['hello', 'branch two'],
   );
 });
 
@@ -1699,7 +1700,7 @@ test('contentToText formats user attachments and cleans citation markers', () =>
     },
   }, { 'a-cite': { id: 'a-cite' } });
 
-  assert.equal(textWithCitations.text, 'According to research, this holds true.');
+  assert.equal(textWithCitations.text, 'According to research〔来源信息未同步〕, this holds true.');
 });
 
 test('messageNodeToView formats thinking duration and image asset pointer', () => {

@@ -4,6 +4,8 @@ import {
   LANG,
   SRC,
   START,
+  CODE_FENCE, CODE_BLOCK, CODE_INLINE, EQUATION_BLOCK, EQUATION_INLINE,
+  ITALIC_AST, ITALIC_UND, STRONG_AST, STRONG_UND, STRIKE, LINK, IMAGE,
   default_add_text,
   default_add_token,
   default_end_token,
@@ -14,12 +16,17 @@ import {
 } from 'streaming-markdown';
 
 let katexPromise = null;
+const literalPrefixes = new Map([
+  [ITALIC_AST, '*'], [ITALIC_UND, '_'], [STRONG_AST, '**'], [STRONG_UND, '__'],
+  [STRIKE, '~~'], [LINK, '['], [IMAGE, '!['],
+]);
 
 export function createIncrementalMarkdown(root) {
   let source = '';
   let finalizedLength = -1;
   let state = createParser(root);
   let preview = null;
+  let lastWasCR = false;
 
   function reset() {
     root.replaceChildren();
@@ -27,6 +34,7 @@ export function createIncrementalMarkdown(root) {
     finalizedLength = -1;
     state = createParser(root);
     preview = null;
+    lastWasCR = false;
   }
 
   function removePreview() {
@@ -39,6 +47,7 @@ export function createIncrementalMarkdown(root) {
     if (!pending) return;
     const data = state.renderer.data;
     const parent = data.nodes[data.index] || root;
+    if (parent.tagName === 'IMG') return;
     preview = document.createTextNode(pending);
     parent.appendChild(preview);
   }
@@ -49,13 +58,18 @@ export function createIncrementalMarkdown(root) {
     const suffix = next.slice(source.length);
     if (suffix) {
       removePreview();
-      parser_write(state, suffix);
+      // A CRLF split across updates is still one newline; normalize before
+      // the parser so code copying does not depend on transport boundaries.
+      let normalized = suffix;
+      if (lastWasCR && normalized.startsWith('\n')) normalized = normalized.slice(1);
+      lastWasCR = suffix.endsWith('\r');
+      parser_write(state, normalized.replace(/\r\n|\r/g, '\n'));
       source = next;
       finalizedLength = -1;
     }
     if (final && finalizedLength !== source.length) {
       removePreview();
-      parser_end(state);
+      state.finish();
       finalizedLength = source.length;
     } else if (!final && suffix) {
       showPreview();
@@ -67,41 +81,105 @@ export function createIncrementalMarkdown(root) {
 
 function createParser(root) {
   const renderer = default_renderer(root);
+  const tokens = new WeakMap();
+  let state;
   renderer.add_token = (data, type) => {
     default_add_token(data, type);
     const node = data.nodes[data.index];
     if (!node || node === root) return;
+    let prefix = literalPrefixes.get(type) || '';
+    if (type === CODE_INLINE) prefix = '`'.repeat(state.fence_start || 1);
+    if (type === EQUATION_INLINE) prefix = state.pending.startsWith('\\') ? '\\(' : '$';
+    if (type === EQUATION_BLOCK) prefix = state.pending.startsWith('\\') ? '\\[\n' : '$$\n';
+    tokens.set(node, { type, prefix });
     if (node.tagName === 'A') {
       node.target = '_blank';
       node.rel = 'noreferrer noopener';
     } else if (node.tagName === 'IMG') {
       node.loading = 'lazy';
       node.referrerPolicy = 'no-referrer';
+      node.alt = '';
+      node.addEventListener('error', () => replaceUnavailableImage(node), { once: true });
     } else if (node.tagName === 'INPUT' && node.type === 'checkbox') {
       node.classList.add('task-checkbox');
     }
   };
-  renderer.add_text = default_add_text;
+  renderer.add_text = (data, text) => {
+    const node = data.nodes[data.index];
+    if (node?.tagName === 'IMG') node.alt += text;
+    else default_add_text(data, text);
+  };
   renderer.set_attr = setSafeAttribute;
   renderer.end_token = (data) => {
+    const node = data.nodes[data.index];
+    if (tokens.get(node)?.type === CODE_FENCE && state.pending.startsWith('\n')) {
+      // The parser withholds the newline before a closing fence. That newline
+      // belongs to the code payload and must survive display/copy.
+      node.append(document.createTextNode('\n'));
+    }
     finalizeNode(data);
     default_end_token(data);
   };
-  return parser(renderer);
+  state = parser(renderer);
+  state.finish = () => {
+    // parser_end only feeds a synthetic newline; it does not close open code,
+    // tables or inline tokens. Remember the real tail before that sentinel.
+    const data = renderer.data;
+    const before = data.nodes[data.index];
+    const beforeInfo = tokens.get(before);
+    const tail = state.text + state.pending;
+    const beforeBody = before?.tagName === 'IMG' ? before.alt : before?.textContent || '';
+    const incompleteBody = beforeBody + tail;
+    const pendingEscape = state.pending === '\\' && ![CODE_FENCE, CODE_BLOCK, CODE_INLINE, EQUATION_INLINE, EQUATION_BLOCK].includes(beforeInfo?.type);
+    if (pendingEscape) {
+      renderer.add_text(data, tail);
+      state.text = state.pending = '';
+    } else parser_end(state);
+    while (data.index > 0) {
+      const node = data.nodes[data.index];
+      const info = tokens.get(node);
+      if (info?.type === CODE_FENCE || info?.type === CODE_BLOCK) {
+        if (node === before) node.textContent = incompleteBody;
+        finalizeCodeBlock(node);
+      } else if (info?.prefix) {
+        // At EOF an unclosed span is literal, not valid emphasis/link/math.
+        // In particular do not drop a final backtick or incomplete equation.
+        const body = node === before ? incompleteBody : node.tagName === 'IMG' ? node.alt : node.textContent || '';
+        node.replaceWith(document.createTextNode(info.prefix + body));
+      } else finalizeNode(data);
+      default_end_token(data);
+    }
+  };
+  return state;
+}
+
+function replaceUnavailableImage(image) {
+  const replacement = document.createElement('span');
+  replacement.className = 'image-unavailable';
+  replacement.textContent = `〔图片未能显示${image.alt ? `：${image.alt}` : ''}〕`;
+  image.replaceWith(replacement);
+  return replacement;
 }
 
 function setSafeAttribute(data, type, value) {
   const node = data.nodes[data.index];
   if (!node) return;
   if (type === HREF) {
-    const url = sanitizeMarkdownUrl(value, false);
+    const destination = parseMarkdownDestination(value);
+    const url = sanitizeMarkdownUrl(destination.href, false);
     if (url) node.setAttribute('href', url);
+    else node.removeAttribute('href');
+    if (url && destination.title) node.setAttribute('title', destination.title);
+    else node.removeAttribute('title');
     return;
   }
   if (type === SRC) {
-    const url = sanitizeMarkdownUrl(value, true);
+    const destination = parseMarkdownDestination(value);
+    const url = sanitizeMarkdownUrl(destination.href, true);
     if (url) node.setAttribute('src', url);
-    else node.remove();
+    else data.nodes[data.index] = replaceUnavailableImage(node);
+    if (url && destination.title) node.setAttribute('title', destination.title);
+    else node.removeAttribute('title');
     return;
   }
   if (type === LANG) {
@@ -134,6 +212,9 @@ function finalizeNode(data) {
 function finalizeCodeBlock(code) {
   const pre = code.parentElement;
   if (!pre || pre.parentElement?.classList.contains('code-block')) return;
+  pre.tabIndex = 0;
+  pre.setAttribute('role', 'region');
+  pre.setAttribute('aria-label', '代码，可滚动');
   const language = normalizeCodeLanguage(code.dataset.language || [...code.classList]
     .find((name) => name.startsWith('language-'))?.slice(9));
   const source = code.textContent || '';
@@ -152,6 +233,7 @@ function finalizeCodeBlock(code) {
   copy.className = 'code-copy-btn';
   copy.dataset.action = 'copy-code';
   copy.setAttribute('aria-label', '复制代码');
+  copy.setAttribute('aria-live', 'polite');
   copy.textContent = '复制';
   header.append(label, copy);
   pre.replaceWith(wrapper);
@@ -162,6 +244,9 @@ function wrapTable(table) {
   if (table.parentElement?.classList.contains('table-wrap')) return;
   const wrapper = document.createElement('div');
   wrapper.className = 'table-wrap';
+  wrapper.tabIndex = 0;
+  wrapper.setAttribute('role', 'region');
+  wrapper.setAttribute('aria-label', '表格，可水平滚动');
   table.replaceWith(wrapper);
   wrapper.append(table);
 }
@@ -203,10 +288,31 @@ export function sanitizeMarkdownUrl(value, image = false) {
     const allowed = image
       ? url.protocol === 'https:' || url.protocol === 'http:'
       : url.protocol === 'https:' || url.protocol === 'http:' || url.protocol === 'mailto:';
-    return allowed ? url.href : '';
+    return allowed && !url.username && !url.password ? url.href : '';
   } catch {
     return '';
   }
+}
+
+export function parseMarkdownDestination(value) {
+  // streaming-markdown supplies the whole destination to HREF, including
+  // optional <angle brackets> and a quoted title. Passing that straight to
+  // URL() resolves it as a bogus relative chatgpt.com path.
+  const raw = String(value ?? '').trim();
+  const match = raw.match(/^(?:<([^<>\r\n]+)>|(\S+?))(?:[ \t]+(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|\(((?:\\.|[^)\\])*)\)))?$/);
+  if (!match) return { href: '', title: '' };
+  return { href: decodeMarkdownAttribute(match[1] ?? match[2]), title: decodeMarkdownAttribute(match[3] ?? match[4] ?? match[5]) };
+}
+
+function decodeMarkdownAttribute(value) {
+  const named = { amp: '&', quot: '"', apos: "'", lt: '<', gt: '>' };
+  return String(value || '').replace(/\\([!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~])/g, '$1')
+    .replace(/&(#x[0-9a-f]+|#\d+|amp|quot|apos|lt|gt);/gi, (original, entity) => {
+      if (entity[0] !== '#') return named[entity.toLowerCase()] || original;
+      const hex = entity[1].toLowerCase() === 'x';
+      const code = Number.parseInt(entity.slice(hex ? 2 : 1), hex ? 16 : 10);
+      return code > 0 && code <= 0x10ffff && !(code >= 0xd800 && code <= 0xdfff) ? String.fromCodePoint(code) : '\uFFFD';
+    });
 }
 
 export function normalizeCodeLanguage(value) {
@@ -215,6 +321,7 @@ export function normalizeCodeLanguage(value) {
 }
 
 function highlightCode(source, language) {
+  if (source.length > 200_000) return escapeHtml(source);
   if (!/^(js|javascript|ts|typescript|json|jsonc|css|scss|html|xml|svg|bash|sh|zsh|shell|python|py|sql|rust|rs|go|golang|c|cpp|c\+\+|java|yaml|yml|dockerfile|toml|ini|md|markdown)$/.test(language)) {
     return escapeHtml(source);
   }

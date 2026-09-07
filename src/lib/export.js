@@ -4,34 +4,97 @@ const ROLE_LABELS = {
   system: 'System',
   tool: 'Tool',
 };
+const filenameEncoder = new TextEncoder();
 
-export function buildConversationMarkdown(title, messages = []) {
-  const safeTitle = String(title || '').trim() || 'ChatGPT Conversation';
+function heading(value) {
+  return String(value ?? '').replace(/[\r\n\u2028\u2029\u0000-\u001f]+/g, ' ').trim()
+    .replace(/[\\`*_\[\]<>]/g, '\\$&');
+}
+
+export function hasExportableMessage(message) {
+  return Boolean(message && !message.pending && (
+    String(message.text ?? '').trim() || String(message.thought ?? '').trim() ||
+    message.tool || message.error || message.unrecognized ||
+    /^(?:failed|error|cancelled|canceled|interrupted|incomplete|aborted|stopped)$/.test(message.status || '')
+  ));
+}
+
+function fencedPayload(payload) {
+  const text = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2) ?? '';
+  let length = 3;
+  for (const match of text.matchAll(/`+/g)) length = Math.max(length, match[0].length + 1);
+  const fence = '`'.repeat(length);
+  return `${fence}${typeof payload === 'string' ? 'text' : 'json'}\n${text}\n${fence}`;
+}
+
+function messageSection(message, level = 2) {
+  if (!hasExportableMessage(message)) return null;
+  const tool = message.tool;
+  const label = tool
+    ? `${tool.kind === 'tool-call' ? '工具调用' : '工具结果'} · ${heading(tool.name || message.name || 'Tool')}`
+    : heading(message.name || ROLE_LABELS[message.role] || message.role || '消息');
+  const parts = [];
+  if (message.error || /^(?:failed|error)$/.test(message.status || '')) parts.push('> 生成异常。');
+  else if (/^(?:cancelled|canceled|interrupted|incomplete|aborted|stopped)$/.test(message.status || '')) parts.push('> 此项生成已中断或未完成。');
+  if (message.cacheRedacted) parts.push('> 此项来自本地缓存，其中的凭据字段已省略。');
+  if (typeof message.thought === 'string' && message.thought.trim()) {
+    parts.push(`${'#'.repeat(level + 1)} 思考过程\n\n${message.thought}`);
+  }
+  if (tool) {
+    const callIds = [...new Set([tool.callId, tool.toolCallId, ...(tool.callIds || [])].filter(Boolean))];
+    if (callIds.length) parts.push(`调用标识：${callIds.map(heading).join('、')}`);
+    parts.push(fencedPayload(tool.payload));
+  } else if (typeof message.text === 'string' && message.text.trim()) {
+    // Leading indentation and trailing two-space line breaks are content.
+    parts.push(message.text);
+  }
+  if (message.unrecognized) parts.push(`> 尚未展开的内容类型：${heading(message.contentType || 'unknown')}。`);
+  return `${'#'.repeat(level)} ${label}\n\n${parts.join('\n\n')}`;
+}
+
+export function buildConversationMarkdown(title, messages = [], options = {}) {
+  const safeTitle = heading(title) || 'ChatGPT Conversation';
   const sections = [`# ${safeTitle}`];
-
+  if (options.historyComplete === false) sections.push('> 历史尚未同步完整；此文件仅包含当前已取得的内容，不是完整会话。');
   for (const message of messages) {
-    const text = String(message?.text || '').trim();
-    if (!text) continue;
-    const role = String(message?.role || 'message');
-    const label = message?.name || ROLE_LABELS[role] || role;
-    sections.push(`## ${label}\n\n${text}`);
+    const section = messageSection(message);
+    if (section) sections.push(section);
+  }
+  const unresolved = (options.unresolved || []).filter((group) => group.replies?.some(hasExportableMessage));
+  if (unresolved.length) {
+    sections.push('## 未归属输出\n\n> 以下内容尚无可验证的用户消息归属，不应视为上一问题的回答。');
+    for (let i = 0; i < unresolved.length; i += 1) {
+      sections.push(`### 未归属组 ${i + 1}`);
+      for (const message of unresolved[i].replies) {
+        const section = messageSection(message, 4);
+        if (section) sections.push(section);
+      }
+    }
   }
 
   return `${sections.join('\n\n')}\n`;
 }
 
 export function markdownFilename(title) {
-  const base = String(title || '')
+  let base = String(title || '')
     .replace(/[\\/:*?"<>|\u0000-\u001f]/g, ' ')
     .replace(/\s+/g, ' ')
     .replace(/[. ]+$/g, '')
-    .trim()
-    .slice(0, 120);
+    .trim();
+  // Keep the UTF-8 basename comfortably below filesystem byte limits and
+  // never cut an emoji/surrogate pair in half.
+  let bytes = 0;
+  base = [...base].filter((character) => {
+    bytes += filenameEncoder.encode(character).length;
+    return bytes <= 220;
+  }).join('');
+  if (/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(base)) base = `_${base}`;
+  base = base.replace(/[. ]+$/g, '');
   return `${base || 'slimgpt-conversation'}.md`;
 }
 
-export function downloadConversationMarkdown(title, messages = []) {
-  const content = buildConversationMarkdown(title, messages);
+export function downloadConversationMarkdown(title, messages = [], options = {}) {
+  const content = buildConversationMarkdown(title, messages, options);
   const filename = markdownFilename(title);
   const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' });
   const url = URL.createObjectURL(blob);
@@ -39,9 +102,12 @@ export function downloadConversationMarkdown(title, messages = []) {
   anchor.href = url;
   anchor.download = filename;
   anchor.style.display = 'none';
-  document.body.appendChild(anchor);
-  anchor.click();
-  anchor.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  try {
+    document.body.appendChild(anchor);
+    anchor.click();
+  } finally {
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
   return { content, filename };
 }

@@ -56,6 +56,7 @@
   let conversationIndexSyncRequested = false;
   let conversationIndexBootstrapped = false;
   let turnSessionCounter = 0;
+  let turnSubmissionOrdinal = 0;
   let pendingNewTurnSession = null;
   let suppressLocationEmission = false;
   let thinkingSync = Promise.resolve();
@@ -76,6 +77,7 @@
   const canonicalBackoffUntil = new Map();
   const canonicalFailureCounts = new Map();
   const activeTurnSessions = new Map();
+  const turnSessionReservations = new Map();
   const executionStates = new Map();
   const observedFetchResponses = new WeakSet();
   const XHR_RESPONSE_OBSERVED = Symbol("slimgpt-xhr-response-observed");
@@ -320,15 +322,15 @@
         if (!messageOwners.has(ownerNode)) messageOwners.set(ownerNode, conversationId);
         const text = String(roleNode.textContent || '').replace(/\u00a0/g, ' ').trim();
         const seenKey = `${conversationId}\u0000${messageId}`;
-        if (!text || seenText.get(seenKey) === text) continue;
+        if (!text.replace(/[\u200b-\u200d\ufeff]/g, '').trim() || seenText.get(seenKey) === text) continue;
         seenText.set(seenKey, text);
         if (seenText.size > MAX_SEEN_MESSAGES) {
           const oldest = seenText.keys().next().value;
           seenText.delete(oldest);
         }
-        const turnSession = executionStates.get(executionKey(conversationId))?.state === 'running'
-          ? activeTurnSessions.get(conversationId)
-          : null;
+        // DOM scans include old messages. The active transport says nothing
+        // about the ownership of those nodes; only their stable message id
+        // may connect this low-fidelity fallback to a protocol item.
         emit({
           type: "page-capture",
           transport: "dom",
@@ -336,21 +338,6 @@
           requestId: `dom-${messageId}`,
           url: location.href,
           conversationId,
-          ...(turnSession?.turnId
-            ? { turnId: turnSession.turnId }
-            : {}),
-          ...(turnSession?.turnAliases?.length
-            ? { turnAliases: turnSession.turnAliases.slice() }
-            : {}),
-          ...(turnSession?.transportTurnId
-            ? { transportTurnId: turnSession.transportTurnId }
-            : {}),
-          ...(turnSession?.userMessageId
-            ? { turnUserMessageId: turnSession.userMessageId }
-            : {}),
-          ...(turnSession?.parentMessageId
-            ? { turnParentMessageId: turnSession.parentMessageId }
-            : {}),
           mimeType: "application/json",
           timestamp: Date.now(),
           data: JSON.stringify({
@@ -551,7 +538,7 @@
       const submission = request && isConversationSubmission(request);
       const turnScope = submission
         ? snapshotSubmissionTurn(request, conversationScope)
-        : (request && isResumeRequest(request) ? snapshotActiveTurn(conversationScope) : null);
+        : (request && isResumeRequest(request) ? snapshotActiveTurn(conversationScope, readRequestTurnIdentity(request)) : null);
       const resumeSnapshot = request && isResumeRequest(request)
         ? snapshotRequest(request, upstreamFetch, fetchThis, conversationScope, turnScope)
         : null;
@@ -684,6 +671,8 @@
   async function snapshotSubmissionTurn(request, conversationScope) {
     const session = {
       sessionId: nextTurnSessionId(),
+      submissionOrdinal: ++turnSubmissionOrdinal,
+      scopePending: true,
       transportTurnId: request?.headers?.get?.("x-oai-turn-trace-id") || null,
       turnId: null,
       turnAliases: [],
@@ -699,14 +688,14 @@
     if (!session.transportTurnId) session.transportTurnId = session.sessionId;
     registerTurnSession(session);
     const [scope, identity] = await Promise.all([
-      conversationScope?.catch(() => ({ conversationId: null, conflicted: false })) ||
+      conversationScope?.catch(() => ({ conversationId: null, conflicted: true })) ||
         Promise.resolve({ conversationId: null, conflicted: false }),
       readRequestTurnIdentity(request),
     ]);
+    session.scopePending = false;
+    session.scopeConflicted = Boolean(scope?.conflicted);
     if (!scope?.conflicted && scope?.conversationId) {
       session.conversationId = scope.conversationId;
-      if (pendingNewTurnSession?.sessionId === session.sessionId) pendingNewTurnSession = null;
-      registerTurnSession(session);
     }
     if (identity?.userMessageId) session.userMessageId = identity.userMessageId;
     if (identity?.parentMessageId) session.parentMessageId = identity.parentMessageId;
@@ -716,20 +705,32 @@
     if (identity?.workingTurnId) session.workingTurnId = identity.workingTurnId;
     if (identity?.requestId) session.requestId = identity.requestId;
     if (identity?.turnTraceId) session.turnTraceId = identity.turnTraceId;
+    registerTurnSession(session);
     return session;
   }
 
-  async function snapshotActiveTurn(conversationScope) {
+  async function snapshotActiveTurn(conversationScope, requestIdentity = null) {
+    // Capture at request entry, not after an awaited body parse. Otherwise a
+    // later submission can lend its identity to an older resume request.
+    const atRequest = new Map([...activeTurnSessions].map(([id, session]) => [id, {
+      ...session, turnAliases: session.turnAliases.slice(),
+    }]));
+    const reservedAtRequest = [...turnSessionReservations.values()].map((session) => ({ ...session, turnAliases: session.turnAliases.slice() }));
     const scope = await (conversationScope?.catch(() => ({ conversationId: null, conflicted: false })) ||
       Promise.resolve({ conversationId: null, conflicted: false }));
     if (scope?.conflicted) return null;
     const conversationId = scope?.conversationId || null;
-    let session = conversationId ? activeTurnSessions.get(conversationId) : null;
-    if (!session && pendingNewTurnSession) {
-      if (conversationId) bindPendingTurnSession(conversationId);
-      session = conversationId ? activeTurnSessions.get(conversationId) : pendingNewTurnSession;
+    const identity = await Promise.resolve(requestIdentity).catch(() => null);
+    if (identity?.userMessageId || identity?.turnAliases?.length) {
+      const matching = reservedAtRequest.filter((session) => session.conversationId === conversationId &&
+        notificationMatchesTurnSession({ ...identity, turnUserMessageId: identity.userMessageId }, session));
+      // Multiple regenerations may share a user id. Do not break that tie by
+      // timestamp or by whichever request happens to be active now.
+      return matching.length === 1 ? matching[0] : null;
     }
-    return session ? { ...session } : null;
+    // A conversation id alone is never evidence that a pending new chat owns
+    // it. Binding belongs to correlated message/turn events or official route.
+    return conversationId ? atRequest.get(conversationId) || null : null;
   }
 
   async function readRequestTurnIdentity(request) {
@@ -770,24 +771,36 @@
       metadata.turnExchangeId,
       userMessage?.turn_exchange_id,
       userMessage?.turnExchangeId,
+      value.turn_exchange_id,
+      value.turnExchangeId,
+      value.metadata?.turn_exchange_id,
     );
     const workingTurnId = firstTurnIdentityString(
       metadata.working_turn_id,
       metadata.workingTurnId,
       userMessage?.working_turn_id,
       userMessage?.workingTurnId,
+      value.working_turn_id,
+      value.workingTurnId,
+      value.metadata?.working_turn_id,
     );
     const requestId = firstTurnIdentityString(
       metadata.request_id,
       metadata.requestId,
       userMessage?.request_id,
       userMessage?.requestId,
+      value.request_id,
+      value.requestId,
+      value.metadata?.request_id,
     );
     const turnTraceId = firstTurnIdentityString(
       metadata.turn_trace_id,
       metadata.turnTraceId,
       userMessage?.turn_trace_id,
       userMessage?.turnTraceId,
+      value.turn_trace_id,
+      value.turnTraceId,
+      value.metadata?.turn_trace_id,
     );
     const turnAliases = uniqueTurnIdentityStrings([
       turnExchangeId,
@@ -829,6 +842,17 @@
 
   function registerTurnSession(session) {
     if (!session?.sessionId) return;
+    turnSessionReservations.set(session.sessionId, session);
+    while (turnSessionReservations.size > MAX_EXECUTION_STATES) {
+      turnSessionReservations.delete(turnSessionReservations.keys().next().value);
+    }
+    if (session.scopePending || session.scopeConflicted || session.released) return;
+    // Registration order is a local transport ordering key, never a persisted
+    // semantic turn id. Slow decoding of an older request cannot go backwards.
+    for (const other of turnSessionReservations.values()) {
+      if (!other.scopePending && !other.scopeConflicted &&
+          other.conversationId === session.conversationId && other.submissionOrdinal > session.submissionOrdinal) return;
+    }
     if (session.conversationId) {
       activeTurnSessions.set(session.conversationId, session);
       if (activeTurnSessions.size > MAX_EXECUTION_STATES) {
@@ -843,6 +867,8 @@
   async function releaseTurnSession(turnScope) {
     const session = await Promise.resolve(turnScope).catch(() => null);
     if (!session?.sessionId) return;
+    const reserved = turnSessionReservations.get(session.sessionId);
+    if (reserved) reserved.released = true;
     if (session.conversationId && activeTurnSessions.get(session.conversationId)?.sessionId === session.sessionId) {
       activeTurnSessions.delete(session.conversationId);
     }
@@ -852,6 +878,9 @@
   function bindPendingTurnSession(conversationId) {
     if (!conversationId || !pendingNewTurnSession) return null;
     const session = pendingNewTurnSession;
+    if (session.scopePending || session.scopeConflicted || session.released) return null;
+    const existing = activeTurnSessions.get(conversationId);
+    if (existing && existing.sessionId !== session.sessionId) return null;
     pendingNewTurnSession = null;
     session.conversationId = conversationId;
     activeTurnSessions.set(conversationId, session);
@@ -867,6 +896,41 @@
       );
     }
     return session;
+  }
+
+  function observeCapturedTurn(value, capture) {
+    const session = turnSessionReservations.get(capture?.transportSessionId);
+    const message = value?.message;
+    if (!session || session.scopePending || session.scopeConflicted || session.released ||
+        !message || typeof message !== 'object' || !message.id || !message.author) return;
+    const metadata = message.metadata && typeof message.metadata === 'object' ? message.metadata : {};
+    const userId = firstTurnIdentityString(message.turn_user_message_id, metadata.turn_user_message_id,
+      message.author.role === 'user' ? message.id : null);
+    if (userId && session.userMessageId && userId !== session.userMessageId) return;
+    const conversationIds = uniqueTurnIdentityStrings([
+      value.conversation_id, value.conversationId, message.conversation_id, message.conversationId,
+      session.conversationId,
+    ]).filter((id) => !isProvisionalConversationId(id));
+    if (conversationIds.length > 1) return;
+    const exchange = firstTurnIdentityString(metadata.turn_exchange_id, message.turn_exchange_id);
+    if (exchange && session.turnExchangeId && exchange !== session.turnExchangeId) return;
+    const working = firstTurnIdentityString(metadata.working_turn_id, message.working_turn_id);
+    const requestId = firstTurnIdentityString(metadata.request_id, message.request_id);
+    const trace = firstTurnIdentityString(metadata.turn_trace_id, message.turn_trace_id);
+    session.turnAliases = uniqueTurnIdentityStrings([...session.turnAliases, exchange, working, requestId, trace]);
+    session.turnId ||= session.turnAliases[0] || null;
+    session.turnExchangeId ||= exchange;
+    session.workingTurnId ||= working;
+    session.requestId ||= requestId;
+    session.turnTraceId ||= trace;
+    session.userMessageId ||= userId;
+    // This association is proven by the exact captured submission transport,
+    // unlike a broadcast for an arbitrary conversation elsewhere in the account.
+    const conversationId = conversationIds[0];
+    if (conversationId && !session.conversationId) {
+      if (pendingNewTurnSession?.sessionId === session.sessionId) bindPendingTurnSession(conversationId);
+      else { session.conversationId = conversationId; registerTurnSession(session); }
+    }
   }
 
   function conversationIdFromRequestBody(body) {
@@ -1292,9 +1356,7 @@
 
   function createOfficialSemanticStream() {
     const encoder = new TextEncoder();
-    const channelValues = [];
-    const projectedByChannel = [];
-    const projectedChannelOrder = [];
+    const channelValues = new Map();
     const projectedLegacyMessages = new Map();
     const projectedControls = new Map();
     let projectedResumeControl = null;
@@ -1304,7 +1366,9 @@
     let closed = false;
     let source = "";
     let encoding = null;
+    let deltaFailed = false;
     let previousDelta = { channel: 0, op: "add", path: "", value: undefined };
+    let onTurnValue = null;
 
     const readable = new ReadableStream({
       start(nextController) {
@@ -1322,94 +1386,84 @@
       controller.enqueue(encoder.encode(`${prefix}data: ${JSON.stringify(value)}\n\n`));
     };
 
-    const processBlock = (block) => {
-      const frame = parseOfficialSseFrame(block);
-      if (!frame || frame.data === "[DONE]") return;
-      if (frame.event === "delta_encoding") {
-        if (frame.value !== "v1") return;
-        encoding = "v1";
-        previousDelta = { channel: 0, op: "add", path: "", value: undefined };
-        channelValues.length = 0;
-        projectedByChannel.length = 0;
-        projectedChannelOrder.length = 0;
-        return;
-      }
-      if (frame.event === "delta" && encoding === "v1") {
-        try {
-          const delta = decodeOfficialCompactDelta(frame.value, previousDelta);
-          previousDelta = delta;
-          const value = applyOfficialDelta(channelValues[delta.channel], delta);
-          channelValues[delta.channel] = value;
-          const projected = projectOfficialSemanticValue(value);
-          if (!projected) return;
-          if (projectedByChannel[delta.channel] === undefined) {
-            projectedChannelOrder.push(delta.channel);
-          }
-          projectedByChannel[delta.channel] = projected;
-        } catch {
-          // A future delta dialect must not fall back to the expensive raw
-          // official renderer. SlimGPT still owns and displays the real stream.
-        }
-        return;
-      }
-
-      const projected = projectOfficialSemanticValue(frame.value);
+    const rememberProjection = (projected) => {
       if (!projected) return;
       if (projected.type === "resume_conversation_token") {
-        // A successful stream needs no resume state. On abnormal EOF this is
-        // emitted immediately before close so the official retry manager can
-        // continue the turn instead of treating a synthetic DONE as success.
         projectedResumeControl = projected;
       } else if (projected.message?.id) {
-        projectedLegacyMessages.set(projected.message.id, projected);
+        // A channel is a reusable transport slot, not the identity of its
+        // current output item. Keep structural items before that slot changes
+        // into a completion/control event. Only tiny projections live here.
+        const message = projected.message;
+        const key = `${message.id}\0${message.author?.role || ''}\0${message.channel || ''}`;
+        projectedLegacyMessages.set(key, projected);
       } else if (projected.type) {
         projectedControls.set(projected.type, projected);
       }
     };
 
+    const processBlock = (block) => {
+      const frame = parseOfficialSseFrame(block);
+      if (!frame || frame.data === "[DONE]") return;
+      if (frame.event === "delta_encoding") {
+        if (frame.value !== "v1") { deltaFailed = true; return; }
+        encoding = "v1";
+        previousDelta = { channel: 0, op: "add", path: "", value: undefined };
+        channelValues.clear();
+        return;
+      }
+      if (frame.event === "delta") {
+        if (deltaFailed) return;
+        if (encoding !== "v1") { deltaFailed = true; return; }
+        try {
+          const delta = decodeOfficialCompactDelta(frame.value, previousDelta);
+          const value = applyOfficialDelta(channelValues.get(delta.channel), delta);
+          previousDelta = delta;
+          channelValues.set(delta.channel, value);
+          onTurnValue?.(value);
+          rememberProjection(projectOfficialSemanticValue(value));
+        } catch {
+          // A future delta dialect must not fall back to the expensive raw
+          // official renderer. Nor may later inherited operations continue
+          // from the state before a missing/failed delta.
+          deltaFailed = true;
+          channelValues.clear();
+        }
+        return;
+      }
+
+      try { onTurnValue?.(frame.value); } catch { /* observation must not affect projection */ }
+      rememberProjection(projectOfficialSemanticValue(frame.value));
+    };
+
     return {
       readable,
       setContext(context) {
+        onTurnValue = typeof context?.onTurnValue === 'function' ? context.onTurnValue : null;
         turnUserMessageId = context?.turnUserMessageId || turnUserMessageId;
         turnParentMessageId = context?.turnParentMessageId || turnParentMessageId;
       },
       accept(chunk) {
         if (closed || !chunk) return;
-        source += chunk;
-        while (true) {
-          const boundary = source.match(/\r?\n\r?\n/);
-          if (!boundary || boundary.index === undefined) break;
-          const block = source.slice(0, boundary.index);
-          source = source.slice(boundary.index + boundary[0].length);
-          processBlock(block);
-        }
+        const parsed = consumeOfficialSseBlocks(source, chunk);
+        source = parsed.rest;
+        for (const block of parsed.blocks) processBlock(block);
       },
       finish(sawDone) {
         if (closed) return;
-        if (source.trim()) processBlock(source);
+        for (const block of consumeOfficialSseBlocks(source, '', true).blocks) processBlock(block);
         source = "";
+        if (deltaFailed) sawDone = false;
         if (controller) {
           if (!sawDone && projectedResumeControl) write("", projectedResumeControl);
-
-          const orderedMessages = [];
-          const messagesById = new Map();
-          const rememberMessage = (projected) => {
-            const id = projected?.message?.id;
-            if (!id) return;
-            if (!messagesById.has(id)) orderedMessages.push(id);
-            messagesById.set(id, projected);
-          };
-          for (const channel of projectedChannelOrder) rememberMessage(projectedByChannel[channel]);
-          for (const projected of projectedLegacyMessages.values()) rememberMessage(projected);
 
           let matchingUser = null;
           let latestUser = null;
           let final = null;
-          for (const id of orderedMessages) {
-            const projected = messagesById.get(id);
+          for (const projected of projectedLegacyMessages.values()) {
             if (projected?.message?.author?.role === "user") {
               latestUser = projected;
-              if (id === turnUserMessageId) matchingUser = projected;
+              if (projected.message.id === turnUserMessageId) matchingUser = projected;
             }
             if (isOfficialFinalAssistant(projected?.message)) final = projected;
           }
@@ -1431,6 +1485,11 @@
         }
         controller = null;
         closed = true;
+        channelValues.clear();
+        projectedLegacyMessages.clear();
+        projectedControls.clear();
+        projectedResumeControl = null;
+        onTurnValue = null;
       },
     };
   }
@@ -1459,13 +1518,33 @@
     };
   }
 
+  function consumeOfficialSseBlocks(buffer, chunk, flush = false) {
+    const source = (String(buffer || '') + String(chunk || '')).replace(/^\uFEFF/, '');
+    const blocks = [];
+    let blockStart = 0;
+    let lineStart = 0;
+    for (const match of source.matchAll(/\r\n|\r|\n/g)) {
+      if (!flush && match[0] === '\r' && match.index === source.length - 1) break;
+      const end = match.index + match[0].length;
+      if (match.index === lineStart) {
+        blocks.push(source.slice(blockStart, lineStart));
+        blockStart = end;
+      }
+      lineStart = end;
+    }
+    return { blocks, rest: flush ? '' : source.slice(blockStart) };
+  }
+
   function parseOfficialSseFrame(block) {
     if (!block) return null;
     let event = "";
     const data = [];
-    for (const line of String(block).split(/\r?\n/)) {
-      if (line.startsWith("event:")) event = line.slice(6).trim();
-      else if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
+    for (const line of String(block).split(/\r\n|\r|\n/)) {
+      const colon = line.indexOf(':');
+      const field = colon < 0 ? line : line.slice(0, colon);
+      const value = colon < 0 ? '' : line.slice(colon + 1).replace(/^ /, '');
+      if (field === 'event') event = value;
+      else if (field === 'data') data.push(value);
     }
     if (!data.length) return null;
     const body = data.join("\n");
@@ -1483,9 +1562,13 @@
     }
     const compact = { ...rawDelta };
     for (const [field, short] of [["channel", "c"], ["path", "p"], ["op", "o"]]) {
-      if (!(short in compact)) compact[short] = previousDelta[field];
+      if (!(short in compact) && !(field in compact)) compact[short] = previousDelta[field];
     }
-    return expandOfficialDelta(compact);
+    const delta = expandOfficialDelta(compact);
+    if (!Number.isSafeInteger(delta.channel) || delta.channel < 0 || typeof delta.path !== 'string') {
+      throw new Error('Invalid official delta channel/path');
+    }
+    return delta;
   }
 
   function expandOfficialDelta(compact) {
@@ -1538,6 +1621,12 @@
   }
 
   function applyOfficialDeltaOperation(target, key, delta) {
+    if (Array.isArray(target)) {
+      if (key === '-' && delta.op === 'add') key = target.length;
+      if (!Number.isSafeInteger(key) || key < 0 || key > target.length || (key === target.length && delta.op !== 'add')) {
+        throw new Error('Invalid official delta array index');
+      }
+    }
     if (delta.op === "patch") {
       let value = target[key];
       for (const patch of delta.value) value = applyOfficialDelta(value, patch);
@@ -1661,38 +1750,32 @@
           });
       },
     });
+    const headers = new Headers(response.headers);
+    headers.delete("content-encoding");
+    headers.delete("content-length");
+    headers.delete("transfer-encoding");
+    const projected = new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+    const readers = {};
+    for (const name of ["text", "json", "arrayBuffer", "blob", "formData", "bytes", "clone"]) {
+      if (typeof projected[name] !== "function") continue;
+      readers[name] = { configurable: true, value: projected[name].bind(projected) };
+    }
     try {
       Object.defineProperties(response, {
-        body: {
-          configurable: true,
-          value: body,
-        },
-        bodyUsed: {
-          configurable: true,
-          get: () => body.locked,
-        },
-        text: {
-          configurable: true,
-          value: async () => new Response(body).text(),
-        },
-        json: {
-          configurable: true,
-          value: async () => JSON.parse(await new Response(body).text()),
-        },
+        // clone() tees a stream and can replace its branch. Always expose the
+        // projected Response's current body, not the original locked stream.
+        body: { configurable: true, get: () => projected.body },
+        bodyUsed: { configurable: true, get: () => projected.bodyUsed },
+        ...readers,
       });
       return response;
     } catch {
-      const headers = new Headers(response.headers);
-      headers.delete("content-encoding");
-      headers.delete("content-length");
-      headers.delete("transfer-encoding");
-      const fallback = new Response(body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers,
-      });
-      observedFetchResponses.add(fallback);
-      return fallback;
+      observedFetchResponses.add(projected);
+      return projected;
     }
   }
 
@@ -1701,7 +1784,9 @@
     const decoder = new TextDecoder();
     const { onClose, cancelSignal, officialSemanticStream, ...unresolvedMeta } = meta;
     const captureMeta = await resolveCaptureMeta(unresolvedMeta);
-    officialSemanticStream?.setContext(captureMeta);
+    officialSemanticStream?.setContext({ ...captureMeta,
+      onTurnValue: (value) => observeCapturedTurn(value, captureMeta),
+    });
     if (captureMeta.conversationId && isExecutionStreamUrl(captureMeta.url)) {
       emitExecutionState('running', 'sse-active', captureMeta.conversationId);
     }
@@ -1712,11 +1797,18 @@
     let sawDone = false;
     let readError = null;
 
+    const trackCompletion = (data, flush = false) => {
+      const parsed = consumeOfficialSseBlocks(markerTail, data, flush);
+      markerTail = parsed.rest;
+      for (const block of parsed.blocks) {
+        if (block.includes('[DONE]') && parseOfficialSseFrame(block)?.data === '[DONE]') sawDone = true;
+      }
+    };
+
     const captureChunk = (data) => {
       if (!data) return;
       officialSemanticStream?.accept(data);
-      markerTail = `${markerTail}${data}`.slice(-256);
-      if (/(?:^|\n)\s*data:\s*\[DONE\]/.test(markerTail)) sawDone = true;
+      trackCompletion(data);
       emit({
         type: "page-capture",
         transport: "sse",
@@ -1737,6 +1829,7 @@
     } catch (error) {
       readError = error;
     } finally {
+      trackCompletion('', true);
       officialSemanticStream?.finish(sawDone);
       emit({
         type: "page-capture",
@@ -1967,7 +2060,7 @@
           );
           const turnScope = conversationRequest
             ? snapshotXhrSubmissionTurn(body, conversationScope)
-            : (url.pathname === RESUME_PATH ? snapshotActiveTurn(conversationScope) : null);
+            : (url.pathname === RESUME_PATH ? snapshotActiveTurn(conversationScope, turnIdentityFromRequestBody(body)) : null);
           observeXhrResponse(this, {
             ...meta,
             conversationScope,
@@ -1984,6 +2077,8 @@
   async function snapshotXhrSubmissionTurn(body, conversationScope) {
     const session = {
       sessionId: nextTurnSessionId(),
+      submissionOrdinal: ++turnSubmissionOrdinal,
+      scopePending: true,
       transportTurnId: null,
       turnId: null,
       turnAliases: [],
@@ -1996,11 +2091,15 @@
       parentMessageId: null,
       startedAt: Date.now(),
     };
+    session.transportTurnId = session.sessionId;
+    registerTurnSession(session);
     const [scope, identity] = await Promise.all([
-      conversationScope?.catch(() => ({ conversationId: null, conflicted: false })) ||
+      conversationScope?.catch(() => ({ conversationId: null, conflicted: true })) ||
         Promise.resolve({ conversationId: null, conflicted: false }),
       Promise.resolve(turnIdentityFromRequestBody(body)),
     ]);
+    session.scopePending = false;
+    session.scopeConflicted = Boolean(scope?.conflicted);
     if (!scope?.conflicted && scope?.conversationId) session.conversationId = scope.conversationId;
     if (identity?.userMessageId) session.userMessageId = identity.userMessageId;
     if (identity?.parentMessageId) session.parentMessageId = identity.parentMessageId;
@@ -2071,6 +2170,12 @@
 
   function queueCanonicalConversation(conversationId) {
     if (!conversationId || isProvisionalConversationId(conversationId)) return;
+    const retryAfterMs = (canonicalBackoffUntil.get(conversationId) || 0) - Date.now();
+    if (retryAfterMs > 0) {
+      emit({ type: 'canonical-sync-status', conversationId, state: 'error', code: 'backoff', retryAfterMs });
+    } else if (!backendFetch || !(backendHeaders || backendSessionHeaders)) {
+      emit({ type: 'canonical-sync-status', conversationId, state: 'error', code: 'not-ready' });
+    }
     const generation = canonicalQueueGenerations.get(conversationId) || 0;
     const attempted = canonicalAttemptedGenerations.get(conversationId);
     if (!pendingCanonicalIds.has(conversationId)) {
@@ -2088,6 +2193,7 @@
     if (!backendFetch || !(backendHeaders || backendSessionHeaders)) return;
     const now = Date.now();
     for (const conversationId of pendingCanonicalIds) {
+      if (canonicalFetches.size >= 3) break;
       if (canonicalFetches.has(conversationId)) continue;
       if ((canonicalBackoffUntil.get(conversationId) || 0) > now) continue;
       const generation = canonicalQueueGenerations.get(conversationId) || 0;
@@ -2100,6 +2206,8 @@
     const sourceHeaders = backendHeaders || backendSessionHeaders;
     if (canonicalFetches.has(conversationId) || !backendFetch || !sourceHeaders) return;
     canonicalAttemptedGenerations.set(conversationId, generation);
+    const syncId = nextRequestId('sync');
+    emit({ type: 'canonical-sync-status', conversationId, canonicalSyncId: syncId, state: 'loading' });
     const task = (async () => {
       const headers = new Headers(sourceHeaders);
       headers.delete("content-length");
@@ -2116,7 +2224,6 @@
         canonicalQueueGenerations.delete(conversationId);
       }
       const ordered = pages.slice().reverse();
-      const syncId = nextRequestId("sync");
       for (let index = 0; index < ordered.length; index += 1) {
         const page = ordered[index];
         emit({
@@ -2137,17 +2244,23 @@
           canonicalComplete: index === ordered.length - 1,
         });
       }
+      emit({ type: 'canonical-sync-status', conversationId, canonicalSyncId: syncId, state: 'complete' });
     })();
     canonicalFetches.set(conversationId, task);
     try {
       await task;
     } catch (error) {
       scheduleCanonicalBackoff(conversationId, error);
+      emit({ type: 'canonical-sync-status', conversationId, canonicalSyncId: syncId, state: 'error',
+        code: error?.code === 'timeout' ? 'timeout' : error?.code === 'invalid-history' ? 'invalid-history' : 'request-failed',
+        status: Number(error?.status) || null,
+        retryAfterMs: Math.max(0, (canonicalBackoffUntil.get(conversationId) || 0) - Date.now()),
+      });
     } finally {
       canonicalFetches.delete(conversationId);
-      if ((canonicalQueueGenerations.get(conversationId) || 0) !== generation) {
-        drainCanonicalFetches();
-      }
+      // Release a slot for any queued conversation. Failed generations remain
+      // attempted/backed off; this is completion-driven, not timer polling.
+      drainCanonicalFetches();
     }
   }
 
@@ -2156,7 +2269,7 @@
     canonicalFailureCounts.set(conversationId, failureCount);
     const explicitDelay = Number(error?.retryAfterMs);
     const delay = Number.isFinite(explicitDelay) && explicitDelay > 0
-      ? Math.min(explicitDelay, 60_000)
+      ? explicitDelay
       : Math.min(1_500 * (2 ** Math.min(failureCount - 1, 4)), 24_000);
     canonicalBackoffUntil.set(conversationId, Date.now() + delay);
     // Strictly event-driven: a failed full-history read never schedules its
@@ -2180,12 +2293,15 @@
     return error;
   }
 
-  async function fetchCanonicalConversationPages(conversationId, headers) {
+  async function fetchCanonicalConversationPages(conversationId, headers, limits = {}) {
     const pages = [];
     const seenCursors = new Set();
+    const maxPages = limits.maxPages ?? 100;
+    const maxTotalBytes = limits.maxTotalBytes ?? 64 * 1024 * 1024;
+    let totalBytes = 0;
     let before = null;
 
-    for (let pageIndex = 0; pageIndex < 100; pageIndex += 1) {
+    for (let pageIndex = 0; pageIndex < maxPages; pageIndex += 1) {
       const tryFetch = async (useMessagesEndpoint) => {
         const path = useMessagesEndpoint && before
           ? `/backend-api/conversations/${encodeURIComponent(conversationId)}/messages`
@@ -2194,22 +2310,12 @@
         url.searchParams.set("include_has_versions", "true");
         url.searchParams.set("num_turns", String(CANONICAL_PAGE_TURNS));
         if (before) url.searchParams.set("before", before);
-        return {
-          url,
-          response: await Reflect.apply(backendFetch, backendFetchThis, [
-            url.href,
-            {
-              method: "GET",
-              credentials: "include",
-              cache: "no-store",
-              headers: new Headers(headers),
-            },
-          ]),
-        };
+        return fetchCanonicalPageResponse(url, headers, limits);
       };
 
       let url;
       let response;
+      let body;
       // Prefer the paginated /messages endpoint for older pages (matches
       // fixture and newer ChatGPT builds), but fall back to the unified
       // ?before= cursor on the same /conversations/:id endpoint if the
@@ -2220,29 +2326,33 @@
         if (primary.response.ok) {
           url = primary.url;
           response = primary.response;
+          body = primary.body;
         } else if ([404, 405, 400].includes(primary.response.status)) {
           const fallback = await tryFetch(false);
           url = fallback.url;
           response = fallback.response;
+          body = fallback.body;
         } else {
           url = primary.url;
           response = primary.response;
+          body = primary.body;
         }
       } else {
         const single = await tryFetch(false);
         url = single.url;
         response = single.response;
+        body = single.body;
       }
       if (!response.ok) {
         if (!pages.length && [404, 405].includes(response.status)) {
-          return fetchLegacyCanonicalConversation(conversationId, headers);
+          return fetchLegacyCanonicalConversation(conversationId, headers, limits);
         }
         throw canonicalFetchFailure(response);
       }
-      const text = await response.text();
-      if (!text || text.length > MAX_NON_STREAM_BODY) throw new Error('invalid canonical response size');
-      let value;
-      try { value = JSON.parse(text); } catch { throw new Error('invalid canonical response json'); }
+      const { text, bytes } = body;
+      totalBytes += bytes;
+      if (totalBytes > maxTotalBytes) throw canonicalProtocolFailure('canonical total size limit exceeded');
+      const { pageInfo } = validateCanonicalPage(text, conversationId);
       pages.push({
         text,
         url: response.url || url.href,
@@ -2250,44 +2360,124 @@
         mimeType: response.headers.get("content-type") || "application/json",
       });
 
-      // Legacy/full tree responses are already complete in one request.
-      if (value?.mapping && value?.current_node) break;
-      const pageInfo = value?.page_info || value?.data?.page_info || null;
-      if (!pageInfo?.has_previous_page) break;
-      const cursor = String(pageInfo.start_cursor || "").trim();
-      if (!cursor || seenCursors.has(cursor)) throw new Error('canonical cursor did not advance');
+      // Explicit pagination always wins over the presence of a mapping/root.
+      if (!pageInfo || pageInfo.has_previous_page === false) return pages;
+      const cursor = typeof pageInfo.start_cursor === 'string' ? pageInfo.start_cursor.trim() : '';
+      if (!cursor || seenCursors.has(cursor)) throw canonicalProtocolFailure('canonical cursor did not advance');
       seenCursors.add(cursor);
       before = cursor;
     }
-    return pages;
+    throw canonicalProtocolFailure('canonical page limit reached with incomplete history');
   }
 
-  async function fetchLegacyCanonicalConversation(conversationId, headers) {
+  async function fetchLegacyCanonicalConversation(conversationId, headers, limits = {}) {
     const url = new URL(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, location.origin);
-    const response = await Reflect.apply(backendFetch, backendFetchThis, [
-      url.href,
-      {
-        method: "GET",
-        credentials: "include",
-        cache: "no-store",
-        headers: new Headers(headers),
-      },
-    ]);
+    const { response, body } = await fetchCanonicalPageResponse(url, headers, limits);
     if (!response.ok) throw canonicalFetchFailure(response);
-    const text = await response.text();
-    if (!text || text.length > MAX_NON_STREAM_BODY) throw new Error('invalid legacy canonical response size');
-    try {
-      const value = JSON.parse(text);
-      if (!value?.mapping || !value?.current_node) throw new Error('invalid legacy canonical response');
-    } catch {
-      throw new Error('invalid legacy canonical response json');
-    }
+    const { text, bytes } = body;
+    const { value, pageInfo } = validateCanonicalPage(text, conversationId);
+    if (!value.mapping || pageInfo?.has_previous_page || bytes > (limits.maxTotalBytes ?? 64 * 1024 * 1024)) throw canonicalProtocolFailure('invalid or incomplete legacy canonical response');
     return [{
       text,
       url: response.url || url.href,
       status: response.status,
       mimeType: response.headers.get("content-type") || "application/json",
     }];
+  }
+
+  function canonicalProtocolFailure(message) {
+    const error = new Error(message);
+    error.code = 'invalid-history';
+    return error;
+  }
+
+  function validateCanonicalPage(text, conversationId) {
+    let root;
+    try { root = JSON.parse(text); } catch { throw canonicalProtocolFailure('invalid canonical response json'); }
+    let value = root;
+    let outerPageInfo;
+    const visited = new Set();
+    while (value && typeof value === 'object' && !Array.isArray(value) && !visited.has(value)) {
+      visited.add(value);
+      for (const id of [value.conversation_id, value.conversationId]) {
+        if (id != null && id !== conversationId) throw canonicalProtocolFailure('canonical conversation identity mismatch');
+      }
+      if (value.page_info != null) outerPageInfo = value.page_info;
+      if (value.mapping || Array.isArray(value.messages)) break;
+      // Envelope keys only; tool output/message content is never traversed.
+      value = value.data || value.conversation || value.result || value.payload;
+      if (visited.size > 8) break;
+    }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw canonicalProtocolFailure('invalid canonical page shape');
+    if (value.id != null && value.id !== conversationId) throw canonicalProtocolFailure('canonical conversation identity mismatch');
+    const mapping = value.mapping;
+    const isTree = mapping && typeof mapping === 'object' && !Array.isArray(mapping);
+    const messageValid = (message) => message && typeof message === 'object' && !Array.isArray(message) &&
+      typeof message.id === 'string' && message.id && (message.author || message.content);
+    if (isTree) {
+      if (!Object.values(mapping).every((node) => node && typeof node === 'object' && !Array.isArray(node) && (node.message == null || messageValid(node.message)))) throw canonicalProtocolFailure('invalid canonical mapping node');
+    } else if (!Array.isArray(value.messages) || !value.messages.every(messageValid)) {
+      throw canonicalProtocolFailure('invalid canonical messages');
+    }
+    const pageInfo = value.page_info ?? outerPageInfo;
+    if (pageInfo != null && (typeof pageInfo !== 'object' || typeof pageInfo.has_previous_page !== 'boolean')) throw canonicalProtocolFailure('invalid canonical pagination');
+    if (!isTree && !pageInfo) throw canonicalProtocolFailure('canonical list has no pagination boundary');
+    if (isTree && !pageInfo && (Object.keys(mapping).length && !mapping[value.current_node])) throw canonicalProtocolFailure('canonical tree has no terminal node');
+    return { value, pageInfo: pageInfo || null };
+  }
+
+  async function fetchCanonicalPageResponse(url, headers, limits = {}) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), limits.requestTimeoutMs ?? 30_000);
+    try {
+      const response = await Reflect.apply(backendFetch, backendFetchThis, [url.href, {
+        method: 'GET', credentials: 'include', cache: 'no-store',
+        headers: new Headers(headers), signal: controller.signal,
+      }]);
+      if (!response.ok) {
+        // Rejected fallback endpoints can still stream bodies. They are not
+        // evidence and must not keep a reader/connection alive indefinitely.
+        try { await response.body?.cancel(); } catch { /* already closed */ }
+        return { url, response, body: null };
+      }
+      return { url, response, body: await readCanonicalBody(response, controller.signal) };
+    } catch (error) {
+      if (controller.signal.aborted) {
+        const timeout = new Error('canonical request timed out');
+        timeout.code = 'timeout';
+        throw timeout;
+      }
+      throw error;
+    } finally { clearTimeout(timer); }
+  }
+
+  async function readCanonicalBody(response, signal) {
+    if (!response.body) throw canonicalProtocolFailure('empty canonical response');
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    const chunks = [];
+    let bytes = 0;
+    let completed = false;
+    const abort = () => { void reader.cancel().catch(() => {}); };
+    signal.addEventListener('abort', abort, { once: true });
+    try {
+      while (true) {
+        if (signal.aborted) throw signal.reason;
+        const { done, value } = await reader.read();
+        if (signal.aborted) throw signal.reason;
+        if (done) { completed = true; break; }
+        bytes += value.byteLength;
+        if (bytes > MAX_NON_STREAM_BODY) throw canonicalProtocolFailure('canonical response size limit exceeded');
+        chunks.push(decoder.decode(value, { stream: true }));
+      }
+      chunks.push(decoder.decode());
+      if (!bytes) throw canonicalProtocolFailure('empty canonical response');
+      return { text: chunks.join(''), bytes };
+    } finally {
+      signal.removeEventListener('abort', abort);
+      if (!completed) { try { await reader.cancel(); } catch { /* already failed */ } }
+      reader.releaseLock();
+    }
   }
 
   function installWebSocketObserver() {
@@ -2470,7 +2660,7 @@
       event.stopImmediatePropagation();
       for (const notification of notifications) {
         const conversationId = notification.conversationId;
-        const stateValue = notificationExecutionState(notification);
+        const stateValue = applicableNotificationState(notification, activeTurnSessions.get(conversationId));
         if (
           conversationId &&
           pendingNewTurnSession &&
@@ -2501,11 +2691,14 @@
         }
         if (conversationId && stateValue === 'running') {
           adoptNotificationTurnIdentity(conversationId, notification);
-          emitExecutionState('running', 'ws-turn-running', conversationId, { phase: notification.type });
+          emitExecutionState('running', 'ws-turn-running', conversationId, { phase: notification.type,
+            turnAliases: notification.turnAliases, turnUserMessageId: notification.turnUserMessageId });
         } else if (conversationId && stateValue === 'stopped') {
-          emitExecutionState('stopped', 'ws-turn-stopped', conversationId, { phase: notification.type });
+          emitExecutionState('stopped', 'ws-turn-stopped', conversationId, { phase: notification.type,
+            turnAliases: notification.turnAliases, turnUserMessageId: notification.turnUserMessageId });
           const activeSession = activeTurnSessions.get(conversationId);
           if (!activeSession || notificationMatchesTurnSession(notification, activeSession)) {
+            if (activeSession) activeSession.released = true;
             activeTurnSessions.delete(conversationId);
           }
         }
@@ -2547,6 +2740,10 @@
       const metadata = eventPayload.metadata && typeof eventPayload.metadata === "object"
         ? eventPayload.metadata
         : {};
+      const conversationIds = uniqueTurnIdentityStrings([
+        payload.conversation_id, payload.conversationId, eventPayload.conversation_id, eventPayload.conversationId,
+      ]);
+      if (conversationIds.length !== 1 || isProvisionalConversationId(conversationIds[0])) continue;
       const turnExchangeId = firstTurnIdentityString(
         eventPayload.turn_exchange_id,
         eventPayload.turnExchangeId,
@@ -2573,7 +2770,13 @@
       );
       notifications.push({
         type: String(payload.type || eventPayload.type || "conversation-update"),
-        conversationId: eventPayload.conversation_id || eventPayload.conversationId || null,
+        conversationId: conversationIds[0],
+        turnUserMessageId: firstTurnIdentityString(
+          eventPayload.turn_user_message_id, eventPayload.turnUserMessageId,
+          eventPayload.user_message_id, eventPayload.userMessageId,
+          metadata.turn_user_message_id, metadata.user_message_id,
+          payload.turn_user_message_id, payload.user_message_id,
+        ),
         status: String(eventPayload.status || payload.status || ''),
         turnExchangeId,
         workingTurnId,
@@ -2593,14 +2796,9 @@
   function adoptNotificationTurnIdentity(conversationId, notification) {
     const session = activeTurnSessions.get(conversationId);
     if (!session || !notification?.turnAliases?.length) return;
+    if (!notificationMatchesTurnSession(notification, session)) return;
     const existingAliases = uniqueTurnIdentityStrings(session.turnAliases || []);
-    if (
-      existingAliases.length &&
-      !existingAliases.some((alias) => notification.turnAliases.includes(alias))
-    ) {
-      return;
-    }
-    activeTurnSessions.set(conversationId, {
+    Object.assign(session, {
       ...session,
       turnId: session.turnId || notification.turnAliases[0],
       turnAliases: uniqueTurnIdentityStrings([
@@ -2614,36 +2812,25 @@
     });
   }
 
+  function applicableNotificationState(notification, session) {
+    if (session && !notificationMatchesTurnSession(notification, session)) return null;
+    return notificationExecutionState(notification);
+  }
+
   function notificationMatchesTurnSession(notification, session) {
+    if (!session || session.scopePending || session.scopeConflicted || session.released) return false;
+    const userId = firstTurnIdentityString(notification?.turnUserMessageId, notification?.userMessageId);
+    if (userId && session.userMessageId && userId !== session.userMessageId) return false;
+    if (notification?.turnExchangeId && session.turnExchangeId && notification.turnExchangeId !== session.turnExchangeId) return false;
     const notificationAliases = uniqueTurnIdentityStrings(notification?.turnAliases || []);
     const sessionAliases = uniqueTurnIdentityStrings(session?.turnAliases || []);
-    if (!notificationAliases.length || !sessionAliases.length) return true;
-    return notificationAliases.some((alias) => sessionAliases.includes(alias));
+    return Boolean((userId && session.userMessageId === userId) ||
+      notificationAliases.some((alias) => sessionAliases.includes(alias)));
   }
 
   function notificationMatchesPendingNewTurn(notification, session) {
-    if (!session) return false;
-    const notificationAliases = uniqueTurnIdentityStrings(notification?.turnAliases || []);
-    const sessionAliases = uniqueTurnIdentityStrings([
-      ...(session?.turnAliases || []),
-      session?.turnId,
-      session?.transportTurnId,
-      session?.turnExchangeId,
-      session?.workingTurnId,
-      session?.requestId,
-      session?.turnTraceId,
-    ]);
-    if (notificationAliases.length && sessionAliases.length) {
-      if (notificationAliases.some((alias) => sessionAliases.includes(alias))) return true;
-    }
-    // Pure event-driven binding for new chats: a pending session created by a
-    // new chat submission without client aliases claims the first unseen
-    // conversation turn notification that carries valid turn identities.
-    const conversationId = typeof notification?.conversationId === 'string' ? notification.conversationId.trim() : '';
-    if (conversationId && !activeTurnSessions.has(conversationId) && !isProvisionalConversationId(conversationId)) {
-      if (notificationAliases.length) return true;
-    }
-    return false;
+    return Boolean(session && !session.conversationId &&
+      notificationMatchesTurnSession(notification, session));
   }
 
   function notificationExecutionState(notification) {
@@ -2871,6 +3058,11 @@
       case "navigate-conversation": {
         const route = payload.route === "uc" ? "uc" : "c";
         navigate(`/${route}/${encodeURIComponent(payload.conversationId || "")}`);
+        return;
+      }
+      case "refresh-conversation": {
+        const id = typeof payload.conversationId === 'string' ? payload.conversationId.trim() : '';
+        if (id && !isProvisionalConversationId(id)) queueCanonicalConversation(id);
         return;
       }
       case "adopt-conversation-id": {

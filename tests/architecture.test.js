@@ -122,7 +122,7 @@ test('official slow stream consumers receive structural semantics without owning
     'official items must retain structure while expensive message bodies are suppressed',
   );
   assert.ok(mitm.includes('event.stopImmediatePropagation()'), 'heavy official websocket conversation parsing should be cut off');
-  assert.ok(home.includes('[DONE] terminates this SSE segment only'), 'synthetic/transport DONE must not become logical turn completion');
+  assert.ok(home.includes('createConversationStreamReader'), 'the UI must use the tested stream reader rather than treating transport EOF as logical completion');
   assert.ok(mitm.includes("emitExecutionState('stopped', 'ws-turn-stopped'"), 'logical stop should follow the server conversation lifecycle');
 });
 
@@ -143,7 +143,7 @@ test('intercepted turn sessions survive transport boundaries and clean up on ser
   const captureBlock = source.slice(captureStart, captureEnd);
   assert.equal(captureBlock.includes('releaseTurnSession('), false, 'SSE completion must not release the logical turn session');
   assert.equal(captureBlock.includes('queueCanonicalConversation('), false, 'transport close must not launch a full-history reconciliation before logical turn completion');
-  assert.ok(source.includes('snapshotActiveTurn(conversationScope)'), 'resume requests must inherit the active logical turn');
+  assert.ok(source.includes('snapshotActiveTurn(conversationScope, readRequestTurnIdentity(request))'), 'resume requests must consult their own identity before inheriting a transport context');
   assert.ok(source.includes("emitExecutionState('stopped', 'ws-turn-stopped'"));
   assert.ok(source.includes("if (conversationId && stateValue === 'stopped')"), 'full-history reconciliation should be driven by the durable server stop boundary');
   assert.ok(source.includes('activeTurnSessions.delete(conversationId)'), 'server turn completion must release the active session');
@@ -177,7 +177,7 @@ test('canonical pagination never publishes a partial history when an older curso
   assert.ok(source.includes('const CANONICAL_PAGE_TURNS = 10'));
   assert.ok(fetchBlock.includes('[404, 405].includes(response.status)'));
   assert.ok(fetchBlock.includes('throw canonicalFetchFailure(response)'), 'a failed older page must abort the partial page chain');
-  assert.ok(fetchBlock.includes("throw new Error('canonical cursor did not advance')"), 'broken cursor chains must also remain incomplete');
+  assert.ok(fetchBlock.includes("throw canonicalProtocolFailure('canonical cursor did not advance')"), 'broken cursor chains must also remain incomplete');
 
   const syncStart = source.indexOf('async function fetchCanonicalConversation(conversationId, generation');
   const syncEnd = source.indexOf('async function fetchCanonicalConversationPages', syncStart);

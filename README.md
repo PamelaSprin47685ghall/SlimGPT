@@ -33,6 +33,7 @@ Log into ChatGPT in that browser first. On login, cookie-consent, Cloudflare, or
 ```bash
 npm install
 npm test
+npm run test:markdown
 npm run check
 npm run build
 npm run live:smoke
@@ -45,6 +46,148 @@ Real-site read-only smoke:
 ```bash
 npm run live:smoke:real
 ```
+
+To verify parsing of one existing conversation without submitting a message:
+
+```bash
+npm run build:extension
+node scripts/live-smoke.mjs --live --clone-profile --read-history
+```
+
+The history check waits for a complete canonical sync and reports counts, not
+conversation text. It exits unsuccessfully when login, a verification page,
+or incomplete history prevents the check. `--read-history` cannot be combined
+with `--send-live`. The source Chrome cookie database is opened read-only;
+only ChatGPT/OpenAI cookies and the encryption settings needed by Chrome are
+copied into a private temporary profile. Passwords, browsing history,
+extensions, and unrelated cookies are not copied. This helper uses Node's
+built-in `node:sqlite` module.
+
+Unit tests cover snapshot replacement/deletion versus explicit deltas,
+UTF-8 and arbitrary SSE chunk boundaries, both standalone protocol parsers,
+out-of-order tool ownership, partial-history retention, restored observations,
+citations, clipboard failures, input composition, and nested scrolling.
+The browser fixture pins a copy of the built extension for the entire run so
+that a concurrent build cannot invalidate its lazy-loaded assets.
+
+### Streaming Markdown and optional formatting
+
+`npm run test:markdown` builds the production Markdown renderer and tool
+component into a temporary fixture, then runs assertions in a clean Chromium
+DOM. It serves only local test data, denies remote content through CSP, and
+does not access the user's Chrome profile. Set `CHROME_PATH` when Chromium is
+not installed at one of the runner's standard Linux locations.
+
+The renderer explicitly finalizes open code blocks and tables at the end of a
+message. Unfinished inline markup or formulas retain their literal delimiters;
+code keeps its real trailing newline without gaining an artificial EOF newline.
+CRLF boundaries work even when split across updates. Broken or disallowed
+image URLs retain a visible description. Code above 200,000 characters bypasses
+syntax highlighting without discarding any text.
+
+TOML conversion/highlighting loads only when a tool card is mounted, rather
+than being part of the initial application bundle. Raw content is immediately
+available while that module loads, and remains readable/copyable if loading or
+formatting fails. Browser tests include an actual HTTP failure of the formatter
+chunk; a loader failure does not make the conversation disappear.
+
+### Complete-history synchronization
+
+History publication is transactional at both ends of the bridge. The page hook
+checks every response's conversation identity, message shape and pagination
+boundary. A mapping with `current_node` is not a complete history when its
+`page_info` says older pages remain. The receiver verifies contiguous zero-based
+page indices, consistent page counts and a matching final boundary. Replayed
+pages do not reset staging; missing/conflicting pages retire the transaction
+without replacing the previous history or selected branch. A sender's end
+notification cannot certify pages that never reached the receiver.
+
+Reads have a 30-second per-request deadline covering headers and body, the
+existing per-page body budget, a 64 MiB aggregate body budget and a 100-page
+ceiling. No more than three histories fetch concurrently. Reaching any limit
+while history is incomplete is a visible failure, never a silently shortened
+successful history. Oversized or rejected bodies are canceled. Server-requested
+`Retry-After` intervals are not shortened to an arbitrary one-minute cap.
+
+The interface reports sync/authentication/rate-limit failures and provides
+**重试同步** without navigating away, discarding the draft or retrying a message
+submission. Existing content remains readable. Retries are driven by explicit
+user actions or subsequent protocol events, not a polling timer. Empty, valid
+histories can complete normally instead of remaining in a loading state.
+
+### Turn-session ownership across asynchronous requests
+
+Submission sessions are reserved at interception entry and become active only
+after request scope/identity parsing succeeds. Fetch and XHR share a monotonic
+registration order, so a slow older request cannot replace a newer active turn
+or revive after it has finished. This order is local transport bookkeeping, not
+a historical turn identifier. The reservation ledger retains at most 256 small
+identity records and never retains request bodies or credentials.
+
+Conversation broadcasts do not claim a pending new chat merely because they
+arrive first or name an unseen conversation. Binding requires a matching user
+message or semantic turn identity; transport trace ids are not semantic aliases.
+The pending UI checks correlation before adopting any fields, including when a
+foreign notification repeats. Captured response metadata can enrich the exact
+session that owns its transport without guessing from another tab's broadcast.
+
+A delayed or unidentified stop notification cannot stop/clear a different active
+turn. Resume requests consult their own explicit request identity first; without
+one, they use the session snapshot taken when interception began, not whichever
+turn becomes active after asynchronous parsing. Ambiguous same-user regenerated
+requests remain unbound. Cross-window status publication preserves `unknown`
+rather than converting it to `stopped`, and retains normalized ownership fields.
+
+### Cache and export integrity
+
+The observation cache has a 4 MiB UTF-8 payload budget and a maximum of 24
+conversations. It no longer shortens individual text fields, result arrays,
+or objects to fit. A conversation that cannot be stored intact is omitted as
+a whole; an omission manifest survives reload and produces a visible notice.
+The in-memory conversation is not cropped. Credential-shaped fields remain
+excluded, and affected cached items are labelled instead of being presented
+as untouched raw payloads. A failed legacy-cache migration write does not
+discard the content that was successfully read.
+
+Peer snapshots with comparable protocol revisions replace older observations
+without using wall-clock arrival time. Cleared text/errors remain cleared;
+status-only updates after reload do not erase restored text or invent raw
+transport data.
+
+Markdown export includes reasoning, tool calls/results with their call IDs,
+and ordinary answers from the selected branch, including collapsed/offscreen
+items. Tool strings retain their original whitespace and large numeric
+literals; export fences cannot be closed by backticks inside a tool result.
+Unresolved groups are separate from the preceding user turn. Exporting partial
+history is allowed, but both the file and the UI explicitly label it incomplete.
+Pending unsent drafts are excluded. Errors while preparing or starting a
+download produce an error rather than a success message; the browser's later
+save/cancel decision is not observable by this export path.
+
+Additional regressions exercise regenerated answers that share a user turn,
+actual previous/next branch controls, and a damaged stream followed by a
+canonical recovery read. Known sibling-branch observations are excluded from
+the selected branch; unknown provenance remains visible. Progress labels alone
+do not reclassify a user message, final answer, or tool result as reasoning.
+
+The live SSE reader processes incoming lines incrementally and bounds the
+unfinished event buffer. A decoding failure quarantines that transport's
+subsequent deltas and requests a canonical history refresh; it does not resume
+against state from before a missing operation. Completed snapshots already
+received remain visible. A real later response uses a fresh decoder.
+
+Canonical view projections are cached against immutable history payloads,
+with at most three selected-branch projections per payload. A history refresh
+invalidates the cache without a timer. Run the synthetic, network-free parsing
+benchmark with:
+
+```bash
+node scripts/benchmark-parsing.mjs
+```
+
+It checks 300 turns / 1,200 messages plus a large event delivered in 256-character
+chunks. Reported cold/warm timings compare projection reconstruction with cache
+reuse on the same code; they are not a prior-release or real-account benchmark.
 
 To exercise a real send from an isolated clone of the current Chrome profile, close normal Chrome first, then run:
 
@@ -105,7 +248,7 @@ The main interface has no feature toggles for its core reading behavior; these a
 - Only the active question/response turn is mounted in the center pane; the overview stores compact one-line labels for the other turns.
 - Markdown uses [`streaming-markdown`](https://github.com/thetarnav/streaming-markdown) directly. New source suffixes append through its parser/DOM renderer; completed paragraphs, code blocks, tables, and math nodes retain their DOM identity instead of being regenerated for every chunk.
 - Page synchronization is event-driven: fetch stream chunks, XHR progress, WebSocket messages, and official DOM child/character-data mutations all feed the same live message pipeline. There is no interval polling loop for message synchronization.
-- While takeover is active, `/backend-api/f/conversation/resume` is cloned into SlimGPT and completed immediately for the hidden official consumer. This keeps the full stream in SlimGPT without making ChatGPT's hidden renderer parse and lay out the same response a second time. The response passes through unchanged while the official UI is visible.
+- While takeover is active, SlimGPT consumes the real conversation/resume stream and supplies the hidden official consumer with a lightweight structural projection. The projection retains user/final identity and abnormal-EOF resume controls without forwarding heavy content or fabricating transport completion. The response passes through unchanged while the official UI is visible.
 - While takeover is active, hidden official-page autofocus is suppressed so it cannot steal focus from SlimGPT. Official focus is temporarily permitted only while SlimGPT submits through the real composer or explicitly reveals the official UI.
 - The official conversation graph stays in UI memory. A compact local observation ledger persists normalized recent tool/reasoning/message observations using WebExtension `storage.local`; credential-shaped fields and raw transport envelopes are excluded. Persistence is bounded by whole conversations rather than a per-message sliding window, so one conversation is never silently reduced to its newest few tool calls.
 - The official server conversation graph (`mapping` + `current_node`) is treated as canonical. Local branch switching only selects a different graph leaf for presentation.

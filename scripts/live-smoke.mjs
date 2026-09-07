@@ -5,6 +5,7 @@ import { createServer } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
+import { cloneChromeCookieProfile } from './cookie-profile.mjs';
 
 if (process.argv[2] === '--profile-janitor') {
   await runProfileJanitor(process.argv[3], process.argv[4]);
@@ -17,18 +18,29 @@ const headed = flags.has('--headed');
 const virtualHeaded = flags.has('--virtual-headed');
 const cloneProfile = flags.has('--clone-profile');
 const sendLive = flags.has('--send-live');
+const readHistory = flags.has('--read-history');
+if (readHistory && (!live || sendLive)) throw new Error('--read-history requires --live and forbids --send-live');
 const keepOpen = flags.has('--keep-open');
 const liveDumpPath = process.env.SLIMGPT_LIVE_DUMP || '';
 const LIVE_PROTOCOL_CAPTURE_PATH = /^\/backend-api\/(?:(?:f\/)?conversation(?:\/resume)?(?:\/|$)|conversations\/)/;
-const SENSITIVE_DUMP_KEY = /^(?:(?:access|refresh|resume|session|csrf|auth|id)[_-]?token|token|authorization|cookie|set-cookie|api[_-]?key|email|phone(?:_number)?|picture|conversation_conduit_metadata|mobile_conduit_metadata)$/i;
-const extensionPath = resolve('dist-extension');
+const SENSITIVE_DUMP_KEY = /^(?:(?:access|refresh|resume|resume_conversation|session|csrf|auth|id)[_-]?token|token|authorization|cookie|set-cookie|api[_-]?key|email|phone(?:_number)?|picture|conversation_conduit_metadata|mobile_conduit_metadata)$/i;
 const chromePath = await findChrome();
 const userDataDir = await mkdtemp(join(tmpdir(), 'slimgpt-live-'));
+// Pin the tested build. A concurrent dev/build command must not delete lazy
+// chunks underneath the running browser and turn a code test into a race.
+const extensionPath = join(userDataDir, 'extension-under-test');
+await cp(resolve('dist-extension'), extensionPath, { recursive: true }).catch(async (error) => {
+  await rm(userDataDir, { recursive: true, force: true });
+  throw error;
+});
 const port = await reservePort();
 // Keep the profile directory selected by Chrome's Local State when a real
 // logged-in profile is cloned; otherwise Chrome silently opens Default.
 const clonedProfileDirectory = cloneProfile
-  ? await cloneChromeProfile(userDataDir)
+  ? await cloneChromeProfile(userDataDir).catch(async (error) => {
+      await rm(userDataDir, { recursive: true, force: true });
+      throw error;
+    })
   : null;
 const profileJanitor = cloneProfile
   ? spawn(
@@ -45,6 +57,8 @@ const chromeArgs = [
   virtualHeaded ? '--disable-gpu' : null,
   '--no-first-run',
   '--no-default-browser-check',
+  '--disable-sync',
+  '--disable-background-networking',
   `--user-data-dir=${userDataDir}`,
   clonedProfileDirectory ? `--profile-directory=${clonedProfileDirectory}` : null,
   `--remote-debugging-port=${port}`,
@@ -59,6 +73,8 @@ chrome.stderr.on('data', (chunk) => {
 });
 
 let browserCdp = null;
+let tearingDown = false;
+let fixtureAsyncError = null;
 let resolveKeepOpenShutdown = null;
 const keepOpenShutdown = keepOpen
   ? new Promise((resolveShutdown) => {
@@ -89,6 +105,7 @@ try {
   const result = live
     ? await runLiveSmoke(browserCdp, loaded.id)
     : await runFixtureSmoke(browserCdp, loaded.id);
+  if (fixtureAsyncError) throw fixtureAsyncError;
   console.log(JSON.stringify(result, null, 2));
 
   if (keepOpen) {
@@ -99,6 +116,7 @@ try {
     await Promise.race([onceExit(chrome), keepOpenShutdown]);
   }
 } finally {
+  tearingDown = true;
   // Supervisors may terminate the Chrome child before signalling this parent.
   // Unlink the clone before any asynchronous shutdown work so that either
   // child exit or an explicit signal removes copied cookies immediately.
@@ -173,6 +191,7 @@ async function runFixtureSmoke(browser, extensionId) {
   assert.equal(serializedDumpProbe.includes('private@example.com'), false);
 
   const fixture = makeFixture();
+  let secondCanonicalReads = 0;
   const created = await browser.call('Target.createTarget', { url: 'about:blank' });
   const topTarget = await waitForTarget(port, (item) => item.id === created.targetId);
   const top = await connectCdp(topTarget.webSocketDebuggerUrl);
@@ -189,9 +208,11 @@ async function runFixtureSmoke(browser, extensionId) {
     ],
   });
   top.on('Fetch.requestPaused', (event) => {
+    if (/\/backend-api\/conversations\/second(?:\?|$)/.test(event.request.url)) secondCanonicalReads += 1;
     void fulfillFixtureRequest(top, event, fixture).catch((error) => {
+      if (tearingDown) return;
       if (/(?:Invalid InterceptionId|socket is not open|not open|closed)/i.test(String(error?.message || error))) return;
-      queueMicrotask(() => { throw error; });
+      fixtureAsyncError = error;
     });
   });
   await top.call('Page.navigate', { url: 'https://chatgpt.com/slimgpt-smoke' });
@@ -1198,6 +1219,7 @@ async function runFixtureSmoke(browser, extensionId) {
   await waitFor(async () => (await top.evaluate('location.pathname')) === '/c/second');
   assert.equal((await ui.evaluate(uiStateExpression())).draft, '', 'restoring another conversation must not carry the previous draft');
 
+  await waitFor(async () => (await ui.evaluate(`document.querySelectorAll('.tool-toml-pre code.language-toml').length`)) === 2);
   const toolRendering = await ui.evaluate(`(() => {
     const text = (selector) => {
       const node = document.querySelector(selector);
@@ -1234,6 +1256,35 @@ async function runFixtureSmoke(browser, extensionId) {
   assert.ok(toolRendering.tomlText.includes('next = "<null>"'));
   assert.ok(toolRendering.highlightedTokens > 0, 'TOML code must be syntax highlighted');
   assert.deepEqual(toolRendering.toolNames, ['web.run', 'web.run']);
+  await ui.evaluate(`document.querySelector('.tool-format-toggle').click()`);
+  await waitFor(async () => (await ui.evaluate(`document.querySelector('.tool-code-language')?.textContent`)) === 'RAW');
+  const rawToolPayload = await ui.evaluate(`document.querySelector('.tool-toml-pre code')?.textContent`);
+  assert.equal(JSON.parse(rawToolPayload).query, 'SlimGPT', 'raw view must preserve the underlying tool payload');
+  await ui.evaluate(`document.querySelector('.tool-format-toggle').click()`);
+  await waitFor(async () => (await ui.evaluate(`document.querySelector('.tool-code-language')?.textContent`)) === 'TOML');
+
+  const wheelRouting = await ui.evaluate(`(() => {
+    const outer = document.querySelector('.single-message-scroller');
+    const pre = document.querySelector('.tool-toml-pre');
+    const originalStyle = pre.getAttribute('style');
+    const outerTop = outer.scrollTop;
+    pre.style.maxHeight = '28px';
+    pre.scrollTop = 0;
+    outer.scrollTop = outer.scrollHeight;
+    const nested = new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: 60 });
+    pre.querySelector('code').dispatchEvent(nested);
+    const zoom = new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: 1200, ctrlKey: true });
+    outer.dispatchEvent(zoom);
+    const result = { nestedHasRoom: pre.scrollHeight > pre.clientHeight + 1,
+      nestedPrevented: nested.defaultPrevented, zoomPrevented: zoom.defaultPrevented };
+    if (originalStyle === null) pre.removeAttribute('style');
+    else pre.setAttribute('style', originalStyle);
+    outer.scrollTop = outerTop;
+    return result;
+  })()`);
+  assert.equal(wheelRouting.nestedHasRoom, true);
+  assert.equal(wheelRouting.nestedPrevented, false, 'nested code scrolling must not trigger turn navigation');
+  assert.equal(wheelRouting.zoomPrevented, false, 'pinch zoom must not trigger turn navigation');
   assert.deepEqual(
     toolRendering.replyKinds,
     ['thinking', 'tool-call', 'tool-result', 'message'],
@@ -1428,7 +1479,31 @@ async function runFixtureSmoke(browser, extensionId) {
   await top.evaluate(`document.querySelectorAll('[data-message-id]').forEach((node) => node.remove())`);
 
   const indexRequestsBeforeNewChat = fixture.conversationListRequests || 0;
+  let releaseNewChatResponse;
+  let markNewChatRequest;
+  fixture.newChatResponseGate = new Promise((accept) => { releaseNewChatResponse = accept; });
+  const interceptedNewChat = new Promise((accept) => { markNewChatRequest = accept; });
+  fixture.onNewChatRequest = markNewChatRequest;
   await ui.evaluate(fillAndSubmitExpression('Fixture new-chat request https://example.com'));
+  try {
+    await Promise.race([interceptedNewChat, new Promise((_, reject) => setTimeout(() => reject(new Error('new-chat interception timeout')), 10000))]);
+    // Repeating a foreign notification must not first teach the pending UI a
+    // wrong identity and then appear to match the identity it just injected.
+    for (let repeat = 0; repeat < 2; repeat++) {
+      await top.evaluate(`postMessage({ channel: 'slimgpt-page-v1', direction: 'page-to-extension', payload: {
+        type: 'page-execution-state', conversationId: 'foreign-broadcast-chat', state: 'running',
+        source: 'fixture-unrelated-notification', turnUserMessageId: 'foreign-user', turnAliases: ['foreign-turn'],
+      } }, location.origin)`);
+      await sleep(30);
+    }
+    assert.notEqual(await top.evaluate(`location.pathname`), '/c/foreign-broadcast-chat');
+    assert.equal(await ui.evaluate(`document.querySelector('.composer-shell textarea').value`), 'Fixture new-chat request https://example.com');
+    assert.equal(await ui.evaluate(`document.querySelector('.conversation-title')?.textContent.includes('foreign-broadcast-chat') || false`), false);
+  } finally {
+    releaseNewChatResponse();
+    delete fixture.newChatResponseGate;
+    delete fixture.onNewChatRequest;
+  }
   await waitFor(async () => (await ui.evaluate(uiStateExpression())).composerStatus === '消息已发送（官方已确认）');
   await waitFor(async () => (await top.evaluate('location.pathname')) === '/c/fixture-new-chat');
   await waitFor(async () => {
@@ -1535,6 +1610,274 @@ async function runFixtureSmoke(browser, extensionId) {
     'cross-window execution pulses must carry an explicit state',
   );
 
+  // Exercise corrections through the real page -> isolated bridge -> Svelte
+  // pipeline, not just the pure decoder. A message snapshot is replaceable,
+  // including an empty body; a late DOM echo must not destroy its Markdown.
+  const publishCorrection = async (text, sequence, transport = 'fetch', metadata = {}) => {
+    const data = {
+      conversation_id: 'second',
+      message: {
+        id: 'regression-snapshot', author: { role: 'assistant' },
+        turn_user_message_id: 'second-u1', sequence_number: sequence,
+        content: { content_type: 'text', parts: [text] }, metadata,
+        status: 'finished_successfully', end_turn: true,
+      },
+    };
+    await top.evaluate(`postMessage(${JSON.stringify({
+      channel: 'slimgpt-page-v1', direction: 'page-to-extension',
+      payload: {
+        type: 'page-capture', phase: 'complete', transport,
+        requestId: `regression-${sequence}-${transport}`, conversationId: 'second',
+        url: 'https://chatgpt.com/backend-api/messages/regression', mimeType: 'application/json',
+        data: JSON.stringify(data),
+      },
+    })}, location.origin)`);
+  };
+  const correctionCard = `document.querySelector('[data-message-id="regression-snapshot"]')`;
+  await publishCorrection('Initial incorrect snapshot', 100);
+  await waitFor(async () => await ui.evaluate(`${correctionCard}?.textContent.includes('Initial incorrect snapshot')`));
+  await publishCorrection('', 101);
+  await waitFor(async () => await ui.evaluate(`Boolean(${correctionCard}) && !${correctionCard}.textContent.includes('Initial incorrect snapshot')`));
+  const citation = '\uE200cite\uE202turn0search0\uE201';
+  await publishCorrection(`**修正后的中文 🧪** ${citation}\n\n\`${citation}\``, 102, 'fetch', {
+    content_references: [{ matched_text: citation, url: 'https://example.com/source', title: 'Source' }],
+  });
+  await waitFor(async () => await ui.evaluate(`${correctionCard}?.querySelector('strong')?.textContent === '修正后的中文 🧪'`));
+  await publishCorrection('Stale DOM echo', 103, 'dom');
+  await publishCorrection('Stale network snapshot', 99);
+  await sleep(100);
+  const correctionRendering = await ui.evaluate(`(() => {
+    const card = ${correctionCard};
+    return {
+      count: document.querySelectorAll('[data-message-id="regression-snapshot"]').length,
+      text: card?.textContent || '',
+      href: card?.querySelector('a')?.getAttribute('href') || '',
+      code: card?.querySelector('code')?.textContent || '',
+      spinning: Boolean(card?.querySelector('.thinking-indicator')),
+    };
+  })()`);
+  assert.equal(correctionRendering.count, 1, 'snapshot correction must update one card, never duplicate it');
+  assert.equal(correctionRendering.href, 'https://example.com/source', 'citation metadata must render as a safe clickable source');
+  assert.equal(correctionRendering.code, citation, 'literal code must keep the original reference bytes');
+  assert.equal(correctionRendering.text.includes('Stale'), false, 'neither DOM echo nor an earlier sequence may undo a corrected snapshot');
+  assert.equal(correctionRendering.spinning, false, 'a completed correction must not retain the streaming spinner');
+
+  const publishCapture = (payload) => top.evaluate(`postMessage(${JSON.stringify({
+    channel: 'slimgpt-page-v1', direction: 'page-to-extension', payload: {
+      type: 'page-capture', conversationId: 'second', ...payload,
+    },
+  })}, location.origin)`);
+  const sse = (value, event = 'delta') => `event: ${event}\ndata: ${JSON.stringify(value)}\n\n`;
+  await top.evaluate(`(() => {
+    window.__slimgptRecoverySyncCount = 0;
+    window.addEventListener('message', (event) => {
+      const value = event.data;
+      if (event.source === window && value?.channel === 'slimgpt-page-v1' && value.direction === 'page-to-extension' &&
+          value.payload?.canonicalComplete && value.payload.conversationId === 'second') window.__slimgptRecoverySyncCount += 1;
+    });
+  })()`);
+  const readsBeforeFailure = secondCanonicalReads;
+  const safeMessage = { id: 'stream-recovery-safe', author: { role: 'assistant' },
+    content: { content_type: 'text', parts: ['VALID BEFORE FAILURE'] }, status: 'finished_successfully' };
+  await publishCapture({ transport: 'sse', phase: 'chunk', requestId: 'fixture-broken-stream', turnUserMessageId: 'second-u1',
+    data: sse('v1', 'delta_encoding') + sse({ p: '', o: 'add', v: { conversation_id: 'second', message: safeMessage } }) +
+      sse({ p: '/__proto__/bad', o: 'replace', v: true }) + sse({ p: '/message/content/parts/0', o: 'append', v: 'CORRUPTED SUFFIX' }),
+  });
+  await waitFor(async () => await ui.evaluate(`document.querySelector('[data-message-id="stream-recovery-safe"]')?.textContent.includes('VALID BEFORE FAILURE')`));
+  await waitFor(async () => secondCanonicalReads > readsBeforeFailure);
+  await waitFor(async () => await top.evaluate(`window.__slimgptRecoverySyncCount >= 1`));
+  const capturesBeforeComplete = await top.evaluate(`window.__slimgptRecoverySyncCount`);
+  await publishCapture({ transport: 'sse', phase: 'complete', requestId: 'fixture-broken-stream', data: 'data: [DONE]\n\n' });
+  await waitFor(async () => await top.evaluate(`window.__slimgptRecoverySyncCount > ${capturesBeforeComplete}`));
+  const streamRecovery = await ui.evaluate(`(() => ({
+    retainedValidText: document.querySelector('[data-message-id="stream-recovery-safe"]')?.textContent.includes('VALID BEFORE FAILURE'),
+    corruptedTextVisible: document.body.textContent.includes('CORRUPTED SUFFIX'),
+  }))()`);
+  assert.equal(streamRecovery.retainedValidText, true);
+  assert.equal(streamRecovery.corruptedTextVisible, false);
+  streamRecovery.canonicalRefreshRequested = secondCanonicalReads > readsBeforeFailure;
+
+  // One user turn with regenerated sibling answers; cached observations from
+  // both siblings must not bypass the real branch switch controls.
+  const branchMessage = (id, text, role = 'assistant') => ({ id, author: { role },
+    content: { content_type: 'text', parts: [text] }, metadata: { turn_exchange_id: 'fixture-regenerated-turn' },
+    status: 'finished_successfully',
+  });
+  const branchPayload = { id: 'second', current_node: 'regenerated-new', mapping: {
+    'second-u1': { id: 'second-u1', parent: null, children: ['regenerated-old', 'regenerated-new'], message: branchMessage('second-u1', 'Regeneration question', 'user') },
+    'regenerated-old': { id: 'regenerated-old', parent: 'second-u1', children: [], message: branchMessage('regenerated-old', 'OLD REGENERATED ANSWER') },
+    'regenerated-new': { id: 'regenerated-new', parent: 'second-u1', children: [], message: branchMessage('regenerated-new', 'NEW REGENERATED ANSWER') },
+  } };
+  // Recovery has completed; this next canonical fixture is independent.
+  for (const id of ['regenerated-old', 'regenerated-new']) await publishCapture({ transport: 'fetch', phase: 'complete',
+    requestId: `fixture-${id}`, data: JSON.stringify({ conversation_id: 'second', message: branchPayload.mapping[id].message }),
+  });
+  await publishCapture({ transport: 'fetch', phase: 'complete', requestId: 'fixture-branch-sync',
+    canonicalSyncId: 'fixture-branch-sync', canonicalPageIndex: 0, canonicalComplete: true,
+    data: JSON.stringify(branchPayload),
+  });
+  await waitFor(async () => await ui.evaluate(`Boolean(document.querySelector('[data-message-id="regenerated-new"] .branch-control'))`));
+  assert.equal(await ui.evaluate(`Boolean(document.querySelector('[data-message-id="regenerated-old"]'))`), false);
+  await ui.evaluate(`document.querySelector('[data-message-id="regenerated-new"] [aria-label="上一分支"]').click()`);
+  await waitFor(async () => await ui.evaluate(`Boolean(document.querySelector('[data-message-id="regenerated-old"]'))`));
+  assert.equal(await ui.evaluate(`Boolean(document.querySelector('[data-message-id="regenerated-new"]'))`), false);
+  await ui.evaluate(`document.querySelector('[data-message-id="regenerated-old"] [aria-label="下一分支"]').click()`);
+  await waitFor(async () => await ui.evaluate(`Boolean(document.querySelector('[data-message-id="regenerated-new"]'))`));
+  assert.equal(await ui.evaluate(`Boolean(document.querySelector('[data-message-id="regenerated-old"]'))`), false);
+  const regeneratedBranches = { initialLatestOnly: true, previousOnly: true, nextOnly: true };
+
+  // Export and persistence must use the complete parsed timeline, not just
+  // the currently mounted/expanded message text in the virtualized reader.
+  const exportRows = Array.from({ length: 600 }, (_, index) => ({ index, title: `row-${index}` }));
+  const exportMessages = [
+    { id: 'export-thought', author: { role: 'assistant' }, content: { content_type: 'thoughts', thoughts: [{ content: 'THOUGHT_WITHOUT_TEXT' }] } },
+    { id: 'export-call', author: { role: 'assistant' }, recipient: 'fixture.read', call_id: 'export-call-1', content: { content_type: 'text', parts: ['{"path":"fixture","exact":123456789012345678901}'] } },
+    { id: 'export-result', author: { role: 'tool' }, tool_call_id: 'export-call-1', content: { content_type: 'execution_output', result: { rows: exportRows } } },
+  ];
+  for (const message of exportMessages) await publishCapture({ transport: 'fetch', phase: 'complete', requestId: `fixture-${message.id}`,
+    data: JSON.stringify({ conversation_id: 'second', message: { ...message, turn_user_message_id: 'second-u1', status: 'finished_successfully' } }),
+  });
+  await publishCapture({ transport: 'fetch', phase: 'complete', requestId: 'fixture-export-unbound',
+    data: JSON.stringify({ conversation_id: 'second', message: { id: 'export-unbound', author: { role: 'assistant' }, content: { parts: ['EXPORT_UNBOUND'] }, status: 'finished_successfully' } }),
+  });
+  await waitFor(async () => await ui.evaluate(`Boolean(document.querySelector('[data-message-id="export-result"]'))`));
+  await ui.evaluate(`(() => {
+    window.__integrityExportBlob = null;
+    URL.createObjectURL = (blob) => { window.__integrityExportBlob = blob; return 'blob:fixture-integrity-export'; };
+    const originalClick = HTMLAnchorElement.prototype.click;
+    HTMLAnchorElement.prototype.click = function () { if (!this.download) return originalClick.call(this); };
+    [...document.querySelectorAll('.sidebar-actions .button')].find((button) => button.textContent.includes('导出 Markdown')).click();
+  })()`);
+  const fullExport = await ui.evaluate(`window.__integrityExportBlob.text()`);
+  assert.ok(fullExport.includes('THOUGHT_WITHOUT_TEXT'), 'thought-only items must be exported even while collapsed');
+  assert.ok(fullExport.includes('工具调用') && fullExport.includes('工具结果'));
+  assert.ok(fullExport.includes('123456789012345678901'), 'raw tool arguments must not be numerically rounded');
+  assert.ok(fullExport.includes('row-599'), 'large result arrays must be exported in full');
+  assert.ok(fullExport.indexOf('EXPORT_UNBOUND') > fullExport.indexOf('## 未归属输出'));
+  await waitFor(async () => {
+    const entries = await readExtensionStorageValue(browser, extensionId, 'observationLedger');
+    const result = entries?.find((entry) => entry.id === 'second')?.observations.find((item) => item.id === 'export-result');
+    return result?.tool?.payload?.rows?.length === 600;
+  });
+  // Exercise the real isolated storage bridge and its change notification.
+  const setCacheOmissions = (items) => ui.evaluate(`window.parent.postMessage({
+    channel: 'slimgpt-ui-v1', direction: 'ui-to-bridge', payload: {
+      type: 'storage-set', requestId: 'fixture-omission-notice', values: { observationLedgerOmissions: ${JSON.stringify(items)} },
+    },
+  }, 'https://chatgpt.com')`);
+  await setCacheOmissions([{ id: 'second', reason: 'budget' }]);
+  await waitFor(async () => await ui.evaluate(`Boolean(document.querySelector('.cache-integrity-notice'))`));
+  await setCacheOmissions([]);
+  await waitFor(async () => await ui.evaluate(`!document.querySelector('.cache-integrity-notice')`));
+  await ui.evaluate(`(() => {
+    URL.createObjectURL = () => { throw new Error('fixture download failure'); };
+    [...document.querySelectorAll('.sidebar-actions .button')].find((button) => button.textContent.includes('导出 Markdown')).click();
+  })()`);
+  await waitFor(async () => await ui.evaluate(`document.querySelector('.composer-status')?.textContent.includes('导出失败')`));
+  const exportIntegrity = { reasoning: true, rawToolPayloads: true, complete600RowCache: true, separateUnresolved: true, visibleCacheOmissions: true, downloadFailureReported: true };
+
+  // Lose a bridge page on purpose. The last packet's complete flag must not
+  // replace the prior authoritative view with a disconnected suffix.
+  const beforeGapIds = await ui.evaluate(`JSON.stringify([...document.querySelectorAll('[data-message-id]')].map((node) => node.dataset.messageId))`);
+  await ui.evaluate(`(() => {
+    const editor = document.querySelector('.composer-shell textarea');
+    editor.value = 'KEEP DRAFT DURING HISTORY RETRY';
+    editor.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  const gapNode = (id, parent) => ({ id, parent, children: [], message: {
+    id, author: { role: 'user' }, content: { content_type: 'text', parts: [id] },
+  } });
+  await publishCapture({ transport: 'fetch', phase: 'complete', requestId: 'fixture-gap-first',
+    canonicalSyncId: 'fixture-gap-sync', canonicalPageIndex: 0, canonicalPageCount: 3, canonicalComplete: false,
+    data: JSON.stringify({ id: 'second', current_node: 'gap-first', mapping: { 'gap-first': gapNode('gap-first', null) } }),
+  });
+  await publishCapture({ transport: 'fetch', phase: 'complete', requestId: 'fixture-gap-last',
+    canonicalSyncId: 'fixture-gap-sync', canonicalPageIndex: 2, canonicalPageCount: 3, canonicalComplete: true,
+    data: JSON.stringify({ id: 'second', current_node: 'gap-last', mapping: { 'gap-last': gapNode('gap-last', 'MISSING-PAGE') } }),
+  });
+  await waitFor(async () => await ui.evaluate(`Boolean(document.querySelector('.history-sync-error'))`));
+  assert.equal(await ui.evaluate(`JSON.stringify([...document.querySelectorAll('[data-message-id]')].map((node) => node.dataset.messageId))`), beforeGapIds);
+  assert.equal(await ui.evaluate(`Boolean(document.querySelector('[data-message-id="gap-last"]'))`), false);
+  const readsBeforeRetry = secondCanonicalReads;
+  await ui.evaluate(`document.querySelector('.history-sync-error .button').click()`);
+  await waitFor(async () => secondCanonicalReads > readsBeforeRetry);
+  await waitFor(async () => await ui.evaluate(`!document.querySelector('.history-sync-error') && window.__SLIMGPT_DEBUG__?.canonicalComplete && !window.__SLIMGPT_DEBUG__.canonicalSyncError`));
+  assert.equal(await ui.evaluate(`document.querySelector('.composer-shell textarea').value`), 'KEEP DRAFT DURING HISTORY RETRY');
+
+  // An actual older-page HTTP failure must likewise publish no replacement
+  // pages. Retry uses the real page-world command and preserves the draft.
+  const originalSecondPage = fixture.secondCanonicalPage;
+  fixture.secondCanonicalPage = { ...originalSecondPage, page_info: { ...originalSecondPage.page_info,
+    has_previous_page: true, start_cursor: 'fixture-failing-older-page',
+  } };
+  fixture.secondOlderStatus = 503;
+  const beforeHttpIds = await ui.evaluate(`JSON.stringify([...document.querySelectorAll('[data-message-id]')].map((node) => node.dataset.messageId))`);
+  await ui.evaluate(`parent.postMessage({ channel: 'slimgpt-ui-v1', direction: 'ui-to-bridge',
+    payload: { type: 'refresh-conversation', conversationId: 'second' } }, 'https://chatgpt.com')`);
+  await waitFor(async () => await ui.evaluate(`Boolean(document.querySelector('.history-sync-error'))`));
+  assert.equal(await ui.evaluate(`JSON.stringify([...document.querySelectorAll('[data-message-id]')].map((node) => node.dataset.messageId))`), beforeHttpIds);
+  assert.ok(fixture.secondOlderReads > 0);
+  fixture.secondCanonicalPage = originalSecondPage;
+  // Failure backoff is 1.5 seconds; do not make a test click bypass it.
+  await sleep(1700);
+  const readsBeforeHttpRetry = secondCanonicalReads;
+  await ui.evaluate(`document.querySelector('.history-sync-error .button').click()`);
+  await waitFor(async () => secondCanonicalReads > readsBeforeHttpRetry);
+  await waitFor(async () => await ui.evaluate(`!document.querySelector('.history-sync-error') && window.__SLIMGPT_DEBUG__?.canonicalComplete`));
+  assert.equal(await ui.evaluate(`document.querySelector('.composer-shell textarea').value`), 'KEEP DRAFT DURING HISTORY RETRY');
+  const canonicalSyncIntegrity = { rejectedBridgeGap: true, keptPriorHistory: true, olderHttpFailureVisible: true,
+    explicitRetryRecovered: true, draftPreserved: true };
+
+  // A clean fixture socket travels through the real installed WebSocket
+  // wrapper. No network or account notification is synthesized outside this
+  // isolated test page. The official listener must still be suppressed.
+  await top.evaluate(`(() => {
+    window.__turnIdentityEvents = [];
+    window.addEventListener('message', (event) => {
+      if (event.source === window && event.data?.channel === 'slimgpt-page-v1' && event.data.direction === 'page-to-extension') {
+        const p = event.data.payload;
+        if (p.type === 'page-execution-state' || p.type === 'page-conversation-bound' || p.url?.includes('identity-test=')) window.__turnIdentityEvents.push(p);
+      }
+    });
+    window.__originalTestWebSocket = window.WebSocket;
+    window.WebSocket = class FixtureSocket extends EventTarget {
+      static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3;
+      constructor(url) { super(); this.url = url; this.readyState = 1; }
+      send() {}
+      close() { this.readyState = 3; this.dispatchEvent(new Event('close')); }
+    };
+    window.__identitySocket = new WebSocket('wss://ws.chatgpt.com/ws/user/fixture-identity');
+    window.__officialNotificationCount = 0;
+    window.__identitySocket.addEventListener('message', () => window.__officialNotificationCount++);
+  })()`);
+  const identityRequest = (path) => top.evaluate(`Promise.race([fetch(${JSON.stringify(path)}, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      conversation_id: 'second', parent_message_id: 'second-u1',
+      messages: [{ id: 'identity-current-user', author: { role: 'user' }, content: { content_type: 'text', parts: ['identity fixture'] } }],
+    }) }).then((response) => response.text()), new Promise((_, reject) => setTimeout(() => reject(new Error('fixture identity request timed out')), 12000))])`);
+  await identityRequest('/backend-api/conversation?identity-test=submit');
+  await waitFor(async () => await top.evaluate(`window.__turnIdentityEvents.some((p) => p.phase === 'complete' && p.url?.includes('identity-test=submit'))`));
+  const sendIdentityNotification = (type, turnId) => top.evaluate(`window.__identitySocket.dispatchEvent(new MessageEvent('message', { data: ${JSON.stringify(JSON.stringify({
+    type: 'message', topic_id: 'conversations', payload: { type, conversation_id: 'second', ...(turnId ? { turn_exchange_id: turnId } : {}) },
+  }))} }))`);
+  await sendIdentityNotification('conversation-turn-started', 'identity-current-turn');
+  await waitFor(async () => await ui.evaluate(`window.__SLIMGPT_DEBUG__?.workState === 'running'`));
+  await top.evaluate(`window.__turnIdentityEvents = []`);
+  await sendIdentityNotification('conversation-turn-stopped', 'identity-old-turn');
+  await sendIdentityNotification('conversation-turn-stopped', null);
+  await sleep(100);
+  assert.equal(await ui.evaluate(`window.__SLIMGPT_DEBUG__?.workState`), 'running', 'foreign and anonymous stop packets must not stop the current turn');
+  assert.equal(await top.evaluate(`window.__turnIdentityEvents.some((p) => p.type === 'page-execution-state' && p.state === 'stopped')`), false);
+  await identityRequest('/backend-api/f/conversation/resume?identity-test=resume');
+  await waitFor(async () => await top.evaluate(`window.__turnIdentityEvents.some((p) => p.phase === 'complete' && p.url?.includes('identity-test=resume'))`));
+  assert.equal(await top.evaluate(`window.__turnIdentityEvents.find((p) => p.phase === 'complete' && p.url?.includes('identity-test=resume'))?.turnUserMessageId`), 'identity-current-user');
+  await sendIdentityNotification('conversation-turn-stopped', 'identity-current-turn');
+  await waitFor(async () => await ui.evaluate(`window.__SLIMGPT_DEBUG__?.workState === 'stopped'`));
+  assert.equal(await top.evaluate(`window.__officialNotificationCount`), 0, 'heavy official socket parsing remains suppressed');
+  await top.evaluate(`window.WebSocket = window.__originalTestWebSocket`);
+  const turnSessionIntegrity = { streamIdentityLearned: true, staleStopIgnored: true, anonymousStopIgnored: true,
+    resumeKeptCurrentUser: true, matchingStopAccepted: true, officialParsingSuppressed: true, pendingForeignIdentityRejected: true };
+
   return {
     mode: 'fixture',
     chrome: await chromeVersion(),
@@ -1560,6 +1903,12 @@ async function runFixtureSmoke(browser, extensionId) {
     },
     conversationNavigation,
     newChatNavigation,
+    correctionRendering,
+    streamRecovery,
+    regeneratedBranches,
+    exportIntegrity,
+    canonicalSyncIntegrity,
+    turnSessionIntegrity,
   };
 }
 
@@ -1574,9 +1923,15 @@ function shouldKeepLiveProtocolEvent(event) {
 }
 
 function sanitizeDumpString(value) {
+  try {
+    const parsed = JSON.parse(value);
+    if (parsed && typeof parsed === 'object') return JSON.stringify(sanitizeLiveDumpValue(parsed));
+  } catch {
+    // Raw SSE chunks and ordinary message strings need the fallback below.
+  }
   return String(value)
     .replace(
-      /("(?:(?:access|refresh|resume|session|csrf|auth|id)[_-]?token|token|authorization|cookie|set-cookie|api[_-]?key|email|phone_number|picture|conversation_conduit_metadata|mobile_conduit_metadata)"\s*:\s*)"(?:\\.|[^"\\])*"/gi,
+      /("(?:(?:access|refresh|resume|resume_conversation|session|csrf|auth|id)[_-]?token|token|authorization|cookie|set-cookie|api[_-]?key|email|phone_number|picture|conversation_conduit_metadata|mobile_conduit_metadata)"\s*:\s*)"(?:\\.|[^"\\])*"/gi,
       '$1"[REDACTED]"',
     )
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]')
@@ -1585,6 +1940,14 @@ function sanitizeDumpString(value) {
 
 function sanitizeLiveDumpValue(value, key = '') {
   if (SENSITIVE_DUMP_KEY.test(key)) return '[REDACTED]';
+  if (typeof value === 'string' && /(?:url|href)$/i.test(key)) {
+    try {
+      const url = new URL(value);
+      return `${url.origin}${url.pathname}`;
+    } catch {
+      return '[INVALID_URL]';
+    }
+  }
   if (typeof value === 'string') return sanitizeDumpString(value);
   if (Array.isArray(value)) return value.map((item) => sanitizeLiveDumpValue(item));
   if (!value || typeof value !== 'object') return value;
@@ -1699,6 +2062,23 @@ async function runLiveSmoke(browser, extensionId) {
   try {
     await connectUi();
     uiState = await evaluateUi(uiStateExpression());
+    if (readHistory) {
+      // Read one existing conversation through the installed extension. Do
+      // not submit a prompt or disclose its title/body in the console report.
+      await waitFor(async () => await evaluateUi(`Boolean(document.querySelector('.conversation-item'))`), 20000);
+      await evaluateUi(`document.querySelector('.conversation-item').click()`);
+      await waitFor(async () => await evaluateUi(`Boolean(window.__SLIMGPT_DEBUG__?.canonicalComplete)`), 30000);
+      uiState = await evaluateUi(`(() => ({
+        canonicalComplete: window.__SLIMGPT_DEBUG__?.canonicalComplete === true,
+        turns: window.__SLIMGPT_DEBUG__?.turnCount || 0,
+        unresolvedGroups: window.__SLIMGPT_DEBUG__?.unresolvedCount || 0,
+        visibleMessages: document.querySelectorAll('.message-card').length,
+        visibleTools: document.querySelectorAll('.message-card.tool-call, .message-card.tool-result').length,
+        visibleReasoningBlocks: document.querySelectorAll('.thought-block').length,
+        visibleTextLength: document.querySelector('.message-stage')?.textContent?.length || 0,
+        loading: Boolean(document.querySelector('.conversation-loading')),
+      }))()`);
+    }
     if (sendLive) {
       assert.equal(state.composer, true, 'real ChatGPT composer is required for --send-live');
       const prompt = process.env.SLIMGPT_LIVE_PROMPT || 'SlimGPT live smoke test: reply with exactly OK';
@@ -1751,6 +2131,7 @@ async function runLiveSmoke(browser, extensionId) {
   } catch (error) {
     const failedUiState = await evaluateUi(uiStateExpression()).catch(() => null);
     await writeLiveProtocolDump(top, 'failed', Object.assign(error, { failedUiState }));
+    if (readHistory) throw new Error(`Read-only history validation failed: ${String(error?.message || 'unavailable')}`);
     if (sendLive) throw error;
     uiState = { unavailable: String(error?.message || error) };
   }
@@ -1762,7 +2143,8 @@ async function runLiveSmoke(browser, extensionId) {
     profileClone: cloneProfile,
     headed,
     sendLive,
-    state,
+    readHistory,
+    state: { ...state, url: state.url ? new URL(state.url).origin + new URL(state.url).pathname : '' },
     uiState,
   };
 }
@@ -1773,18 +2155,31 @@ async function fulfillFixtureRequest(client, event, fixture) {
   const pathname = parsedUrl.pathname;
   let body = null;
   let contentType = 'text/plain; charset=utf-8';
+  let responseCode = 200;
   if (event.resourceType === 'Document') {
     body = fixture.document;
     contentType = 'text/html; charset=utf-8';
+  } else if ((pathname === '/backend-api/conversation' || pathname === '/backend-api/f/conversation/resume') && parsedUrl.searchParams.has('identity-test')) {
+    contentType = 'text/event-stream; charset=utf-8';
+    body = `data: ${JSON.stringify({ conversation_id: 'second', message: {
+      id: parsedUrl.searchParams.get('identity-test') === 'resume' ? 'identity-resumed-answer' : 'identity-initial-answer',
+      author: { role: 'assistant' }, content: { content_type: 'text', parts: ['identity fixture answer'] },
+      metadata: { turn_exchange_id: 'identity-current-turn' }, status: 'in_progress',
+    } })}\n\ndata: [DONE]\n\n`;
   } else if (url.includes('/backend-api/f/conversation/resume')) {
     fixture.resumeRequests = (fixture.resumeRequests || 0) + 1;
     body = fixture.resumeRequests === 1
-      ? fixture.resume.replace(/\ndata: \[DONE\]\n\n$/, '')
+      // Remove only DONE, preserving the blank line that terminates the
+      // preceding message. Removing that delimiter tests a truncated event,
+      // which must not be emitted by a conforming SSE parser.
+      ? fixture.resume.replace(/data: \[DONE\]\n\n$/, '')
       : fixture.resume;
     fixture.onResumeRequest?.(fixture.resumeRequests);
     contentType = 'text/event-stream; charset=utf-8';
   } else if (pathname === '/backend-api/f/conversation') {
     if (event.request.headers?.['x-oai-turn-trace-id'] === 'fixture-new-chat') {
+      fixture.onNewChatRequest?.();
+      if (fixture.newChatResponseGate) await fixture.newChatResponseGate;
       body = fixture.newChatStream;
       contentType = 'text/event-stream; charset=utf-8';
     } else if (event.request.headers?.['x-oai-turn-trace-id'] === 'fixture-turn-mobile') {
@@ -1819,6 +2214,11 @@ async function fulfillFixtureRequest(client, event, fixture) {
   } else if (pathname === '/backend-api/conversations/second') {
     await sleep(650);
     body = JSON.stringify(fixture.secondCanonicalPage);
+    contentType = 'application/json; charset=utf-8';
+  } else if (pathname === '/backend-api/conversations/second/messages') {
+    fixture.secondOlderReads = (fixture.secondOlderReads || 0) + 1;
+    responseCode = fixture.secondOlderStatus || 503;
+    body = '{}';
     contentType = 'application/json; charset=utf-8';
   } else if (pathname === '/backend-api/conversations/mobile-smoke') {
     body = JSON.stringify(fixture.mobileCanonicalPage);
@@ -1874,7 +2274,7 @@ async function fulfillFixtureRequest(client, event, fixture) {
   }
   await client.call('Fetch.fulfillRequest', {
     requestId: event.requestId,
-    responseCode: 200,
+    responseCode,
     responseHeaders: [
       { name: 'Content-Type', value: contentType },
       { name: 'Cache-Control', value: 'no-store' },
@@ -2029,7 +2429,9 @@ function makeFixture() {
           id: 'second-reason-live',
           parent_id: 'second-a1',
           author: { role: 'assistant' },
-          content: { content_type: 'thought', text: '完整串起来，' },
+          // A message envelope is a cumulative snapshot. True deltas are
+          // exercised separately through the encoded SSE fixtures.
+          content: { content_type: 'thought', text: '先把证据链完整串起来，' },
           status: 'in_progress',
           end_turn: false,
           create_time: 5,
@@ -2064,7 +2466,7 @@ function makeFixture() {
           id: 'second-reason-live',
           parent_id: 'second-a1',
           author: { role: 'assistant' },
-          content: { content_type: 'thought', text: '不能只留半句话。' },
+          content: { content_type: 'thought', text: '先把证据链完整串起来，不能只留半句话。' },
           status: 'in_progress',
           end_turn: false,
           create_time: 5,
@@ -2609,21 +3011,7 @@ function escapeHtmlAttribute(value) {
 }
 
 async function cloneChromeProfile(destination) {
-  const source = join(homedir(), '.config', 'google-chrome');
-  const localState = join(source, 'Local State');
-  const parsed = JSON.parse(await readFile(localState, 'utf8'));
-  const profile = parsed.profile?.last_used || 'Default';
-  await cp(localState, join(destination, 'Local State'));
-  await cp(join(source, profile), join(destination, profile), {
-    recursive: true,
-    filter: (entry) => {
-      const relative = entry.slice(join(source, profile).length + 1);
-      if (!relative) return true;
-      const first = relative.split('/')[0];
-      return !new Set(['Cache', 'Code Cache', 'GPUCache', 'Service Worker', 'DawnCache', 'GraphiteDawnCache']).has(first);
-    },
-  });
-  return profile;
+  return cloneChromeCookieProfile(destination);
 }
 
 async function findChrome() {
@@ -2685,6 +3073,7 @@ async function waitFor(check, timeoutMs = 12_000, intervalMs = 80) {
   const deadline = Date.now() + timeoutMs;
   let lastError = null;
   while (Date.now() < deadline) {
+    if (fixtureAsyncError) throw fixtureAsyncError;
     try {
       const value = await check();
       if (value) return value;
@@ -2733,8 +3122,12 @@ async function connectCdp(url) {
         return Promise.reject(new Error('CDP socket is not open'));
       }
       const id = ++nextId;
+      const requestError = new Error(`CDP ${method} did not complete`);
       return new Promise((resolveCall, rejectCall) => {
-        pending.set(id, { resolve: resolveCall, reject: rejectCall });
+        pending.set(id, { resolve: resolveCall, reject: (cause) => {
+          requestError.cause = cause;
+          rejectCall(requestError);
+        } });
         try {
           socket.send(JSON.stringify({ id, method, params }));
         } catch (error) {
