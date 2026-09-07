@@ -12,9 +12,14 @@
     generating = false,
     status = '',
     error = false,
+    readonlyBranch = false,
+    recentUserMessages = [],
     onThinkingLevelChange = () => {},
     onSend = () => {},
     onStop = () => {},
+    onCancelSend = () => {},
+    onRetry = null,
+    onReturnToLatestBranch = null,
   } = $props();
 
   let textareaEl = $state(null);
@@ -27,7 +32,40 @@
   const MIN_HEIGHT = 34;
   const MAX_HEIGHT = 160;
 
-  const canSubmit = $derived(!disabled && !loading && !busy && !generating && Boolean(value.trim()));
+  // In-flight send countdown (display only): mirrors the send watchdog window
+  // so the waiting state shows honest progress. Restarts whenever `busy` flips.
+  const SEND_WAIT_SECONDS = 30;
+  let sendElapsed = $state(0);
+  const sendRemaining = $derived(Math.max(0, SEND_WAIT_SECONDS - sendElapsed));
+
+  // ArrowUp/Down history recall: index into recentUserMessages, -1 = idle.
+  // Any edit resets the browse position.
+  let historyIndex = $state(-1);
+  let historyDraft = $state('');
+
+  const canSubmit = $derived(!disabled && !loading && !busy && !generating && !readonlyBranch && Boolean(value.trim()));
+  const sendTitle = $derived(readonlyBranch ? '当前正在只读查看历史分支；请切回最新分支后再发送' : '发送');
+  const showCharCount = $derived(value.length > 500);
+  const charCountWarn = $derived(value.length > 30000);
+
+  $effect(() => {
+    if (!busy) {
+      sendElapsed = 0;
+      return;
+    }
+    sendElapsed = 0;
+    const timer = setInterval(() => {
+      sendElapsed += 1;
+    }, 1000);
+    return () => clearInterval(timer);
+  });
+
+  // A new history list (message update or conversation switch) ends browsing.
+  $effect(() => {
+    const _ = recentUserMessages;
+    historyIndex = -1;
+    historyDraft = '';
+  });
 
   const currentLevelObj = $derived(
     THINKING_LEVELS.find((item) => item.level === thinkingLevel) || THINKING_LEVELS[1]
@@ -62,6 +100,10 @@
   }
 
   function submit() {
+    if (readonlyBranch) {
+      showLocalNotice('当前正在只读查看历史分支；请切回最新分支后再发送');
+      return;
+    }
     if (generating) {
       showLocalNotice('正在生成回答，请稍候…');
       return;
@@ -80,7 +122,22 @@
     });
   }
 
+  // Structural send slot: `.composer-shell .send-button` ALWAYS exists so a
+  // programmatic `.click()` never throws on a missing node. In generating
+  // mode the same 34px circular slot becomes the stop control (stop-mode
+  // class, ■ icon, onStop action, disabled only on bridge/loading); in
+  // send mode it keeps the existing disabled send + readonly reason.
+  function handleSlotClick() {
+    if (generating) {
+      if (disabled || loading) return;
+      onStop();
+      return;
+    }
+    submit();
+  }
+
   function onKeydown(event) {
+    if (recallHistory(event)) return;
     if (shouldSubmitOnEnter(event, ime)) {
       event.preventDefault();
       if (generating) {
@@ -147,7 +204,97 @@
   function onTextareaInput() {
     // Typing dismisses the transient refusal notice and any faded status.
     clearLocalNotice();
+    // Any edit resets the ArrowUp/Down history browse position.
+    historyIndex = -1;
     adjustHeight();
+  }
+
+  function retryCurrentDraft() {
+    dismissedStatus = status;
+    if (onRetry) {
+      onRetry();
+      return;
+    }
+    if (value.trim()) submit();
+  }
+
+  function afterHistoryJump() {
+    adjustHeight();
+    queueMicrotask(() => {
+      if (!textareaEl?.isConnected) return;
+      try {
+        textareaEl.focus({ preventScroll: true });
+        const end = textareaEl.value.length;
+        textareaEl.setSelectionRange(end, end);
+      } catch {}
+    });
+  }
+
+  // ArrowUp with an empty textarea recalls this conversation's last sent
+  // user text; ArrowDown moves forward again. Returns true when handled.
+  function recallHistory(event) {
+    if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return false;
+    if (event.shiftKey || event.ctrlKey || event.metaKey || event.altKey) return false;
+    if (ime.isComposing) return false;
+    const list = Array.isArray(recentUserMessages) ? recentUserMessages : [];
+    if (event.key === 'ArrowUp') {
+      if (historyIndex === -1 && value !== '') return false;
+      if (!list.length) return false;
+      event.preventDefault();
+      if (historyIndex === -1) {
+        historyDraft = value;
+        historyIndex = list.length - 1;
+      } else {
+        historyIndex = Math.max(0, Math.min(historyIndex, list.length - 1) - 1);
+      }
+      value = list[historyIndex] ?? '';
+      afterHistoryJump();
+      return true;
+    }
+    if (historyIndex === -1) return false;
+    event.preventDefault();
+    if (historyIndex >= list.length - 1) {
+      historyIndex = -1;
+      value = historyDraft;
+    } else {
+      historyIndex = Math.min(historyIndex + 1, list.length - 1);
+      value = list[historyIndex] ?? '';
+    }
+    afterHistoryJump();
+    return true;
+  }
+
+  function hasFilePayload(transfer) {
+    if (!transfer) return false;
+    if (transfer.files && transfer.files.length > 0) return true;
+    try {
+      return Array.from(transfer.types || []).includes('Files');
+    } catch {
+      return false;
+    }
+  }
+
+  // Image/file payloads are guided, never silently swallowed.
+  function onPaste(event) {
+    const transfer = event.clipboardData;
+    if (!hasFilePayload(transfer)) return;
+    let text = '';
+    try { text = transfer.getData('text/plain'); } catch {}
+    if (!text) event.preventDefault();
+    showLocalNotice('纯文本模式暂不支持图片/文件，请在官方界面上传');
+  }
+
+  function onDrop(event) {
+    const transfer = event.dataTransfer;
+    if (!hasFilePayload(transfer)) return;
+    let text = '';
+    try { text = transfer.getData('text/plain'); } catch {}
+    if (!text) event.preventDefault();
+    showLocalNotice('纯文本模式暂不支持图片/文件，请在官方界面上传');
+  }
+
+  function onDragOver(event) {
+    if (hasFilePayload(event.dataTransfer)) event.preventDefault();
   }
 </script>
 
@@ -184,6 +331,15 @@
       </Segmented>
     </div>
 
+    {#if busy}
+      <div class="composer-sending" role="status" title="正在等待官方输入框确认">
+        <span>发送中…{sendRemaining}s</span>
+        <button type="button" class="composer-cancel-send-btn" onclick={() => onCancelSend()} title="不再等待，直接按发送失败处理（草稿保留）">取消等待</button>
+      </div>
+    {/if}
+    {#if showCharCount}
+      <span class="composer-char-count" class:composer-char-warn={charCountWarn} title={charCountWarn ? '内容较长（超过 30000 字），发送可能较慢' : `${value.length} 字`}>{value.length} 字</span>
+    {/if}
     {#if !error && status}
       <div class="composer-status" role="status" aria-live="polite" title={status}>
         {status}
@@ -211,6 +367,13 @@
       <span class="composer-error-text">{status}</span>
       <button
         type="button"
+        class="composer-error-retry"
+        aria-label="就地重试"
+        title="用当前草稿重试发送"
+        onclick={retryCurrentDraft}
+      >重试</button>
+      <button
+        type="button"
         class="composer-error-dismiss"
         aria-label="关闭提示"
         onclick={() => { dismissedStatus = status; }}
@@ -227,6 +390,9 @@
       oncompositionstart={() => ime.onCompositionStart()}
       oncompositionend={() => ime.onCompositionEnd()}
       oninput={onTextareaInput}
+      onpaste={onPaste}
+      ondrop={onDrop}
+      ondragover={onDragOver}
       disabled={disabled || loading}
       readonly={busy}
       aria-busy={busy || generating}
@@ -236,28 +402,31 @@
         ? '正在加载对话…'
         : (disabled
           ? 'ChatGPT 页面桥尚未就绪…'
-          : (generating
-            ? 'ChatGPT 正在思考与生成回答…'
-            : (busy ? '正在提交上一条消息…' : '发消息…')))}
+          : (readonlyBranch
+            ? '只读查看分支中…'
+            : (generating
+              ? 'ChatGPT 正在思考与生成回答…'
+              : (busy ? '正在提交上一条消息…' : '发消息…'))))}
       aria-label="消息"
     ></textarea>
-    <Button
-      class="send-button"
-      fill
-      round
-      disabled={!canSubmit}
-      onClick={submit}
-      aria-label="发送"
-    >↑</Button>
-    {#if generating}
-      <Button
-        class="stop-button"
-        outline
-        round
-        onClick={onStop}
-        aria-label="停止回答"
-      >■ 停止回答</Button>
+    {#if readonlyBranch}
+      <button
+        type="button"
+        class="composer-branch-return-btn"
+        onclick={() => onReturnToLatestBranch?.()}
+        title="回到最新分支以继续发送"
+      >回到最新分支</button>
     {/if}
+      <Button
+      class={`send-button${generating ? ' stop-mode stop-button' : ''}`}
+        fill
+        round
+      style={generating ? 'font-size: 13px;' : undefined}
+      disabled={generating ? (disabled || loading) : !canSubmit}
+      onClick={handleSlotClick}
+      aria-label={generating ? '停止回答' : '发送'}
+      title={generating ? '停止回答' : sendTitle}
+    >{generating ? '■' : '↑'}</Button>
   </div>
   <div class="composer-hint">Enter 发送 · Shift+Enter 换行 · 失败不会自动重发</div>
 </div>

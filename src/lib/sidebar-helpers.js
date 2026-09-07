@@ -103,6 +103,40 @@ export function fullSidebarDateTime(value) {
   return fullDateTimeFormatter.format(date);
 }
 
+export function groupConversations(conversations = [], now = new Date()) {
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const startOfYesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1).getTime();
+  const startOf7Days = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 6).getTime();
+
+  const groups = [
+    { key: 'today', label: '今天', items: [] },
+    { key: 'yesterday', label: '昨天', items: [] },
+    { key: 'week', label: '近7天', items: [] },
+    { key: 'earlier', label: '更早', items: [] },
+  ];
+
+  for (const item of conversations) {
+    const rawTime = item?.update_time ?? item?.updatedAt ?? item?.create_time ?? item?.createdAt;
+    const date = parseTimestamp(rawTime);
+    if (!date) {
+      groups[3].items.push(item);
+      continue;
+    }
+    const time = date.getTime();
+    if (time >= startOfToday) {
+      groups[0].items.push(item);
+    } else if (time >= startOfYesterday) {
+      groups[1].items.push(item);
+    } else if (time >= startOf7Days) {
+      groups[2].items.push(item);
+    } else {
+      groups[3].items.push(item);
+    }
+  }
+
+  return groups.filter((group) => group.items.length > 0);
+}
+
 export function filterConversations(conversations = [], query = '', limit = 100) {
   const needle = String(query || '').trim().toLocaleLowerCase();
   if (!needle) {
@@ -113,7 +147,8 @@ export function filterConversations(conversations = [], query = '', limit = 100)
   const matched = conversations.filter((item) => {
     const title = String(item?.title || '').toLocaleLowerCase();
     const snippet = String(item?.last || '').toLocaleLowerCase();
-    const combined = `${title} ${snippet}`;
+    const body = String(item?.searchText || '').toLocaleLowerCase();
+    const combined = `${title} ${snippet} ${body}`;
     return tokens.every((token) => combined.includes(token));
   });
   const visible = matched.slice(0, limit);
@@ -123,4 +158,33 @@ export function filterConversations(conversations = [], query = '', limit = 100)
     visible,
     isCapped: matched.length > limit,
   };
+}
+
+export function highlightTitle(title = '', query = '') {
+  const text = String(title || '');
+  const needle = String(query || '').trim();
+  if (!needle || !text) {
+    return [{ text, mark: false }];
+  }
+  const tokens = needle.split(/\s+/).filter(Boolean);
+  if (!tokens.length) {
+    return [{ text, mark: false }];
+  }
+  const escaped = tokens.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+  const regex = new RegExp(`(${escaped})`, 'gi');
+  const parts = text.split(regex);
+  const lowerTokens = tokens.map((t) => t.toLocaleLowerCase());
+  return parts.filter(Boolean).map((part) => ({
+    text: part,
+    mark: lowerTokens.includes(part.toLocaleLowerCase()),
+  }));
+}
+
+export function isContentHit(item, query = '') {
+  const needle = String(query || '').trim().toLocaleLowerCase();
+  if (!needle || !item?.searchText) return false;
+  const tokens = needle.split(/\s+/).filter(Boolean);
+  if (!tokens.length) return false;
+  const body = String(item.searchText).toLocaleLowerCase();
+  return tokens.some((token) => body.includes(token));
 }

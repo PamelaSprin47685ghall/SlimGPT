@@ -1,6 +1,6 @@
 <script>
   import { onDestroy, onMount } from 'svelte';
-  import { extractToolCallIds, extractToolKeyArg, loadToolFormatter, presentToolPayload } from '../lib/tool-presentation.js';
+  import { extractToolCallIds, extractToolKeyArg, extractToolDuration, getGlobalToolFoldPref, loadToolFormatter, presentToolPayload } from '../lib/tool-presentation.js';
   import { copyText } from '../lib/clipboard.js';
 
   let { tool, streaming = false, isError = false } = $props();
@@ -19,9 +19,12 @@
   const presentation = $derived(presentToolPayload(tool?.payload, { formatter, raw: rawMode }));
   const displayRaw = $derived(presentation.format === 'RAW');
   const callIds = $derived(extractToolCallIds(tool));
+  const duration = $derived(extractToolDuration(tool));
+  const ioLabel = $derived(tool?.kind === 'tool-result' ? '[输出]' : '[入参]');
 
-  // When streaming prop is explicitly provided (boolean), follow streaming. Otherwise default to true (expanded).
-  let isOpen = $state(typeof streaming === 'boolean' ? streaming : true);
+  // Compute initial fold from global pref (localStorage 'slimgpt-tools-fold') unless streaming
+  let defaultOpen = typeof streaming === 'boolean' ? streaming : !getGlobalToolFoldPref();
+  let isOpen = $state(defaultOpen);
 
   function toggleOpen() {
     manualOpen = !isOpen;
@@ -106,15 +109,20 @@
   <div class="tool-summary-bar">
     <button type="button" class="tool-summary-toggle" onclick={toggleOpen} aria-expanded={isOpen}>
       <span class="tool-summary-status" class:is-running={isRunning} class:is-error={!isRunning && !isSuccess}>{summaryStatus}</span>
+      <span class="tool-io-label">{ioLabel}</span>
       <span class="tool-summary-name">{toolName}</span>
       {#if keyArg}
         <span class="tool-summary-arg" title={keyArg}>{keyArg}</span>
+      {/if}
+      {#if duration}
+        <span class="tool-duration" title={`耗时 ${duration}`}>（{duration}）</span>
       {/if}
       <span class="tool-summary-toggle-text">{isOpen ? '收起 ▲' : '展开 ▼'}</span>
     </button>
   </div>
   <div class="tool-code-header" hidden={!isOpen}>
     <span class="tool-code-language">{presentation.format}</span>
+    <span class="tool-io-label-header">{ioLabel}</span>
     <span class="tool-code-name" title={tool?.title || tool?.name || 'tool'}>
       {tool?.name || 'tool'}{tool?.title ? ` · ${tool.title}` : ''}
     </span>
@@ -187,6 +195,9 @@
   .tool-summary-status { font-weight: 700; color: #22735e; }
   .tool-summary-status.is-error { color: var(--slim-danger); }
   .tool-summary-status.is-running { color: var(--f7-theme-color); font-weight: 700; letter-spacing: -0.05em; }
+  .tool-io-label { font-size: 10px; font-weight: 700; color: var(--slim-muted); opacity: 0.85; }
+  .tool-duration { font-size: 10px; color: var(--slim-muted); margin-left: 2px; }
+  .tool-io-label-header { font-size: 9.5px; font-weight: 700; color: var(--slim-muted); opacity: 0.9; }
   .tool-summary-name { font-weight: 600; font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   .tool-summary-arg { font-size: 10.5px; color: var(--slim-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: min(50vw, 400px); }
   .tool-summary-toggle-text { margin-left: auto; font-size: 10px; color: var(--slim-muted); flex: none; }

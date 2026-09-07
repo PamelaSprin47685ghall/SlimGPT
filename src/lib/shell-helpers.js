@@ -16,6 +16,7 @@ export function prioritizeBanners({
   conversationHistoryPending = false,
   conversationBlockingLoad = false,
   conversationTimedOut = false,
+  dismissedBannerIds = null,
 } = {}) {
   const banners = [];
 
@@ -30,7 +31,7 @@ export function prioritizeBanners({
       actionKey: 'bridge-error',
     });
   } else if (!liveConnected) {
-    // Priority 2: Offline / Not Taken Over
+    // Priority: Offline / Not Taken Over
     banners.push({
       id: 'offline',
       priority: 2,
@@ -41,7 +42,7 @@ export function prioritizeBanners({
     });
   }
 
-  // Priority 3: Sync error
+  // Priority 3: Sync error (outranks cache/partial notice)
   if (historySyncProblem) {
     banners.push({
       id: 'sync-error',
@@ -85,6 +86,11 @@ export function prioritizeBanners({
     });
   }
 
+  // Session-memory dismissal: notice-level (non-error) banners the user closed
+  // stay hidden; error-level banners (bridge-error, sync-error) are never dismissed.
+  if (dismissedBannerIds?.size) {
+    return banners.filter((banner) => banner.level === 'error' || !dismissedBannerIds.has(banner.id));
+  }
   return banners;
 }
 

@@ -2,7 +2,14 @@
   import { Button } from 'framework7-svelte';
   import { formatModelLabel } from '../lib/message-presentation.js';
   import { historySyncStatusLabel, historySyncPillLabel, isHistorySyncRetryable } from '../lib/history-sync.js';
-  import { formatSidebarTime, fullSidebarDateTime, filterConversations } from '../lib/sidebar-helpers.js';
+  import {
+    formatSidebarTime,
+    fullSidebarDateTime,
+    filterConversations,
+    groupConversations,
+    highlightTitle,
+    isContentHit,
+  } from '../lib/sidebar-helpers.js';
 
   let {
     conversations = [],
@@ -21,8 +28,11 @@
     hasExportableContent = false,
     exportError = '',
     sidebarNotice = '',
+    generatingIds = [],
+    branchLabel = '',
     onShowOfficial = () => {},
     onExportMarkdown = () => {},
+    onCopyMarkdown = () => {},
     onNewChat = () => {},
     onSelect = () => {},
     onRetryHistorySync = () => {},
@@ -40,6 +50,9 @@
 
   let query = $state('');
   let pageLimit = $state(100);
+  let cleanExport = $state(false);
+  let copied = $state(false);
+  let copyTimer = null;
 
   $effect(() => {
     const _ = query;
@@ -50,6 +63,8 @@
   const filtered = $derived(searchResult.visible);
   const totalMatches = $derived(searchResult.total);
   const isCapped = $derived(searchResult.isCapped);
+  const grouped = $derived(groupConversations(filtered));
+  const hasQuery = $derived(Boolean(query.trim()));
 
   const syncPill = $derived(historySyncPillLabel(historySyncState));
   const syncFull = $derived(historySyncStatusLabel(historySyncState));
@@ -61,6 +76,18 @@
       query = '';
       event.stopPropagation();
       event.preventDefault();
+      return;
+    }
+    if (event.key === 'Enter' && filtered.length) {
+      event.preventDefault();
+      handleSelect(filtered[0].id);
+      return;
+    }
+    if (event.key === 'ArrowDown' && filtered.length) {
+      event.preventDefault();
+      const root = event.currentTarget?.closest?.('.conversation-sidebar');
+      const first = root?.querySelector?.('.conversation-item');
+      if (first) first.focus();
     }
   }
 
@@ -74,6 +101,26 @@
     return String(item?.last || '')
       .replace(/\s+/g, ' ')
       .trim();
+  }
+
+  function isGenerating(item) {
+    return Array.isArray(generatingIds) && generatingIds.includes(item?.id);
+  }
+
+  function exportOpts() {
+    return { includeThought: !cleanExport, includeTools: !cleanExport };
+  }
+
+  async function handleCopyMarkdown() {
+    try {
+      const result = await onCopyMarkdown(exportOpts());
+      if (result === false) return;
+      copied = true;
+      clearTimeout(copyTimer);
+      copyTimer = setTimeout(() => { copied = false; }, 2000);
+    } catch {
+      // HomePage surfaces the failure via exportError / composer status.
+    }
   }
 
   function handleSelect(id) {
@@ -138,18 +185,33 @@
       <span>登录、网络和产品能力仍由当前 ChatGPT 页面处理；SlimGPT 只负责更轻的界面。</span>
     </div>
     <Button outline small onClick={onShowOfficial}>暂时显示官方界面</Button>
-    <Button
-      outline
-      small
-      disabled={!hasExportableContent}
-      onClick={onExportMarkdown}
-      title={!hasExportableContent ? '当前对话暂无可导出的内容' : (historyComplete ? '导出当前对话 Markdown' : '历史尚未完整，导出将包含不完整提示')}
-    >
-      <span>导出 Markdown · 当前对话</span>
-      {#if !historyComplete && hasExportableContent}
-        <span class="partial-badge" title="历史尚未同步完整，导出文件将标记局部不完整">部分</span>
-      {/if}
-    </Button>
+    <div class="export-row">
+      <Button
+        outline
+        small
+        disabled={!hasExportableContent}
+        onClick={() => onExportMarkdown(exportOpts())}
+        title={!hasExportableContent ? '当前对话暂无可导出的内容' : (historyComplete ? '导出当前对话 Markdown' : '历史尚未完整，导出将包含不完整提示')}
+      >
+        <span>导出 Markdown · 下载</span>
+        {#if !historyComplete && hasExportableContent}
+          <span class="partial-badge" title="历史尚未同步完整，导出文件将标记局部不完整">部分</span>
+        {/if}
+      </Button>
+      <Button
+        outline
+        small
+        disabled={!hasExportableContent}
+        onClick={handleCopyMarkdown}
+        title={!hasExportableContent ? '当前对话暂无可复制的内容' : '复制当前对话 Markdown 到剪贴板'}
+      >
+        <span>{copied ? '已复制' : '复制 Markdown'}</span>
+      </Button>
+    </div>
+    <label class="clean-export-row" title="勾选后导出与复制时省略思考过程与工具调用，仅保留纯净问答">
+      <input type="checkbox" bind:checked={cleanExport} />
+      <span>纯净问答</span>
+    </label>
   </div>
 
   <label class="search-box conversation-search">
@@ -185,7 +247,10 @@
         {:else if captures === 0}
           <div class="empty-title">等待同步官方会话</div>
           <div class="empty-hint">捕获到官方会话索引后，这里会显示历史对话。请确保已在当前 ChatGPT 标签页登录。</div>
-          <button type="button" class="empty-action-btn" onclick={onNewChat} disabled={sendInFlight}>发起新对话</button>
+          <div class="empty-actions">
+            <button type="button" class="empty-action-btn" onclick={onShowOfficial}>暂时显示官方界面</button>
+            <button type="button" class="empty-action-btn" onclick={onNewChat} disabled={sendInFlight}>发起新对话</button>
+          </div>
         {:else}
           <div class="empty-title">暂无历史会话</div>
           <div class="empty-hint">当前未发现历史对话记录，随时可以开始新的对话。</div>
@@ -193,45 +258,68 @@
         {/if}
       </div>
     {:else}
-      {#each filtered as conversation (conversation.id)}
-        {@const isCurrent = conversation.id === currentId}
-        {@const isLoading = conversation.id === loadingConversationId}
-        {@const isTimedOut = conversation.id === navigationTimedOutId}
-        {@const modelLabel = formatModel(conversation)}
-        {@const snippet = preview(conversation)}
-        <button
-          type="button"
-          class:active={isCurrent}
-          class:pending={isLoading}
-          class:timed-out={isTimedOut}
-          aria-current={isCurrent ? 'page' : undefined}
-          class="conversation-item"
-          onclick={() => handleSelect(conversation.id)}
-          title={isTimedOut ? `${conversation.title || 'Untitled'}（加载超时，点击重试）` : (conversation.title || 'Untitled')}
-        >
-          <span class="conversation-item-topline">
-            <span class="conversation-title">{conversation.title || 'Untitled'}</span>
-            {#if isLoading}
-              <span class="row-spinner" aria-label="正在加载"></span>
-            {:else if isTimedOut}
-              <span class="retry-pill" title="加载超时，点击重试">重试</span>
-            {/if}
-            <span
-              class="conversation-time"
-              title={fullSidebarDateTime(conversation.update_time || conversation.updatedAt)}
-            >
-              {formatSidebarTime(conversation.update_time || conversation.updatedAt)}
+      {#each grouped as group (group.key)}
+        <div class="sidebar-section-header" role="presentation">{group.label}</div>
+        {#each group.items as conversation (conversation.id)}
+          {@const isCurrent = conversation.id === currentId}
+          {@const isLoading = conversation.id === loadingConversationId}
+          {@const isTimedOut = conversation.id === navigationTimedOutId}
+          {@const modelLabel = formatModel(conversation)}
+          {@const snippet = preview(conversation)}
+          {@const isCompact = !modelLabel && !snippet}
+          {@const titleParts = highlightTitle(conversation.title || 'Untitled', query)}
+          {@const contentHit = hasQuery && isContentHit(conversation, query)}
+          {@const showBranch = isCurrent && branchLabel}
+          <button
+            type="button"
+            class:active={isCurrent}
+            class:pending={isLoading}
+            class:timed-out={isTimedOut}
+            class:compact={isCompact}
+            aria-current={isCurrent ? 'page' : undefined}
+            class="conversation-item"
+            onclick={() => handleSelect(conversation.id)}
+            title={isTimedOut
+              ? `${conversation.title || 'Untitled'}（加载超时，点击重试）`
+              : ((conversation.title || 'Untitled') + (showBranch ? `（${branchLabel}）` : ''))}
+          >
+            <span class="conversation-item-topline">
+              <span class="conversation-title">{#each titleParts as part}{#if part.mark}<mark>{part.text}</mark>{:else}{part.text}{/if}{/each}</span>
+              {#if showBranch}
+                <span class="branch-badge" title="正在查看历史分支（只读）">[{branchLabel}]</span>
+              {/if}
+              {#if isGenerating(conversation) && !isLoading}
+                <span class="pulse-dot" role="img" aria-label="后台生成中" title="后台生成中"></span>
+              {/if}
+              {#if contentHit}
+                <span class="body-hit-badge" title="正文命中搜索词">正文命中</span>
+              {/if}
+              {#if isLoading}
+                <span class="row-spinner" aria-label="正在加载"></span>
+              {:else if isTimedOut}
+                <span class="retry-pill" title="加载超时，点击重试">重试</span>
+              {/if}
+              <span
+                class="conversation-time"
+                title={fullSidebarDateTime(conversation.update_time || conversation.updatedAt)}
+              >
+                {formatSidebarTime(conversation.update_time || conversation.updatedAt)}
+              </span>
             </span>
-          </span>
-          <span class="conversation-item-bottomline">
-            {#if modelLabel}
-              <span class="conversation-model" title={conversation.model || ''}>{modelLabel}</span>
+            {#if !isCompact}
+              <span class="conversation-item-bottomline">
+                {#if modelLabel}
+                  <span class="conversation-model" title={conversation.model || ''}>{modelLabel}</span>
+                {/if}
+                {#if snippet}
+                  <span class="conversation-preview" title={snippet}>
+                    {snippet}
+                  </span>
+                {/if}
+              </span>
             {/if}
-            <span class="conversation-preview" class:empty-preview={!snippet} title={snippet || '暂无消息预览'}>
-              {snippet || '暂无消息预览'}
-            </span>
-          </span>
-        </button>
+          </button>
+        {/each}
       {/each}
       {#if isCapped}
         <div class="load-more-container">
@@ -244,28 +332,38 @@
   </div>
 
   <footer class="sidebar-footer">
-    <div class="sync-status-row">
-      <span class="captures-count" title={`共 ${conversations.length} 个会话`}>
-        共 {conversations.length} 个会话{#if typeof cachedCount === 'number' && cachedCount > 0}（缓存 {cachedCount}/24）{/if}
-      </span>
+    <div class="index-status-line">
+      {#if conversations.length}
+        <span class="captures-count" title={`共 ${conversations.length} 个会话`}>
+          共 {conversations.length} 个会话 · 列表已就绪{#if typeof cachedCount === 'number' && cachedCount > 0}（缓存 {cachedCount}/24）{/if}
+        </span>
+      {:else}
+        <span class="captures-count">等待同步会话列表</span>
+      {/if}
       {#if omissionCount > 0}
         <span class="ledger-omissions-note" title={`本地暂存省略 ${omissionCount} 项`}>省略 {omissionCount} 项</span>
       {/if}
-      {#if syncPill}
-        <span class="sync-label" class:sync-error={historySyncState?.state === 'error'} title={syncFull}>
-          {syncPill}
-        </span>
-      {/if}
-      <button
-        type="button"
-        class="refresh-history-btn"
-        disabled={!currentId || syncLoading || !statusState.startsWith('online') && statusState !== 'online'}
-        onclick={onRetryHistorySync}
-        title={!currentId ? '新对话暂无历史记录可同步' : (syncLoading ? '正在同步…' : '刷新历史')}
-      >
-        {syncLoading ? '同步中…' : '刷新历史'}
-      </button>
     </div>
+    {#if currentId}
+      <div class="active-history-row">
+        {#if syncPill}
+          <span class="sync-label" class:sync-error={historySyncState?.state === 'error'} title={syncFull}>
+            当前对话历史：{syncPill}
+          </span>
+        {:else}
+          <span class="sync-label" title="正在同步当前对话历史">当前对话历史：同步中…</span>
+        {/if}
+        <button
+          type="button"
+          class="refresh-history-btn"
+          disabled={syncLoading || !statusState.startsWith('online') && statusState !== 'online'}
+          onclick={onRetryHistorySync}
+          title={syncLoading ? '正在同步…' : '刷新历史'}
+        >
+          {syncLoading ? '同步中…' : '刷新历史'}
+        </button>
+      </div>
+    {/if}
     <div class="footer-security-note">登录凭据不会离开 ChatGPT 页面</div>
   </footer>
 </aside>
@@ -278,6 +376,12 @@
   }
   .empty-hint {
     margin-bottom: 10px;
+  }
+  .empty-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: center;
+    flex-wrap: wrap;
   }
   .empty-action-btn {
     display: inline-block;
@@ -365,6 +469,26 @@
   .export-btn-wrap {
     width: 100%;
   }
+  .export-row {
+    display: flex;
+    gap: 8px;
+  }
+  .export-row > :global(*) {
+    flex: 1;
+  }
+  .clean-export-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 6px;
+    font-size: 11px;
+    color: var(--slim-muted);
+    cursor: pointer;
+    user-select: none;
+  }
+  .clean-export-row input {
+    accent-color: var(--f7-theme-color, #22735e);
+  }
   .sidebar-export-btn {
     display: flex;
     align-items: center;
@@ -414,6 +538,23 @@
     color: var(--slim-muted);
     text-transform: none;
   }
+  .branch-badge {
+    flex: none;
+    font-size: 9.5px;
+    font-weight: 700;
+    color: var(--slim-warning, #b87b14);
+    white-space: nowrap;
+  }
+  .body-hit-badge {
+    flex: none;
+    font-size: 9px;
+    padding: 1px 5px;
+    border-radius: 4px;
+    border: 1px solid var(--slim-line);
+    color: var(--slim-muted);
+    background: var(--slim-soft);
+    white-space: nowrap;
+  }
   .row-spinner {
     display: inline-block;
     width: 10px;
@@ -433,12 +574,17 @@
     border: 1px solid var(--slim-danger, #e74c3c);
     flex: none;
   }
-  .sync-status-row {
+  .index-status-line {
     display: flex;
     align-items: center;
-    justify-content: space-between;
     gap: 6px;
     flex-wrap: wrap;
+  }
+  .active-history-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 4px;
   }
   .sync-label {
     font-size: 9.5px;
@@ -446,7 +592,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    max-width: 120px;
+    max-width: 160px;
   }
   .sync-label.sync-error {
     color: var(--slim-danger, #e74c3c);
@@ -484,9 +630,6 @@
   }
   .load-more-btn:hover {
     background: var(--slim-surface);
-  }
-  .conversation-preview.empty-preview {
-    opacity: 0.55;
   }
   .footer-security-note {
     font-size: 9.5px;

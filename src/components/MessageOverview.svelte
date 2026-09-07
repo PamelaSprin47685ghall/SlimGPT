@@ -11,6 +11,7 @@
   } = $props();
 
   let listEl = $state(null);
+  let filterQuery = $state('');
 
   // Defaults to the latest turn so HomePage only passes `streaming`.
   const effectiveStreamingIndex = $derived(streamingIndex >= 0 ? streamingIndex : turns.length - 1);
@@ -29,17 +30,23 @@
       .trim();
   }
 
-  function preview(turn) {
+  function getStreamingFallback(turn) {
+    const hasThought = turn?.replies?.some((m) => m?.thought || m?.isThinking);
+    return hasThought ? '正在思考…' : '正在生成…';
+  }
+
+  function preview(turn, index) {
     const question = clean(turn?.user?.text || turn?.user?.thought);
     const answerMsg = turn?.replies?.find((message) => message?.role === 'assistant' && !message?.tool && (message?.text || message?.thought)) ||
       turn?.replies?.find((message) => !message?.tool && (message?.text || message?.thought)) ||
       turn?.replies?.find((message) => message?.text || message?.thought);
     const answer = clean(answerMsg?.text || answerMsg?.thought);
-    if (question && answer) return `${question}  →  ${answer}`;
+    const isStreaming = streaming && index === effectiveStreamingIndex;
+    const fallback = isStreaming ? getStreamingFallback(turn) : (turn?.replies?.some((message) => message?.tool) ? '（工具调用）' : '（空对话轮次）');
+    if (question && (answer || isStreaming)) return `${question}  →  ${answer || fallback}`;
     if (question) return question;
     if (answer) return answer;
-    if (turn?.replies?.some((message) => message?.tool)) return '（工具调用）';
-    return '（空对话轮次）';
+    return fallback;
   }
 
   function hasMultimodalContent(user) {
@@ -78,13 +85,22 @@
   }
 
   function handleListKeydown(event) {
-    if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
+    if (!['ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) return;
+    if (event.target?.tagName === 'INPUT') return;
     if (!listEl) return;
     const items = Array.from(listEl.querySelectorAll('.overview-item'));
     if (!items.length) return;
     const currentIndex = items.findIndex((el) => el === document.activeElement);
     let nextIndex = currentIndex;
-    if (event.key === 'ArrowUp') {
+    if (event.key === 'Home') {
+      nextIndex = 0;
+    } else if (event.key === 'End') {
+      nextIndex = items.length - 1;
+    } else if (event.key === 'PageUp') {
+      nextIndex = Math.max(0, (currentIndex >= 0 ? currentIndex : 0) - 5);
+    } else if (event.key === 'PageDown') {
+      nextIndex = Math.min(items.length - 1, (currentIndex >= 0 ? currentIndex : 0) + 5);
+    } else if (event.key === 'ArrowUp') {
       nextIndex = currentIndex <= 0 ? items.length - 1 : currentIndex - 1;
     } else if (event.key === 'ArrowDown') {
       nextIndex = currentIndex < 0 || currentIndex >= items.length - 1 ? 0 : currentIndex + 1;
@@ -96,6 +112,38 @@
       nextItem.scrollIntoView({ block: 'nearest', behavior: 'auto' });
     }
   }
+
+  function handleFilterKeydown(event) {
+    if (event.key === 'Escape') {
+      filterQuery = '';
+      event.preventDefault();
+    } else if (event.key === 'ArrowDown') {
+      const firstItem = listEl?.querySelector('.overview-item');
+      if (firstItem) {
+        event.preventDefault();
+        firstItem.focus();
+      }
+    }
+  }
+
+  const filteredTurns = $derived.by(() => {
+    const q = filterQuery.trim().toLowerCase();
+    if (!q) {
+      return turns.map((turn, index) => ({ turn, index }));
+    }
+    return turns
+      .map((turn, index) => ({ turn, index }))
+      .filter(({ turn, index }) => {
+        const qText = questionText(turn).toLowerCase();
+        const aText = answerText(turn).toLowerCase();
+        const idxText = String(index + 1);
+        if (qText.includes(q) || aText.includes(q) || idxText.includes(q)) return true;
+        return turn?.replies?.some((r) => {
+          const text = String(r?.text || r?.thought || r?.tool?.name || '').toLowerCase();
+          return text.includes(q);
+        });
+      });
+  });
 </script>
 
 <aside class="message-overview">
@@ -104,33 +152,49 @@
       <strong>消息概览</strong>
       <span>{unresolvedCount ? `问答轮次 · ${unresolvedCount} 条关联待修复` : '问答轮次'}</span>
     </div>
-    <span class="overview-count">{turns.length}</span>
+    <span class="overview-count">{filterQuery.trim() ? `${filteredTurns.length}/${turns.length}` : turns.length}</span>
   </header>
+
+  <div class="overview-filter-box">
+    <input
+      type="search"
+      class="overview-filter-input"
+      bind:value={filterQuery}
+      placeholder="过滤轮次内容… (Esc 清除)"
+      aria-label="过滤问答轮次"
+      onkeydown={handleFilterKeydown}
+    />
+  </div>
 
   <div class="overview-list" bind:this={listEl} onkeydown={handleListKeydown} role="region" aria-label="问答轮次列表">
     {#if turns.length === 0}
       <div class="overview-empty">
         {unresolvedCount ? '对话关系未同步完整，请重新同步关联' : '当前对话暂无问答'}
       </div>
+    {:else if filteredTurns.length === 0}
+      <div class="overview-empty">
+        无匹配的问答轮次
+      </div>
     {:else}
-      {#each turns as turn, index (turn.id || index)}
+      {#each filteredTurns as { turn, index } (turn.id || index)}
         {@const query = questionText(turn)}
         {@const answer = answerText(turn)}
         {@const tools = toolCount(turn)}
         {@const branch = hasBranch(turn)}
+        {@const isStreaming = streaming && index === effectiveStreamingIndex}
         <button
           type="button"
           class="overview-item"
           class:active={index === activeIndex}
           data-overview-index={index}
           aria-current={index === activeIndex ? 'true' : undefined}
-          aria-label={preview(turn)}
+          aria-label={preview(turn, index)}
           onclick={() => onSelect(index)}
         >
           <span class="overview-role role-turn">Q/A</span>
           <span class="overview-text">
             <span class="overview-query">{query || '（空提问）'}</span>
-            <span class="overview-answer">{answer || (tools ? `工具调用 ×${tools}` : '（空对话轮次）')}</span>
+            <span class="overview-answer">{answer || (isStreaming ? getStreamingFallback(turn) : (tools ? `工具调用 ×${tools}` : '（空对话轮次）'))}</span>
           </span>
           <span class="overview-meta">
             {#if branch}
@@ -139,7 +203,7 @@
             {#if tools}
               <span class="overview-tools" title={`本轮含 ${tools} 条工具调用`}>×{tools}</span>
             {/if}
-            {#if streaming && index === effectiveStreamingIndex}
+            {#if isStreaming}
               <span class="overview-live-dot" title="正在输出" aria-hidden="true"></span>
             {/if}
             <span class="overview-number">{index + 1}</span>

@@ -70,6 +70,47 @@ function referenceIndex(metadata) {
   return index;
 }
 
+export function extractSourcesList(metadata = {}) {
+  const roots = [
+    metadata?.content_references,
+    metadata?.citations,
+    metadata?.metadata?.content_references,
+    metadata?.metadata?.citations,
+  ].filter(Array.isArray).flat();
+  const visited = new Set();
+  const list = [];
+  const seenUrls = new Set();
+
+  const collect = (value, depth = 0) => {
+    if (!value || typeof value !== 'object' || visited.has(value) || visited.size >= 4000 || depth > 32) return;
+    visited.add(value);
+    const url = safeReferenceUrl(value.url || value.href);
+    if (url && !seenUrls.has(url)) {
+      seenUrls.add(url);
+      let title = typeof value.title === 'string' ? value.title.trim() : '';
+      let domain = '';
+      try {
+        const parsed = new URL(url);
+        domain = parsed.hostname.replace(/^www\./, '');
+      } catch {}
+      if (!title) title = domain || url;
+      list.push({
+        url,
+        title,
+        domain,
+        avatar: domain ? domain[0].toUpperCase() : '🔗',
+      });
+    }
+    for (const key of ['items', 'sources', 'citations', 'references', 'webpages', 'metadata']) {
+      const child = value[key];
+      for (const nested of Array.isArray(child) ? child : [child]) collect(nested, depth + 1);
+    }
+  };
+
+  for (const root of roots) collect(root);
+  return list;
+}
+
 function safeReferenceUrl(value) {
   if (typeof value !== 'string' || !value.trim()) return '';
   try {

@@ -27,9 +27,12 @@ function fencedPayload(payload) {
   return `${fence}${typeof payload === 'string' ? 'text' : 'json'}\n${text}\n${fence}`;
 }
 
-function messageSection(message, level = 2) {
+function messageSection(message, level = 2, options = {}) {
   if (!hasExportableMessage(message)) return null;
   const tool = message.tool;
+  const includeTools = options.includeTools !== false;
+  const includeThought = options.includeThought !== false;
+  if (tool && !includeTools) return null;
   const label = tool
     ? `${tool.kind === 'tool-call' ? '工具调用' : '工具结果'} · ${heading(tool.name || message.name || 'Tool')}`
     : heading(message.name || ROLE_LABELS[message.role] || message.role || '消息');
@@ -53,7 +56,7 @@ function messageSection(message, level = 2) {
   if (message.error || /^(?:failed|error)$/.test(message.status || '')) parts.push('> 生成异常。');
   else if (/^(?:cancelled|canceled|interrupted|incomplete|aborted|stopped)$/.test(message.status || '')) parts.push('> 此项生成已中断或未完成。');
   if (message.cacheRedacted) parts.push('> 此项来自本地缓存，其中的凭据字段已省略。');
-  if (typeof message.thought === 'string' && message.thought.trim()) {
+  if (includeThought && typeof message.thought === 'string' && message.thought.trim()) {
     parts.push(`${'#'.repeat(level + 1)} 思考过程\n\n${message.thought}`);
   }
   if (tool) {
@@ -65,6 +68,7 @@ function messageSection(message, level = 2) {
     parts.push(message.text);
   }
   if (message.unrecognized) parts.push(`> 尚未展开的内容类型：${heading(message.contentType || 'unknown')}。`);
+  if (parts.length === 0) return null;
   return `${'#'.repeat(level)} ${label}\n\n${parts.join('\n\n')}`;
 }
 
@@ -73,7 +77,7 @@ export function buildConversationMarkdown(title, messages = [], options = {}) {
   const sections = [`# ${safeTitle}`];
   if (options.historyComplete === false) sections.push('> 历史尚未同步完整；此文件仅包含当前已取得的内容，不是完整会话。');
   for (const message of messages) {
-    const section = messageSection(message);
+    const section = messageSection(message, 2, options);
     if (section) sections.push(section);
   }
   const unresolved = (options.unresolved || []).filter((group) => group.replies?.some(hasExportableMessage));
@@ -82,7 +86,7 @@ export function buildConversationMarkdown(title, messages = [], options = {}) {
     for (let i = 0; i < unresolved.length; i += 1) {
       sections.push(`### 待修复的关联组 ${i + 1}`);
       for (const message of unresolved[i].replies) {
-        const section = messageSection(message, 4);
+        const section = messageSection(message, 4, options);
         if (section) sections.push(section);
       }
     }
@@ -105,6 +109,17 @@ export function buildConversationMarkdown(title, messages = [], options = {}) {
   sections.push(footer);
 
   return `${sections.join('\n\n')}\n`;
+}
+
+export function buildTurnMarkdown(turn, options = {}) {
+  if (!turn) return '';
+  const messages = [turn.user, ...(turn.replies || [])].filter(Boolean);
+  const sections = [];
+  for (const message of messages) {
+    const section = messageSection(message, 2, options);
+    if (section) sections.push(section);
+  }
+  return sections.join('\n\n');
 }
 
 export function markdownFilename(title) {

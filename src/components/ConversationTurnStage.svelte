@@ -9,12 +9,15 @@
     activeIndex = 0,
     conversationKey = 'default',
     streaming = false,
+    justSent = false,
     onActiveChange = () => {},
     onBranch = () => {},
     onRepairProtocol = () => {},
     onRetry = () => {},
     onDismiss = () => {},
     onEdit = () => {},
+    onQuote = () => {},
+    onCopyTurn = () => {},
   } = $props();
 
   let scroller = $state(null);
@@ -35,6 +38,13 @@
   let touchStartY = null;
   let edgeSettleToken = 0;
   let edgeSettleTimers = [];
+  let inertiaLockedUntil = 0;
+  let inertiaLockDirection = 0;
+  let boundaryClosing = $state(false);
+  let boundaryClosingTimer = null;
+  let quoteSelection = $state(null);
+  let previousStreaming = false;
+  let previousActiveIndex = activeIndex;
 
   const activeTurn = $derived(turns[activeIndex] || null);
   const turnCount = $derived(turns.length);
@@ -55,6 +65,22 @@
   const hasAnswer = $derived(answerIdx >= 0);
 
   $effect(() => {
+    const isStreaming = streaming;
+    const index = activeIndex;
+    const wasStreaming = previousStreaming;
+    const wasIndex = previousActiveIndex;
+    previousStreaming = isStreaming;
+    previousActiveIndex = index;
+
+    if (turnCount > 0 && index === turnCount - 1) {
+      if ((!wasStreaming && isStreaming) || (wasIndex !== index && isStreaming)) {
+        tailPinned = true;
+        settleEdge('end');
+      }
+    }
+  });
+
+  $effect(() => {
     const key = conversationKey;
     const index = activeIndex;
     const count = turnCount;
@@ -66,15 +92,18 @@
     }
     const conversationChanged = key !== previousKey;
     const appendedTurn = !conversationChanged && count > previousTurnCount;
-    if (appendedTurn && index !== count - 1) {
-      pendingEdge = 'end';
-      tailPinned = true;
-      previousTurnCount = count;
-      onActiveChange(count - 1);
-      return;
-    }
+    const wasOnLastTurn = previousTurnCount > 0 && index === previousTurnCount - 1;
     if (appendedTurn) {
-      tailPinned = true;
+      if (wasOnLastTurn || justSent) {
+        pendingEdge = 'end';
+        tailPinned = true;
+        previousTurnCount = count;
+        onActiveChange(count - 1);
+        return;
+      }
+      previousTurnCount = count;
+      tailPinned = false;
+      return;
     }
     const edge = conversationChanged ? 'start' : pendingEdge;
     previousKey = key;
@@ -134,6 +163,11 @@
 
   function resetBoundaryRunway() {
     cancelBoundarySettle();
+    cancelBoundaryClosing();
+    if (boundaryClosingTimer) {
+      clearTimeout(boundaryClosingTimer);
+      boundaryClosingTimer = null;
+    }
     boundaryDirection = 0;
     boundaryProgress = 0;
     boundaryOffsetPx = 0;
@@ -148,15 +182,23 @@
     }
   }
 
+  function cancelBoundaryClosing() {
+    boundaryClosing = false;
+    if (boundaryClosingTimer) {
+      clearTimeout(boundaryClosingTimer);
+      boundaryClosingTimer = null;
+    }
+  }
+
   // Runway honesty: a ready-but-idle overlay must never freeze over content.
   // An unready or idle runway decays away. Commits require an explicit follow-up nudge (delta >= 36).
-  function scheduleBoundarySettle(delay = 180) {
+  function scheduleBoundarySettle(delay = 400) {
     cancelBoundarySettle();
     boundarySettleTimer = setTimeout(() => {
       boundarySettleTimer = null;
       if (!boundaryDirection) return;
-      const direction = boundaryDirection;
-      resetBoundaryRunway();
+      boundaryClosing = true;
+      boundaryClosingTimer = setTimeout(resetBoundaryRunway, 400);
     }, delay);
   }
 
@@ -173,12 +215,13 @@
     return -direction * Math.pow(boundaryProgress, 0.85) * Math.min(180, scroller.clientHeight * 0.25);
   }
 
-  function pushBoundary(direction, amount, settleDelay = 180) {
+  function pushBoundary(direction, amount, settleDelay = 400) {
+    cancelBoundarySettle();
+    cancelBoundaryClosing();
     if (!scroller || !canAdvance(direction)) {
       resetBoundaryRunway();
       return false;
     }
-
     const distance = Math.max(360, scroller.clientHeight * 0.95);
     const magnitude = Math.max(0, Number(amount) || 0);
 
@@ -241,12 +284,14 @@
 
   function advance(direction) {
     if (!turns.length) return;
-    cancelBoundarySettle();
+    resetBoundaryRunway();
     const now = performance.now();
     if (now - lastAdvanceAt < 240) return;
     const next = Math.max(0, Math.min(turns.length - 1, activeIndex + direction));
     if (next === activeIndex) return;
     lastAdvanceAt = now;
+    inertiaLockedUntil = now + 350;
+    inertiaLockDirection = direction;
     pendingEdge = direction < 0 ? 'end' : 'start';
     onActiveChange(next);
   }
@@ -278,9 +323,19 @@
     resetBoundaryRunway();
     const scrollerBox = scroller.getBoundingClientRect();
     const elementBox = element.getBoundingClientRect();
-    const top = scroller.scrollTop + elementBox.top - scrollerBox.top - 12;
+    const top = scroller.scrollTop + elementBox.top - scrollerBox.top - 64;
     const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
     scroller.scrollTo({ top: Math.max(0, Math.min(max, top)), behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
+    if (typeof element.focus === 'function') {
+      if (!element.hasAttribute('tabindex')) {
+        element.setAttribute('tabindex', '-1');
+      }
+      try {
+        element.focus({ preventScroll: true });
+      } catch {
+        element.focus();
+      }
+    }
     updateTailPinned();
   }
 
@@ -336,15 +391,13 @@
 
     if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
       if (event.shiftKey || selectionActive()) return;
-      const horizontalScrollable = event.target?.closest?.('pre, .table-wrap, .math-block');
-      if (horizontalScrollable) {
-        const { scrollLeft, scrollWidth, clientWidth } = horizontalScrollable;
-        if (scrollWidth > clientWidth + 1) {
-          const remainingRight = scrollWidth - clientWidth - scrollLeft;
-          if (event.key === 'ArrowRight' && remainingRight > 1) return;
-          if (event.key === 'ArrowLeft' && scrollLeft > 1) return;
-        }
-      }
+      const insideBlock = event.target?.closest?.('pre, .table-wrap, .math-block, .tool-toml-pre, .tool-payload-block');
+      if (insideBlock) return;
+      const isStageShell = event.target === scroller ||
+        event.target?.classList?.contains?.('single-message-scroller') ||
+        event.target?.classList?.contains?.('conversation-turn-stage') ||
+        event.target === document.body;
+      if (!isStageShell) return;
       const direction = event.key === 'ArrowLeft' ? -1 : 1;
       if (canAdvance(direction)) {
         event.preventDefault();
@@ -356,12 +409,12 @@
     }
 
     if (!['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End'].includes(event.key)) return;
-    // Shift/selection keeps native behavior everywhere below.
     if (event.shiftKey || selectionActive()) return;
-    // Vertical arrows keep native scroll-container behavior: when focus sits
-    // inside a nested scroller that can still consume the motion, let it.
-    if ((event.key === 'ArrowUp' || event.key === 'ArrowDown') && event.target instanceof Element) {
-      const probe = event.key === 'ArrowDown' ? 40 : -40;
+    if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown'].includes(event.key) && event.target instanceof Element) {
+      const isPage = event.key === 'PageUp' || event.key === 'PageDown';
+      const isDown = event.key === 'ArrowDown' || event.key === 'PageDown';
+      const probeMagnitude = isPage ? Math.max(80, Math.round(scroller.clientHeight * 0.8)) : 40;
+      const probe = isDown ? probeMagnitude : -probeMagnitude;
       if (nestedScrollerCanConsume(event.target, scroller, probe)) return;
     }
     cancelEdgeSettle();
@@ -404,7 +457,17 @@
 
   function handleWheel(event) {
     if (!hasRenderableContent || !scroller) return;
+    const now = performance.now();
     const delta = wheelDeltaPixels(event, scroller.clientHeight);
+    if (now < inertiaLockedUntil && inertiaLockDirection !== 0) {
+      const deltaDir = delta > 0 ? 1 : delta < 0 ? -1 : 0;
+      if (deltaDir === inertiaLockDirection) {
+        event.preventDefault();
+        return;
+      }
+      inertiaLockedUntil = 0;
+      inertiaLockDirection = 0;
+    }
     if (!delta || nestedScrollerCanConsume(event.target, scroller, delta)) return;
     if (delta < 0) tailPinned = false;
     cancelEdgeSettle();
@@ -485,7 +548,51 @@
   onDestroy(() => {
     cancelEdgeSettle();
     cancelBoundarySettle();
+    cancelBoundaryClosing();
   });
+
+  function handleSelectionChange() {
+    if (typeof window === 'undefined') return;
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || !sel.rangeCount) {
+      quoteSelection = null;
+      return;
+    }
+    const text = sel.toString().trim();
+    if (!text) {
+      quoteSelection = null;
+      return;
+    }
+    const anchorNode = sel.anchorNode;
+    const focusNode = sel.focusNode;
+    const assistantEl = anchorNode?.parentElement?.closest?.('.turn-reply.role-assistant, .message-card.role-assistant');
+    if (!assistantEl) {
+      quoteSelection = null;
+      return;
+    }
+    if (!scroller?.contains(anchorNode) || !scroller?.contains(focusNode)) {
+      quoteSelection = null;
+      return;
+    }
+    const range = sel.getRangeAt(0);
+    const rect = range.getBoundingClientRect();
+    const stageEl = scroller.parentElement;
+    const stageRect = stageEl ? stageEl.getBoundingClientRect() : { left: 0, top: 0 };
+    quoteSelection = {
+      text,
+      x: rect.left + rect.width / 2 - stageRect.left,
+      y: rect.top - stageRect.top,
+    };
+  }
+
+  function applyQuote() {
+    if (!quoteSelection?.text) return;
+    const lines = quoteSelection.text.split('\n');
+    const quoteMarkdown = lines.map((line) => `> ${line}`).join('\n') + '\n\n';
+    onQuote(quoteMarkdown);
+    quoteSelection = null;
+    window.getSelection()?.removeAllRanges?.();
+  }
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
@@ -513,29 +620,18 @@
             onclick={() => stepTurn(1)}
           >›</button>
         </span>
+        {#if onCopyTurn}
+          <button
+            type="button"
+            class="turn-step turn-copy-btn"
+            onclick={() => onCopyTurn(activeTurn)}
+            aria-label="复制本轮问答"
+            title="复制本轮问答 Markdown"
+          >复制本轮</button>
+        {/if}
         <span>一轮问答</span>
         {#if canScroll}
           <span class="turn-scroll-progress" aria-hidden="true"><i style={`width:${Math.round(scrollProgress * 100)}%`}></i></span>
-        {/if}
-        {#if lastTurnActive && canScroll}
-          {#if tailPinned}
-            {#if streaming}
-              <span class="tail-follow-pill active" title="当前紧跟最新回复流式输出">
-                <span class="tail-follow-dot"></span>跟随输出
-              </span>
-            {:else}
-              <span class="tail-follow-pill settled" title="已在底部">已在底部</span>
-            {/if}
-          {:else}
-            <button
-              type="button"
-              class="tail-follow-pill inactive clickable"
-              onclick={scrollToTail}
-              title="已向上浏览，点击回到底部紧跟输出"
-            >
-              ↓ 回到底部跟随
-            </button>
-          {/if}
         {/if}
       {:else}
         <span>对话关系同步未完成</span>
@@ -560,6 +656,7 @@
       class="single-message-scroller"
       bind:this={scroller}
       onscroll={updateTailPinned}
+      onmouseup={handleSelectionChange}
       onwheel={handleWheel}
       ontouchstart={handleTouchStart}
       ontouchmove={handleTouchMove}
@@ -582,6 +679,22 @@
               <MessageBubble message={reply} {onBranch} {onRetry} {onDismiss} {onEdit} />
             </section>
           {/each}
+          {#if streaming && lastTurnActive && (!activeTurn.replies || activeTurn.replies.length === 0)}
+            <section class="turn-message turn-reply role-assistant assistant-skeleton">
+              <div class="message-avatar skeleton-pulse" aria-hidden="true">S</div>
+              <div class="message-card-body">
+                <div class="message-meta">
+                  <span class="message-author-name">ChatGPT</span>
+                </div>
+                <div class="message-bubble">
+                  <div class="thinking-indicator" role="status" aria-live="polite">
+                    <span class="thinking-spinner" aria-hidden="true"></span>
+                    <span>正在思考…</span>
+                  </div>
+                </div>
+              </div>
+            </section>
+          {/if}
         {/if}
         {#if showUnresolved}
           <section class="turn-unresolved-notice" role="status">
@@ -612,6 +725,7 @@
         class:up={boundaryDirection < 0}
         class:down={boundaryDirection > 0}
         class:ready={boundaryReady}
+        class:closing={boundaryClosing}
         class="turn-boundary-runway"
         style={`height:${Math.max(38, Math.min(100, boundaryProgress * 100))}%; opacity:${Math.min(1, 0.4 + boundaryProgress * 0.6)}`}
         aria-hidden="true"
@@ -629,6 +743,40 @@
         </div>
       </div>
     {/if}
+    {#if lastTurnActive && canScroll}
+      <div class="tail-follow-bottom-anchor">
+        {#if tailPinned}
+          {#if streaming}
+            <span class="tail-follow-pill active" title="当前紧跟最新回复流式输出">
+              <span class="tail-follow-dot"></span>跟随输出
+            </span>
+          {:else}
+            <span class="tail-follow-pill settled" title="已在底部">已在底部</span>
+          {/if}
+        {:else}
+          <button
+            type="button"
+            class="tail-follow-pill inactive clickable"
+            onclick={scrollToTail}
+            title="已向上浏览，点击回到底部紧跟输出"
+          >
+            ↓ 回到底部跟随
+          </button>
+        {/if}
+      </div>
+    {/if}
+    {#if quoteSelection}
+      <div class="selection-quote-tooltip" style={`left:${quoteSelection.x}px; top:${quoteSelection.y}px`}>
+        <button
+          type="button"
+          class="selection-quote-btn"
+          onclick={applyQuote}
+          title="引用选中文本到输入框"
+        >
+          <span>引用</span>
+        </button>
+      </div>
+    {/if}
   {/if}
 </div>
 
@@ -637,11 +785,15 @@
     scrollbar-gutter: stable;
     content-visibility: auto;
   }
-  .single-message-scroller:focus-visible {
-    outline: none;
-  }
   .turn-stage-header-badges {
     pointer-events: auto;
+  }
+  .turn-copy-btn {
+    min-width: unset;
+    padding: 0 6px;
+    font-size: 11px;
+    height: 22px;
+    border-radius: 6px;
   }
   .tail-follow-pill {
     display: inline-flex;

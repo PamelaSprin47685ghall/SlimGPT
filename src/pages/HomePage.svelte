@@ -10,8 +10,9 @@
   import { historySyncMessage } from '../lib/history-sync.js';
   import { matchesPendingTurn } from '../lib/pending-turn.js';
   import { prioritizeBanners, createStalenessTracker, trapModalKeydown, getScrimAriaLabel } from '../lib/shell-helpers.js';
-  import { downloadConversationMarkdown, hasExportableMessage } from '../lib/export.js';
-  import { isTerminalMessage } from '../lib/message-presentation.js';
+  import { buildConversationMarkdown, buildTurnMarkdown, downloadConversationMarkdown, hasExportableMessage } from '../lib/export.js';
+  import { copyText } from '../lib/clipboard.js';
+  import { humanizeError, isTerminalMessage } from '../lib/message-presentation.js';
   import {
     loadConversationIndex,
     loadObservationLedgerState,
@@ -87,8 +88,23 @@
   function focusComposer() {
     composerRef?.focus?.();
   }
+
+  function handleQuoteText(quoteMarkdown) {
+    if (!quoteMarkdown) return;
+    draft = draft ? `${quoteMarkdown}${draft}` : quoteMarkdown;
+    queueMicrotask(focusComposer);
+  }
+
   let expandedBanners = $state(false);
+  let dismissedBannerIds = $state(new Set());
   let statusStale = $state(false);
+
+  function dismissBanner(id) {
+    if (!id) return;
+    const next = new Set(dismissedBannerIds);
+    next.add(id);
+    dismissedBannerIds = next;
+  }
   let showShortcutsModal = $state(false);
   let panelPointerIntent = null;
   let activeTurnIndex = $state(0);
@@ -111,6 +127,12 @@
   const xhrBuffers = new Map();
   const captureConversationIds = new Map();
   const conflictedCaptureIds = new Set();
+  // Post-submit settlement tracking (generation gate): conversation id (null
+  // for new chat) → { at, obsId, workState } snapshot taken at dispatch.
+  // A turn settles via a running→non-running transition after submit, or via
+  // a terminal non-user observation newer than the submit snapshot. Reactive
+  // so the send gate and Composer props update as observations land.
+  let submittedStateByConversation = $state(new Map());
   const draftsByConversation = new Map();
   const recentFingerprints = new Set();
   const locallyPromotedConversationIds = new Set();
@@ -118,7 +140,39 @@
   const MAX_PENDING_LIVE_EVENTS = 512;
   let pendingLiveEventCount = 0;
 
+  const conversationSearchTexts = $derived.by(() => {
+    const texts = new Map();
+    for (const [id, record] of conversationRecords) {
+      try {
+        const { turns: recordTurns } = buildConversationRecordTimeline(record, null);
+        const parts = [];
+        let length = 0;
+        for (const turn of recordTurns) {
+          for (const message of [turn.user, ...(turn.replies || [])]) {
+            if (!message) continue;
+            const text = String(message.text || '').trim();
+            if (!text) continue;
+            parts.push(text);
+            length += text.length;
+            if (length >= 2000) break;
+          }
+          if (length >= 2000) break;
+        }
+        if (parts.length) texts.set(id, parts.join('\n').slice(0, 2000));
+      } catch {
+        // Records that cannot be linearized stay searchable by title only.
+      }
+    }
+    return texts;
+  });
   const conversations = $derived([...conversationMap.values()]);
+  const sidebarConversations = $derived(conversations.map((item) => {
+    const searchText = conversationSearchTexts.get(item.id);
+    return searchText ? { ...item, searchText } : item;
+  }));
+  const generatingIds = $derived(
+    [...workStates.entries()].filter(([, state]) => state === 'running').map(([id]) => id)
+  );
   const currentRecord = $derived(currentConversationId ? conversationRecords.get(currentConversationId) || null : null);
   const isViewingAlternativeBranch = $derived(Boolean(currentPayload && currentConversationId && currentRecord?.terminal && currentPayload?.current_node && currentRecord.terminal !== currentPayload.current_node));
   const cacheNotice = $derived(cacheOmissions.get(currentConversationId) || cacheOmissions.get('*') || null);
@@ -141,6 +195,13 @@
     [...turns, ...unresolvedTurns]
       .flatMap((turn) => [turn.user, ...(turn.replies || [])].filter(Boolean))
   );
+  const currentBranchLabel = $derived.by(() => {
+    if (!isViewingAlternativeBranch) return '';
+    const branched = messages.find((message) => (message?.siblingCount || 0) > 1);
+    if (!branched) return '历史分支';
+    const index = typeof branched.siblingIndex === 'number' ? branched.siblingIndex + 1 : 1;
+    return `分支 ${index}/${branched.siblingCount}`;
+  });
   const liveConnected = $derived(status.bridgeReady && status.captureMode === 'page' && !statusStale);
   const statusState = $derived(status.bridgeError ? 'error' : (liveConnected ? 'online' : (statusStale ? 'offline' : 'offline')));
   const statusLabel = $derived(
@@ -160,6 +221,7 @@
     conversationHistoryPending,
     conversationBlockingLoad,
     conversationTimedOut,
+    dismissedBannerIds,
   }));
   const topBanner = $derived(activeBanners[0] || null);
   const secondaryBanners = $derived(activeBanners.slice(1));
@@ -175,10 +237,60 @@
       ? 'starting'
       : (currentConversationId ? (workStates.get(currentConversationId) || 'unknown') : newChatWorkState)
   );
+  // Active-generation evidence must reflect the CURRENT conversation's
+  // visible timeline, not raw leftover observations: a web-mobile live chunk
+  // (status in_progress, e.g. ma1) stays in `observations` after the
+  // canonical payload finalizes the same id (finished_successfully), and a
+  // stale in_progress event must not resurrect a stopped turn. Gate on
+  // direct running evidence too so unknown/stopped pre-submit idle stays idle.
   const hasActiveLiveGeneration = $derived.by(() => {
+    if (conversationWorkState !== 'running') return false;
+    const lastReply = [...messages].reverse().find((m) => m?.role !== 'user');
+    if (lastReply) return !isTerminalMessage(lastReply);
     const live = currentRecord?.observations || [];
     const last = [...live].reverse().find((m) => m?.role !== 'user');
-    return Boolean(last && !isTerminalMessage(last));
+    if (!last || isTerminalMessage(last)) return false;
+    const canonicalMsg = currentRecord?.payload?.mapping?.[last.id || last.nodeId]?.message;
+    if (canonicalMsg && isTerminalMessage(canonicalMsg)) return false;
+    return true;
+  });
+  // This conversation's recent sent user texts (oldest → newest) for the
+  // composer's ArrowUp/Down history recall.
+  const recentUserMessages = $derived(
+    [...turns, ...unresolvedTurns]
+      .map((group) => group?.user?.text)
+      .filter((text) => typeof text === 'string' && text.trim().length > 0)
+      .slice(-20)
+  );
+  // Post-submit settlement for the visible conversation. Stale 'running'
+  // with a terminal obs and no open submit counts as settled (dispatches);
+  // post-submit pre-first-token stays unsettled (refuses the P0-4 hole).
+  const settledSinceSubmit = $derived.by(() => {
+    const sub = submittedStateByConversation.get(currentConversationId ?? null);
+    if (!sub) return true;
+    if (conversationWorkState !== 'running' && sub.workState === 'running') return true;
+    const lastReply = [...messages].reverse().find((m) => m?.role !== 'user');
+    const live = currentRecord?.observations || [];
+    const lastObs = [...live].reverse().find((m) => m?.role !== 'user');
+    const last = lastReply || lastObs;
+    if (!last) return false;
+    const canonicalMsg = currentRecord?.payload?.mapping?.[last.id || last.nodeId]?.message;
+    const terminal = isTerminalMessage(last) || Boolean(canonicalMsg && isTerminalMessage(canonicalMsg));
+    if (!terminal) return false;
+    const lastId = String(last.id || last.nodeId || '');
+    return !sub.obsId || lastId !== sub.obsId;
+  });
+  const hasOpenSubmit = $derived(submittedStateByConversation.get(currentConversationId ?? null) != null);
+  const composerGenerating = $derived(hasActiveLiveGeneration || (hasOpenSubmit && !settledSinceSubmit));
+  // Open submits init empty (see `= $state(new Map())`) and clear on settle
+  // so a pre-submit idle state yields generating=false.
+  $effect(() => {
+    const key = currentConversationId ?? null;
+    if (submittedStateByConversation.has(key) && settledSinceSubmit) {
+      const next = new Map(submittedStateByConversation);
+      next.delete(key);
+      submittedStateByConversation = next;
+    }
   });
   const conversationWorkLabel = $derived(workStateLabel(conversationWorkState));
   const conversationActivelyWorking = $derived(conversationWorkState === 'running' || conversationWorkState === 'starting');
@@ -215,6 +327,29 @@
   });
   let previousDisplayConversationId = null;
   let previousTurnCount = 0;
+
+  // Stream-done announcement: persistent live node text, updated on running→stopped.
+  let streamDoneMessage = $state('');
+  let previousWorkState = null;
+
+  $effect(() => {
+    const state = conversationWorkState;
+    if (previousWorkState === 'running' && state === 'stopped') {
+      const replies = messages.filter((message) => message?.role !== 'user' && message?.role !== 'tool' && !message?.tool);
+      const chars = replies.reduce((total, message) => total + String(message?.text || '').length, 0);
+      const tools = messages.filter((message) => message?.role === 'tool' || message?.tool).length;
+      streamDoneMessage = tools > 0
+        ? `回答生成完毕，共 ${chars} 字，调用工具 ${tools} 次`
+        : `回答生成完毕，共 ${chars} 字`;
+    }
+    previousWorkState = state;
+  });
+
+  // Body scroll-lock while a mobile drawer is open.
+  $effect(() => {
+    if (typeof document === 'undefined') return;
+    document.body.classList.toggle('slimgpt-drawer-open', compactLayout && mobilePanel !== 'none');
+  });
 
   $effect(() => {
     const key = displayConversationId || 'new';
@@ -1043,10 +1178,11 @@
     newChatWorkState = 'unknown';
     finishConversationLoading();
     pendingUser = null;
-    // Always empty, even when already on the null conversation: the
-    // debounced draft effect only persists on change, so clear directly.
-    draft = '';
-    draftsByConversation.set(null, '');
+    // Never wipe the null-conversation draft here: restore it when entering
+    // null (setCurrentConversation already did when switching); it clears
+    // only on confirmed send (handleComposerResult).
+    draft = draftsByConversation.get(null) || '';
+    submittedStateByConversation.delete(null);
     clearPendingLiveEvents();
     closeMobilePanels();
     if (transport.supportsLiveChat) {
@@ -1095,6 +1231,17 @@
         nextConversationMap.delete(provisionalId);
         conversationMap = nextConversationMap;
       }
+    // The open submit moves with the draft from the null/provisional scope
+    // to the bound id (dispatch may have keyed either).
+    if (!submittedStateByConversation.has(id)) {
+      for (const [key, entry] of submittedStateByConversation) {
+        if ((key === null || key === undefined || isProvisionalConversationId(key)) && key !== id) {
+          submittedStateByConversation.set(id, entry);
+          submittedStateByConversation.delete(key);
+          break;
+        }
+      }
+    }
       setCurrentConversation(id, { migrateDraft: true });
     }
     if (transport.supportsLiveChat) {
@@ -1149,7 +1296,9 @@
     );
   }
 
-  function exportMarkdown() {
+  function exportMarkdown(opts = {}) {
+    const includeThought = opts.includeThought !== false;
+    const includeTools = opts.includeTools !== false;
     const exportable = turns.flatMap((turn) => [turn.user, ...turn.replies]).filter(hasExportableMessage);
     const hasUnresolved = unresolvedTurns.some((group) => group.replies?.some(hasExportableMessage));
     if (!exportable.length && !hasUnresolved) {
@@ -1166,6 +1315,8 @@
         updateTime: currentMeta?.update_time ? new Date(currentMeta.update_time < 10_000_000_000 ? currentMeta.update_time * 1000 : currentMeta.update_time).toISOString() : null,
         historyComplete: currentRecord?.canonicalComplete === true,
         model: currentMeta?.model || null,
+        includeThought,
+        includeTools,
       });
       setComposerStatus(conversationHistoryPending ? `已导出当前已取得的内容（历史不完整）：${filename}` : `已导出 ${filename}`);
       sidebarExportError = '';
@@ -1175,7 +1326,95 @@
     }
   }
 
+  async function copyConversationMarkdown(opts = {}) {
+    const includeThought = opts.includeThought !== false;
+    const includeTools = opts.includeTools !== false;
+    const exportable = turns.flatMap((turn) => [turn.user, ...turn.replies]).filter(hasExportableMessage);
+    const hasUnresolved = unresolvedTurns.some((group) => group.replies?.some(hasExportableMessage));
+    if (!exportable.length && !hasUnresolved) {
+      sidebarExportError = conversationHistoryPending ? '当前对话尚未加载，暂无可复制的内容' : '当前对话暂无可复制的消息';
+      setComposerStatus(sidebarExportError, true);
+      return false;
+    }
+    const title = currentMeta?.title || 'ChatGPT Conversation';
+    const content = buildConversationMarkdown(title, exportable, {
+      unresolved: unresolvedTurns,
+      conversationId: currentConversationId,
+      historyComplete: currentRecord?.canonicalComplete === true,
+      model: currentMeta?.model || null,
+      includeThought,
+      includeTools,
+    });
+    try {
+      await copyText(content);
+      setComposerStatus(conversationHistoryPending ? '已复制当前已取得的内容（历史不完整）' : '已复制当前对话 Markdown');
+      sidebarExportError = '';
+      return true;
+    } catch {
+      setComposerStatus('复制失败，请手动选择并复制', true);
+      sidebarExportError = '复制失败，请手动选择并复制';
+      return false;
+    }
+  }
+
+  async function copyTurnMarkdown(turn, opts = {}) {
+    const content = buildTurnMarkdown(turn, {
+      includeThought: opts.includeThought !== false,
+      includeTools: opts.includeTools !== false,
+    });
+    if (!content.trim()) {
+      setComposerStatus('本轮暂无可复制的内容', true);
+      return false;
+    }
+    try {
+      await copyText(content);
+      setComposerStatus('已复制本轮 Markdown');
+      return true;
+    } catch {
+      setComposerStatus('复制失败，请手动选择并复制', true);
+      return false;
+    }
+  }
+
+  // Runs the exact watchdog-timeout path immediately: mark unconfirmed,
+  // keep the draft, free the gate for an explicit retry. Shared by the
+  // send watchdog and the composer's 取消等待 button.
+  function cancelSendWait() {
+    if (!pendingCommandId) return;
+    const commandId = pendingCommandId;
+    const timedOutConversationId = pendingCommandConversationId;
+    clearTimeout(sendTimer);
+    sendTimer = null;
+    pendingCommandId = null;
+    pendingCommandConversationId = null;
+    sendInFlight = false;
+    if (pendingUser?.commandId === commandId) {
+      pendingUser = {
+        ...pendingUser,
+        failed: true,
+        message: {
+          ...pendingUser.message,
+          status: 'failed',
+          error: '官方输入框未确认提交',
+          failed: true,
+        },
+      };
+    }
+    clearPendingLiveEvents();
+    submittedStateByConversation.delete(timedOutConversationId ?? null);
+    setConversationWorkState(timedOutConversationId, 'unknown');
+    setComposerStatus('官方输入框未确认提交；内容仍保留，请检查官方界面后手动决定是否重试', true);
+  }
+
   function sendMessage(text, options = {}) {
+    function workStateOf(id) {
+      return id ? (workStates.get(id) || 'unknown') : newChatWorkState;
+    }
+    function lastNonUserObservationId() {
+      const live = currentRecord?.observations || [];
+      const last = [...live].reverse().find((m) => m?.role !== 'user');
+      return last ? String(last.id || last.nodeId || '') : null;
+    }
     if (conversationPending) {
       setComposerStatus('目标对话仍在加载，请加载完成后再发送', true);
       return;
@@ -1194,8 +1433,15 @@
       setComposerStatus('正在生成回答，请稍候…');
       return;
     }
-    if (sendInFlight) {
+    if (sendInFlight || conversationWorkState === 'starting') {
       setComposerStatus('上一条消息仍在提交；SlimGPT 不会重复发送', true);
+      return;
+    }
+    // Generation gate, done right: a stale 'running' work state with a
+    // terminal observation still dispatches (no open turn), but post-submit
+    // pre-first-token refuses (submitted && unsettled closes the hole).
+    if (hasActiveLiveGeneration || (hasOpenSubmit && !settledSinceSubmit)) {
+      setComposerStatus('正在生成回答，请稍候…');
       return;
     }
     clearPendingLiveEvents();
@@ -1206,6 +1452,13 @@
     sendInFlight = true;
     pendingCommandId = commandId;
     pendingCommandConversationId = currentConversationId;
+    // Snapshot the turn for the generation gate: post-submit pre-first-token
+    // refuses until a new terminal observation or a running→stopped flip.
+    submittedStateByConversation.set(currentConversationId ?? null, {
+      at: stamp,
+      obsId: lastNonUserObservationId(),
+      workState: workStateOf(currentConversationId),
+    });
     pendingUser = {
       commandId,
       conversationId: isProvisionalConversationId(currentConversationId) ? null : currentConversationId,
@@ -1236,25 +1489,7 @@
     clearTimeout(sendTimer);
     sendTimer = setTimeout(() => {
       if (pendingCommandId !== commandId) return;
-      const timedOutConversationId = pendingCommandConversationId;
-      pendingCommandId = null;
-      pendingCommandConversationId = null;
-      sendInFlight = false;
-      if (pendingUser?.commandId === commandId) {
-        pendingUser = {
-          ...pendingUser,
-          failed: true,
-          message: {
-            ...pendingUser.message,
-            status: 'failed',
-            error: '官方输入框未确认提交',
-            failed: true,
-          },
-        };
-      }
-      clearPendingLiveEvents();
-      setConversationWorkState(timedOutConversationId, 'unknown');
-      setComposerStatus('官方输入框未确认提交；内容仍保留，请检查官方界面后手动决定是否重试', true);
+      cancelSendWait();
     }, SEND_COMMAND_WATCHDOG_MS);
     setComposerStatus('正在通过 ChatGPT 页面发送；断线后不会自动重发');
   }
@@ -1284,6 +1519,12 @@
       clearPendingLiveEvents();
       if (message.error === 'send-in-progress') setConversationWorkState(submittedConversationId, 'running');
       else if (message.error === 'send-unconfirmed') setConversationWorkState(submittedConversationId, 'unknown');
+      // A refused submit never opened a turn: free the gate for retry.
+      // 'send-in-progress' means the official side is still working, so the
+      // turn stays tracked and the gate keeps refusing until it settles.
+      if (message.error !== 'send-in-progress') {
+        submittedStateByConversation.delete(submittedConversationId ?? null);
+      }
       const details = {
         'composer-not-found': '找不到官方输入框：请检查当前 ChatGPT 页面是否已登录或页面结构是否变化',
         'composer-rejected-input': '官方输入框没有接受这段文字；内容仍保留，未发送',
@@ -1292,7 +1533,7 @@
         'empty-message': '消息为空，未发送',
         'send-unconfirmed': '已点击发送但官方页面未确认；消息可能未发出，请勿重复发送，可在官方界面核实',
       };
-      const detail = details[message.error] || `发送失败：${message.error || 'unknown'}`;
+      const detail = details[message.error] || humanizeError(message.error) || `发送失败：${message.error || 'unknown'}`;
       setComposerStatus(detail, true);
       return;
     }
@@ -1311,6 +1552,16 @@
     }
     setComposerStatus('消息已发送（官方已确认）');
     queueMicrotask(focusComposer);
+  }
+
+  // Composer error-alert 就地重试: resend the current draft text via the
+  // existing dispatch; with an empty draft, retry the failed pending text.
+  function handleComposerRetry() {
+    if (draft.trim()) {
+      sendMessage(draft.trim());
+      return;
+    }
+    if (pendingUser) handleRetrySend(pendingUser.message);
   }
 
   function handleRetrySend(targetMessage) {
@@ -1363,6 +1614,8 @@
   function handleStopGeneration() {
     if (conversationWorkState !== 'running') return;
     transport.stopGeneration();
+    // The user explicitly ended the turn: free the gate for the next send.
+    submittedStateByConversation.delete(currentConversationId ?? null);
     // A missing official stop control reports back as a command-error and
     // overwrites this optimistic notice; success flips the work state.
     setComposerStatus('正在请求停止生成…');
@@ -1503,16 +1756,20 @@
 
   function persistDraftsSoon(snapshot, key) {
     clearTimeout(draftPersistTimer);
-    draftPersistTimer = setTimeout(() => {
-      try {
-        draftsByConversation.set(key, snapshot);
-        const entries = [...draftsByConversation.entries()].map(([entryKey, value]) => [
-          entryKey === null || entryKey === undefined ? '\0' : String(entryKey),
-          String(value || ''),
+    draftPersistTimer = setTimeout(() => writeDraftsNow(snapshot, key), 300);
+  }
+
+  // Synchronous twin of the debounced persist: beforeunload must not rely
+  // on the timer, or the last keystrokes are lost on reload/close.
+  function writeDraftsNow(snapshot, key) {
+    try {
+      draftsByConversation.set(key, snapshot);
+      const entries = [...draftsByConversation.entries()].map(([entryKey, value]) => [
+        entryKey === null || entryKey === undefined ? '\0' : String(entryKey),
+        String(value || ''),
         ]);
-        sessionStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(entries));
-      } catch {}
-    }, 300);
+      sessionStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(entries));
+    } catch {}
   }
 
   function restoreDrafts() {
@@ -1532,6 +1789,11 @@
 
   onMount(() => {
     restoreDrafts();
+    // Synchronous draft flush on unload: the debounced persist would
+    // otherwise drop the last keystrokes on reload/close.
+    const flushDraftsOnUnload = () => writeDraftsNow(draft, currentConversationId);
+    window.addEventListener('beforeunload', flushDraftsOnUnload);
+    return () => window.removeEventListener('beforeunload', flushDraftsOnUnload);
   });
 
   $effect(() => {
@@ -1763,7 +2025,11 @@
   }
 </script>
 <Page class={`slimgpt-page ${compactLayout ? 'compact-layout' : 'desktop-layout'}`}>
-  <Navbar class={`mobile-navbar ${mobilePanel !== 'none' ? 'drawer-open' : ''}`}>
+  <Navbar
+    class={`mobile-navbar ${mobilePanel !== 'none' ? 'drawer-open' : ''}`}
+    role="banner"
+    inert={compactLayout && mobilePanel !== 'none'}
+  >
     <NavLeft>
       <button
         type="button"
@@ -1775,6 +2041,14 @@
         onpointercancel={cancelPanelPointer}
         onclick={(event) => handlePanelClick(event, 'sidebar')}
       >☰</button>
+      <button
+        type="button"
+        class="button button-small mobile-newchat-button"
+        aria-label="发起新对话"
+        title="发起新对话"
+        disabled={sendInFlight}
+        onclick={() => { closeMobilePanels(); newChat(); }}
+      >+</button>
     </NavLeft>
     <div class="mobile-title">
       <span>{currentMeta?.title || 'SlimGPT'}</span>
@@ -1821,12 +2095,15 @@
       id="slimgpt-mobile-sidebar"
       class:open={compactLayout && mobilePanel === 'sidebar'}
       class="sidebar-host"
+      role={compactLayout ? 'dialog' : 'navigation'}
+      aria-modal={compactLayout && mobilePanel === 'sidebar' ? 'true' : undefined}
+      aria-label={compactLayout ? '会话侧栏' : '会话导航'}
       hidden={compactLayout && mobilePanel !== 'sidebar'}
       tabindex="-1"
       onkeydown={(event) => { if (compactLayout && mobilePanel === 'sidebar') trapModalKeydown(event, event.currentTarget, closeMobilePanels); }}
     >
       <ConversationSidebar
-        {conversations}
+        conversations={sidebarConversations}
         currentId={currentConversationId}
         {loadingConversationId}
         {navigationTimedOutId}
@@ -1846,8 +2123,11 @@
         workState={conversationWorkState}
         onShowOfficial={() => transport.send({ type: 'open-official', conversationId: currentConversationId })}
         onExportMarkdown={exportMarkdown}
+        onCopyMarkdown={copyConversationMarkdown}
         onNewChat={newChat}
         onSelect={selectConversation}
+        generatingIds={generatingIds}
+        branchLabel={currentBranchLabel}
       />
     </div>
 
@@ -1872,11 +2152,12 @@
         </div>
       </header>
 
-      <section class="message-stage">
+      <section class="message-stage" aria-label="消息内容">
         {#if turns.length || unresolvedTurns.length}
           <ConversationTurnStage
             {turns}
             unresolved={unresolvedTurns}
+            justSent={sendInFlight}
             onRepairProtocol={retryHistorySync}
             activeIndex={activeTurnIndex}
             conversationKey={displayConversationId || 'new'}
@@ -1886,19 +2167,31 @@
             onEdit={handleEditMessage}
             onDismiss={handleDismissPendingUser}
             streaming={conversationActivelyWorking}
+            onQuote={handleQuoteText}
+            onCopyTurn={copyTurnMarkdown}
           />
         {:else if !conversationHistoryPending}
           <div class="empty-state">
-            <div class="empty-logo">S</div>
-            <h2>更轻的 ChatGPT 界面</h2>
-            <p>登录、网络和发送仍由当前 ChatGPT 页面处理；SlimGPT 负责会话呈现，并在覆盖显示时暂停官方界面的布局和绘制。</p>
-            <div class="empty-actions">
-              <Button outline small onClick={newChat}>开始新对话</Button>
-              <Button outline small onClick={() => transport.openOfficial(currentConversationId)} title="暂时切换至官方页面（可点击宿主页面右下角的 SlimGPT 浮动按钮随时返回）">查看官方界面</Button>
-              <Button outline small onClick={(event) => openShortcutsModal(event.currentTarget)}>快捷键指南</Button>
-            </div>
+            {#if !status.bridgeReady}
+              <div class="empty-logo">S</div>
+              <h2>尚未与 ChatGPT 建立通信</h2>
+              <p>请确认官方页面已登录并完成加载，然后刷新官方网页重试；连接恢复后即可在此收发消息。</p>
+              <div class="empty-actions">
+                <Button outline small onClick={() => transport.openOfficial(currentConversationId)}>刷新官方网页</Button>
+                <Button outline small onClick={(event) => openShortcutsModal(event.currentTarget)}>快捷键指南</Button>
+              </div>
+            {:else}
+              <div class="empty-logo">S</div>
+              <h2>更轻的 ChatGPT 界面</h2>
+              <p>登录、网络和发送仍由当前 ChatGPT 页面处理；SlimGPT 负责会话呈现，并在覆盖显示时暂停官方界面的布局和绘制。</p>
+              <div class="empty-actions">
+                <Button outline small onClick={newChat}>开始新对话</Button>
+                <Button outline small onClick={() => transport.openOfficial(currentConversationId)} title="暂时切换至官方页面（可点击宿主页面右下角的 SlimGPT 浮动按钮随时返回）">查看官方界面</Button>
+                <Button outline small onClick={(event) => openShortcutsModal(event.currentTarget)}>快捷键指南</Button>
+              </div>
+            {/if}
             <div class="empty-shortcuts-hint">
-              提示：在下方输入框输入消息按 Enter 即可发送，Shift + Enter 换行
+              提示：在下方输入框输入消息按 Enter 即可发送，Shift + Enter 换行；按 ? 查看快捷键，按 Ctrl/⌘ + K 聚焦搜索
             </div>
           </div>
         {/if}
@@ -1933,6 +2226,9 @@
                   {:else if topBanner.actionKey === 'sync-error' || topBanner.actionKey === 'resync'}
                     <Button small outline disabled={!status.bridgeReady} onClick={retryHistorySync}>重试同步</Button>
                   {/if}
+                  {#if topBanner.level !== 'error'}
+                    <button type="button" class="banner-dismiss-btn" aria-label={`关闭提醒：${topBanner.title}`} title="关闭此提醒" onclick={() => dismissBanner(topBanner.id)}>✕</button>
+                  {/if}
                 </div>
               </div>
             {/if}
@@ -1942,11 +2238,16 @@
               </button>
               {#if expandedBanners}
                 {#each secondaryBanners as banner (banner.id)}
-                  <div class={`stage-guide-banner ${banner.level}${banner.actionKey === 'sync-error' ? ' history-sync-error' : ''}${banner.id === 'cache-notice' ? ' cache-integrity-notice' : ''}`} role="status">
+                  <div class={`stage-guide-banner ${banner.level}${banner.actionKey === 'sync-error' ? ' history-sync-error' : ''}${banner.id === 'cache-notice' ? ' cache-integrity-notice' : ''}`} role={banner.level === 'error' ? 'alert' : 'status'}>
                     <div class="banner-text">
                       <strong>{banner.title}</strong>
                       <span>{banner.message}</span>
                     </div>
+                    {#if banner.level !== 'error'}
+                      <div class="banner-actions">
+                        <button type="button" class="banner-dismiss-btn" aria-label={`关闭提醒：${banner.title}`} title="关闭此提醒" onclick={() => dismissBanner(banner.id)}>✕</button>
+                      </div>
+                    {/if}
                   </div>
                 {/each}
               {/if}
@@ -1960,12 +2261,13 @@
             <span>对话执行中：官方页面仍在生成，请稍候…</span>
           </div>
         {/if}
+        <div class="sr-only" aria-live="polite" role="status">{streamDoneMessage}</div>
       </section>
 
       {#if isViewingAlternativeBranch}
-        <div class="branch-return-banner" role="status" style="display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 14px; margin: 0 auto 6px; width: min(1100px, calc(100% - 32px)); border: 1px solid var(--slim-warning); border-radius: 8px; background: var(--slim-warning-bg); color: var(--slim-warning); font-size: 11.5px; box-sizing: border-box;">
+        <div class="branch-return-banner" role="status">
           <span>正在查看历史分支（只读）</span>
-          <button type="button" class="button button-small" onclick={resetToLatestBranch} style="padding: 2px 8px; font-size: 10.5px; border: 1px solid currentColor; border-radius: 4px; background: transparent; color: inherit; cursor: pointer;">切回最新分支</button>
+          <button type="button" class="button button-small branch-return-btn" onclick={resetToLatestBranch}>切回最新分支</button>
         </div>
       {/if}
 
@@ -1977,11 +2279,16 @@
         disabled={!transport.supportsLiveChat || !status.bridgeReady}
         loading={conversationPending}
         busy={sendInFlight}
-        generating={conversationWorkState === 'running' && hasActiveLiveGeneration}
+        generating={composerGenerating}
         status={composerStatus}
         error={composerError}
+        readonlyBranch={isViewingAlternativeBranch}
+        recentUserMessages={recentUserMessages}
         onSend={sendMessage}
         onStop={handleStopGeneration}
+        onCancelSend={cancelSendWait}
+        onRetry={handleComposerRetry}
+        onReturnToLatestBranch={resetToLatestBranch}
       />
     </main>
 
@@ -1989,6 +2296,9 @@
       id="slimgpt-mobile-overview"
       class:open={compactLayout && mobilePanel === 'overview'}
       class="overview-host"
+      role={compactLayout ? 'dialog' : 'complementary'}
+      aria-modal={compactLayout && mobilePanel === 'overview' ? 'true' : undefined}
+      aria-label={compactLayout ? '消息概览' : '对话目录'}
       hidden={compactLayout && mobilePanel !== 'overview'}
       tabindex="-1"
       onkeydown={(event) => { if (compactLayout && mobilePanel === 'overview') trapModalKeydown(event, event.currentTarget, closeMobilePanels); }}
@@ -2060,8 +2370,16 @@
             <span>跳至当前轮次顶部或底部</span>
           </div>
           <div class="shortcut-row">
+            <kbd>Ctrl / ⌘ + Home / End</kbd>
+            <span>跳至首轮 / 末轮</span>
+          </div>
+          <div class="shortcut-row">
             <kbd>Esc</kbd>
-            <span>关闭打开的侧栏、概览抽屉或弹窗</span>
+            <span>关闭打开的侧栏、概览抽屉或弹窗；在搜索框中清空搜索</span>
+          </div>
+          <div class="shortcut-row">
+            <kbd>↑ / ↓（思考强度聚焦时）</kbd>
+            <span>调节思考强度档位</span>
           </div>
           <div class="shortcut-row">
             <kbd>? / Ctrl + /</kbd>

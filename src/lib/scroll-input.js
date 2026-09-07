@@ -10,6 +10,8 @@ export function wheelDeltaPixels(event, viewportHeight, lineHeight = 20) {
 export function nestedScrollerCanConsume(target, boundary, delta, styleOf = globalThis.getComputedStyle) {
   if (!delta || !target || !boundary || typeof styleOf !== 'function') return false;
   let node = target.nodeType === 1 ? target : target?.parentElement;
+  // If target itself is the boundary scroller, do not treat it as a nested scroller
+  if (node === boundary) return false;
   while (node && node !== boundary) {
     // Cheap checks first: getComputedStyle forces layout, so it must never run
     // on the hot wheel path for nodes that cannot scroll vertically.
@@ -54,6 +56,9 @@ const KNOWN_SCROLLABLE_CLASSES = new Set([
   'table-wrap',
   'message-content',
   'message-text',
+  'markdown-body',
+  'thought-content',
+  'thought-content-wrapper',
   'tool-payload',
   'tool-content',
   'single-message-scroller',

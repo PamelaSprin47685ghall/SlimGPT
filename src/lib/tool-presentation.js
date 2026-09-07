@@ -39,6 +39,53 @@ export function extractToolCallIds(tool, message = null) {
   return [...new Set(ids)];
 }
 
+export function extractToolDuration(tool, message = null) {
+  const rawDuration = tool?.duration ?? tool?.durationSec ?? tool?.duration_sec ??
+    tool?.finished_duration_sec ?? tool?.timing?.duration ??
+    message?.duration ?? message?.durationSec ?? message?.duration_sec ??
+    message?.finished_duration_sec ?? message?.metadata?.duration;
+
+  if (typeof rawDuration === 'number' && Number.isFinite(rawDuration) && rawDuration > 0) {
+    return rawDuration < 1 ? `${Math.round(rawDuration * 1000)}ms` : `${rawDuration.toFixed(1).replace(/\.0$/, '')}s`;
+  }
+  if (typeof rawDuration === 'string' && rawDuration.trim()) {
+    const num = Number(rawDuration);
+    if (Number.isFinite(num) && num > 0) {
+      return num < 1 ? `${Math.round(num * 1000)}ms` : `${num.toFixed(1).replace(/\.0$/, '')}s`;
+    }
+    return rawDuration.trim();
+  }
+
+  // Compute from start/end timestamps if present
+  const start = tool?.startTime ?? tool?.start_time ?? tool?.created_at ?? tool?.createTime ?? message?.startTime ?? message?.start_time;
+  const end = tool?.endTime ?? tool?.end_time ?? tool?.finished_at ?? tool?.finishTime ?? message?.endTime ?? message?.end_time;
+  if (start != null && end != null) {
+    const s = typeof start === 'number' ? (start < 10_000_000_000 ? start * 1000 : start) : Date.parse(start);
+    const e = typeof end === 'number' ? (end < 10_000_000_000 ? end * 1000 : end) : Date.parse(end);
+    if (Number.isFinite(s) && Number.isFinite(e) && e >= s) {
+      const diffSec = (e - s) / 1000;
+      return diffSec < 1 ? `${Math.round(e - s)}ms` : `${diffSec.toFixed(1).replace(/\.0$/, '')}s`;
+    }
+  }
+
+  return '';
+}
+
+export function getGlobalToolFoldPref() {
+  try {
+    const val = localStorage.getItem('slimgpt-tools-fold');
+    return val === 'true' || val === '1' || val === 'collapsed' || val === 'fold';
+  } catch {
+    return false;
+  }
+}
+
+export function setGlobalToolFoldPref(fold) {
+  try {
+    localStorage.setItem('slimgpt-tools-fold', fold ? 'true' : 'false');
+  } catch {}
+}
+
 export function extractToolKeyArg(payload, tool = null) {
   if (!payload && !tool) return '';
   let target = payload;

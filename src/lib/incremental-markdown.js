@@ -15,6 +15,7 @@ import {
   parser_end,
   parser_write,
 } from 'streaming-markdown';
+import { copyText } from './clipboard.js';
 
 let katexPromise = null;
 const literalPrefixes = new Map([
@@ -284,6 +285,36 @@ function ensureCodeShell(code) {
   const label = document.createElement('span');
   label.className = 'code-lang';
   label.textContent = language || 'code';
+
+  const actions = document.createElement('div');
+  actions.className = 'code-header-actions';
+
+  const wrapBtn = document.createElement('button');
+  wrapBtn.type = 'button';
+  wrapBtn.className = 'code-action-btn code-wrap-btn';
+  wrapBtn.textContent = '换行';
+  wrapBtn.setAttribute('aria-label', '切换代码换行模式');
+  wrapBtn.setAttribute('aria-pressed', 'false');
+  wrapBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    wrapper.classList.toggle('is-wrapped');
+    const isWrapped = wrapper.classList.contains('is-wrapped');
+    wrapBtn.textContent = isWrapped ? '不换行' : '换行';
+    wrapBtn.setAttribute('aria-pressed', isWrapped ? 'true' : 'false');
+  });
+
+  const downloadBtn = document.createElement('button');
+  downloadBtn.type = 'button';
+  downloadBtn.className = 'code-action-btn code-download-btn';
+  downloadBtn.textContent = '下载';
+  downloadBtn.setAttribute('aria-label', '下载代码文件');
+  downloadBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const rawCode = pre.querySelector('code')?.textContent || '';
+    if (!rawCode) return;
+    downloadCode(rawCode, wrapper.dataset.language);
+  });
+
   const copy = document.createElement('button');
   copy.type = 'button';
   copy.className = 'code-copy-btn';
@@ -291,9 +322,51 @@ function ensureCodeShell(code) {
   copy.setAttribute('aria-label', '复制代码');
   copy.setAttribute('aria-live', 'polite');
   copy.textContent = '复制';
-  header.append(label, copy);
+
+  actions.append(wrapBtn, downloadBtn, copy);
+  header.append(label, actions);
   pre.replaceWith(wrapper);
   wrapper.append(header, pre);
+}
+
+export const LANG_EXT_MAP = {
+  javascript: 'js', js: 'js',
+  typescript: 'ts', ts: 'ts',
+  python: 'py', py: 'py',
+  html: 'html', htm: 'html',
+  css: 'css', scss: 'scss', less: 'less',
+  json: 'json', jsonc: 'json',
+  yaml: 'yaml', yml: 'yaml',
+  rust: 'rs', rs: 'rs',
+  go: 'go', golang: 'go',
+  c: 'c', h: 'h',
+  cpp: 'cpp', 'c++': 'cpp', hpp: 'hpp',
+  java: 'java',
+  sql: 'sql',
+  bash: 'sh', sh: 'sh', zsh: 'sh', shell: 'sh',
+  dockerfile: 'dockerfile',
+  toml: 'toml', ini: 'ini',
+  md: 'md', markdown: 'md',
+  xml: 'xml', svg: 'svg',
+  txt: 'txt', text: 'txt',
+};
+
+export function getFileExtensionForLanguage(lang) {
+  const normalized = String(lang || '').trim().toLowerCase();
+  return LANG_EXT_MAP[normalized] || 'txt';
+}
+
+export function downloadCode(codeText, lang = 'code') {
+  const ext = getFileExtensionForLanguage(lang);
+  const blob = new Blob([codeText], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `code-${Date.now()}.${ext}`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }
 
 function wrapTable(table) {
@@ -303,25 +376,123 @@ function wrapTable(table) {
   wrapper.tabIndex = 0;
   wrapper.setAttribute('role', 'region');
   wrapper.setAttribute('aria-label', '表格，可水平滚动');
+
+  const header = document.createElement('div');
+  header.className = 'table-header-toolbar';
+  const copyBtn = document.createElement('button');
+  copyBtn.type = 'button';
+  copyBtn.className = 'table-copy-btn';
+  copyBtn.textContent = '复制表格';
+  copyBtn.setAttribute('aria-label', '复制表格为 Markdown');
+  copyBtn.setAttribute('aria-live', 'polite');
+  copyBtn.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    const md = tableToMarkdown(table);
+    if (!md) return;
+    let succeeded = false;
+    try {
+      await copyText(md);
+      succeeded = true;
+    } catch {
+      // Report failure rather than silently claiming success or failing silently
+    }
+    if (!copyBtn.isConnected) return;
+    copyBtn.textContent = succeeded ? '已复制' : '复制失败';
+    copyBtn.setAttribute('aria-label', succeeded ? '已复制表格为 Markdown' : '复制表格失败');
+    copyBtn.classList.toggle('copied', succeeded);
+    clearTimeout(copyBtn._copyTimer);
+    copyBtn._copyTimer = setTimeout(() => {
+      copyBtn.textContent = '复制表格';
+      copyBtn.setAttribute('aria-label', '复制表格为 Markdown');
+      copyBtn.classList.remove('copied');
+    }, 2400);
+  });
+  header.append(copyBtn);
+
   table.replaceWith(wrapper);
-  wrapper.append(table);
+  wrapper.append(header, table);
+}
+
+export function tableToMarkdown(table) {
+  if (!table) return '';
+  const rows = [...table.querySelectorAll('tr')];
+  if (!rows.length) return '';
+
+  const matrix = rows.map((tr) =>
+    [...tr.querySelectorAll('th, td')].map((td) => td.textContent.trim().replace(/\|/g, '\\|').replace(/\n+/g, ' '))
+  );
+
+  if (!matrix.length || !matrix[0].length) return '';
+  const colCount = Math.max(...matrix.map((r) => r.length));
+
+  let output = '';
+  // Header row
+  const headerCells = matrix[0];
+  while (headerCells.length < colCount) headerCells.push('');
+  output += `| ${headerCells.join(' | ')} |\n`;
+  output += `| ${Array(colCount).fill('---').join(' | ')} |\n`;
+
+  // Data rows
+  for (let i = 1; i < matrix.length; i++) {
+    const cells = matrix[i];
+    while (cells.length < colCount) cells.push('');
+    output += `| ${cells.join(' | ')} |\n`;
+  }
+  return output;
 }
 
 function renderMath(node, displayMode) {
   const replacement = document.createElement(displayMode ? 'div' : 'span');
   replacement.className = displayMode ? 'math-block' : 'math-inline';
+  const expression = String(node.textContent || '').trim();
   if (displayMode) {
     replacement.tabIndex = 0;
     replacement.setAttribute('role', 'region');
     replacement.setAttribute('aria-label', '数学公式，可水平滚动');
+    replacement.setAttribute('data-latex', expression);
+
+    const mathContainer = document.createElement('div');
+    mathContainer.className = 'math-render-inner';
+    replacement.append(mathContainer);
+
+    const copyBtn = document.createElement('button');
+    copyBtn.type = 'button';
+    copyBtn.className = 'math-copy-btn';
+    copyBtn.textContent = '复制 LaTeX';
+    copyBtn.setAttribute('aria-label', '复制 LaTeX 公式');
+    copyBtn.setAttribute('aria-live', 'polite');
+    copyBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const latex = replacement.getAttribute('data-latex') || expression;
+      if (!latex) return;
+      let succeeded = false;
+      try {
+        await copyText(latex);
+        succeeded = true;
+      } catch {
+        // Report failure rather than silently claiming success or failing silently
+      }
+      if (!copyBtn.isConnected) return;
+      copyBtn.textContent = succeeded ? '已复制' : '复制失败';
+      copyBtn.setAttribute('aria-label', succeeded ? '已复制 LaTeX 公式' : '复制 LaTeX 公式失败');
+      copyBtn.classList.toggle('copied', succeeded);
+      clearTimeout(copyBtn._copyTimer);
+      copyBtn._copyTimer = setTimeout(() => {
+        copyBtn.textContent = '复制 LaTeX';
+        copyBtn.setAttribute('aria-label', '复制 LaTeX 公式');
+        copyBtn.classList.remove('copied');
+      }, 2400);
+    });
+    replacement.append(copyBtn);
+  } else {
+    replacement.textContent = expression;
   }
-  const expression = String(node.textContent || '').trim();
-  replacement.textContent = expression;
   node.replaceWith(replacement);
   void loadKatex().then((katex) => {
     if (!replacement.isConnected) return;
+    const target = displayMode ? replacement.querySelector('.math-render-inner') || replacement : replacement;
     try {
-      katex.render(expression, replacement, {
+      katex.render(expression, target, {
         displayMode,
         throwOnError: false,
         strict: false,
@@ -329,9 +500,13 @@ function renderMath(node, displayMode) {
       });
     } catch {
       replacement.classList.add('math-error');
-      replacement.textContent = expression;
+      target.textContent = expression;
     }
-  }).catch(() => replacement.classList.add('math-error'));
+  }).catch(() => {
+    replacement.classList.add('math-error');
+    const target = displayMode ? replacement.querySelector('.math-render-inner') || replacement : replacement;
+    target.textContent = expression;
+  });
   return replacement;
 }
 
