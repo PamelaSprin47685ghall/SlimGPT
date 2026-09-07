@@ -1,5 +1,5 @@
 <script>
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { Button, Navbar, NavLeft, NavRight, Page } from 'framework7-svelte';
   import ConversationSidebar from '../components/ConversationSidebar.svelte';
   import ConversationTurnStage from '../components/ConversationTurnStage.svelte';
@@ -9,6 +9,7 @@
   import { createConversationStreamReader } from '../lib/conversation-stream.js';
   import { historySyncMessage } from '../lib/history-sync.js';
   import { matchesPendingTurn } from '../lib/pending-turn.js';
+  import { prioritizeBanners, createStalenessTracker, trapModalKeydown, getScrimAriaLabel } from '../lib/shell-helpers.js';
   import { downloadConversationMarkdown, hasExportableMessage } from '../lib/export.js';
   import {
     loadConversationIndex,
@@ -51,6 +52,7 @@
   } from '../../core.js';
 
   const transport = createTransport();
+  let composerRef = $state(null);
   let status = $state({ bridgeReady: false, captureMode: null });
   let conversationMap = $state(new Map());
   let conversationRecords = $state(new Map());
@@ -61,6 +63,8 @@
   let navigationTimedOutId = $state(null);
   let historySyncStates = $state(new Map());
   let captures = $state(0);
+  let sidebarNotice = $state('');
+  let sidebarExportError = $state('');
   let composerStatus = $state('');
   let composerError = $state(false);
   let draft = $state('');
@@ -70,6 +74,20 @@
   let compactLayout = $state(true);
   let mobilePanel = $state('none');
   let lastActiveMobileTrigger = null;
+  let lastActiveModalTrigger = null;
+  let shortcutsModalEl = $state(null);
+  const stalenessTracker = createStalenessTracker({
+    timeoutMs: 90_000,
+    onStale: () => {
+      statusStale = true;
+    },
+  });
+
+  function focusComposer() {
+    composerRef?.focus?.();
+  }
+  let expandedBanners = $state(false);
+  let statusStale = $state(false);
   let showShortcutsModal = $state(false);
   let panelPointerIntent = null;
   let activeTurnIndex = $state(0);
@@ -121,8 +139,8 @@
     [...turns, ...unresolvedTurns]
       .flatMap((turn) => [turn.user, ...(turn.replies || [])].filter(Boolean))
   );
-  const liveConnected = $derived(status.bridgeReady && status.captureMode === 'page');
-  const statusState = $derived(status.bridgeError ? 'error' : (liveConnected ? 'online' : 'offline'));
+  const liveConnected = $derived(status.bridgeReady && status.captureMode === 'page' && !statusStale);
+  const statusState = $derived(status.bridgeError ? 'error' : (liveConnected ? 'online' : (statusStale ? 'offline' : 'offline')));
   const statusLabel = $derived(
   status.bridgeError
     ? '连接失败'
@@ -130,6 +148,19 @@
         ? (liveConnected ? '已连接（官方界面可见）' : '未连接')
         : (liveConnected ? '已接管' : '连接中'))
   );
+  const activeBanners = $derived(prioritizeBanners({
+    bridgeError: Boolean(status.bridgeError),
+    liveConnected,
+    historySyncProblem,
+    cacheNotice,
+    currentHistorySyncState,
+    canonicalSyncError: currentRecord?.canonicalSyncError,
+    conversationHistoryPending,
+    conversationBlockingLoad,
+    conversationTimedOut,
+  }));
+  const topBanner = $derived(activeBanners[0] || null);
+  const secondaryBanners = $derived(activeBanners.slice(1));
   const conversationHistoryPending = $derived(Boolean(currentConversationId && !currentRecord?.canonicalComplete));
   const currentHistorySyncState = $derived(historySyncStates.get(currentConversationId));
   const historySyncProblem = $derived(historySyncMessage(currentHistorySyncState,
@@ -215,7 +246,7 @@
       if (event.key === 'Escape') {
         if (showShortcutsModal) {
           event.preventDefault();
-          showShortcutsModal = false;
+          closeShortcutsModal();
           return;
         }
         if (compactLayout && mobilePanel !== 'none') {
@@ -228,7 +259,7 @@
       if (isEditing) return;
       if ((event.key === '?' || (event.key === '/' && (event.metaKey || event.ctrlKey)))) {
         event.preventDefault();
-        showShortcutsModal = !showShortcutsModal;
+        if (showShortcutsModal) closeShortcutsModal(); else openShortcutsModal();
       }
     };
     window.addEventListener('keydown', handleGlobalKeydown);
@@ -244,6 +275,7 @@
     return () => {
       unsubscribe?.();
       unsubscribeStorage?.();
+      stalenessTracker.clear();
       transport.stop();
       clearTimeout(saveTimer);
       clearTimeout(sendTimer);
@@ -387,6 +419,8 @@
 
   function handleTransportMessage(message) {
     if (!message || typeof message !== 'object') return;
+    stalenessTracker.reset();
+    if (statusStale) statusStale = false;
     if (message.type === 'status') {
       const bridgeError = message.bridgeReady === true ? false : (message.bridgeError ?? status.bridgeError);
       status = { ...status, ...message, bridgeError };
@@ -939,21 +973,30 @@
 
   function selectConversation(id) {
     if (sendInFlight) {
-      setComposerStatus('当前消息仍在提交，请等待确认后再切换对话', true);
+      sidebarNotice = '消息提交中，请等待确认后再切换对话';
+      setComposerStatus('消息提交中，请等待确认后再切换对话', true);
       return;
     }
-    if (!id || (id === currentConversationId && conversationRecords.get(id)?.payload)) {
+    // Allow re-click retry if timed out or incomplete
+    const record = conversationRecords.get(id);
+    const isTimedOut = navigationTimedOutId === id;
+    const isIncomplete = record && !record.canonicalComplete;
+    const canRetryCurrent = id === currentConversationId && (isTimedOut || isIncomplete);
+
+    if (!id || (id === currentConversationId && !canRetryCurrent && record?.payload)) {
       closeMobilePanels();
       return;
     }
     setCurrentConversation(id);
     thinkingLevelOverride = null;
+    sidebarNotice = '';
     startConversationLoading(id);
     closeMobilePanels();
     if (transport.supportsLiveChat) {
       const route = conversationMap.get(id)?.route === 'uc' ? 'uc' : 'c';
       transport.send({ type: 'navigate-conversation', conversationId: id, route });
       setComposerStatus('');
+      queueMicrotask(focusComposer);
     }
   }
 
@@ -967,11 +1010,13 @@
     newChatWorkState = 'unknown';
     finishConversationLoading();
     pendingUser = null;
+    draftsByConversation.set(null, '');
     clearPendingLiveEvents();
     closeMobilePanels();
     if (transport.supportsLiveChat) {
       transport.send({ type: 'new-chat', thinkingLevel: userSettings.thinkingLevel });
     }
+    queueMicrotask(focusComposer);
   }
 
   function setCurrentConversation(id, { migrateDraft = false } = {}) {
@@ -1072,18 +1117,25 @@
     const exportable = turns.flatMap((turn) => [turn.user, ...turn.replies]).filter(hasExportableMessage);
     const hasUnresolved = unresolvedTurns.some((group) => group.replies?.some(hasExportableMessage));
     if (!exportable.length && !hasUnresolved) {
-      setComposerStatus(conversationHistoryPending ? '当前对话尚未加载，暂无可导出的内容' : '当前对话暂无可导出的消息', true);
+      sidebarExportError = conversationHistoryPending ? '当前对话尚未加载，暂无可导出的内容' : '当前对话暂无可导出的消息';
+      setComposerStatus(sidebarExportError, true);
       return;
     }
     const title = currentMeta?.title || 'ChatGPT Conversation';
     try {
       const { filename } = downloadConversationMarkdown(title, exportable, {
         unresolved: unresolvedTurns,
+        conversationId: currentConversationId,
+        createTime: currentMeta?.create_time ? new Date(currentMeta.create_time < 10_000_000_000 ? currentMeta.create_time * 1000 : currentMeta.create_time).toISOString() : null,
+        updateTime: currentMeta?.update_time ? new Date(currentMeta.update_time < 10_000_000_000 ? currentMeta.update_time * 1000 : currentMeta.update_time).toISOString() : null,
         historyComplete: currentRecord?.canonicalComplete === true,
+        model: currentMeta?.model || null,
       });
       setComposerStatus(conversationHistoryPending ? `已导出当前已取得的内容（历史不完整）：${filename}` : `已导出 ${filename}`);
+      sidebarExportError = '';
     } catch {
       setComposerStatus('导出失败，未生成完整文件；当前聊天内容仍保留在页面中', true);
+      sidebarExportError = '导出失败，未生成完整文件';
     }
   }
 
@@ -1146,7 +1198,18 @@
       pendingCommandId = null;
       pendingCommandConversationId = null;
       sendInFlight = false;
-      if (pendingUser?.commandId === commandId) pendingUser = null;
+      if (pendingUser?.commandId === commandId) {
+        pendingUser = {
+          ...pendingUser,
+          failed: true,
+          message: {
+            ...pendingUser.message,
+            status: 'failed',
+            error: '官方输入框未确认提交',
+            failed: true,
+          },
+        };
+      }
       clearPendingLiveEvents();
       setConversationWorkState(timedOutConversationId, 'unknown');
       setComposerStatus('官方输入框未确认提交；内容仍保留，请检查官方界面后手动决定是否重试', true);
@@ -1164,7 +1227,18 @@
     pendingCommandId = null;
     pendingCommandConversationId = null;
     if (!message.ok) {
-      pendingUser = null;
+      if (pendingUser) {
+        pendingUser = {
+          ...pendingUser,
+          failed: true,
+          message: {
+            ...pendingUser.message,
+            status: 'failed',
+            error: message.error || '发送失败',
+            failed: true,
+          },
+        };
+      }
       clearPendingLiveEvents();
       if (message.error === 'send-in-progress') setConversationWorkState(submittedConversationId, 'running');
       else if (message.error === 'send-unconfirmed') setConversationWorkState(submittedConversationId, 'unknown');
@@ -1194,6 +1268,22 @@
       }
     }
     setComposerStatus('消息已发送（官方已确认）');
+    queueMicrotask(focusComposer);
+  }
+
+  function handleRetrySend(targetMessage) {
+    const textToRetry = targetMessage?.text || pendingUser?.text || '';
+    if (!textToRetry) return;
+    if (pendingUser) {
+      pendingUser = null;
+    }
+    sendMessage(textToRetry);
+  }
+
+  function handleDismissPendingUser() {
+    if (pendingUser) {
+      pendingUser = null;
+    }
   }
 
   function pendingUserMatch(rawMessage) {
@@ -1382,14 +1472,16 @@
     if (!rawMessage) return;
     if (getToolMessageInfo(rawMessage)) return;
     const metadata = rawMessage.metadata || {};
+    const updateTime = Number(rawMessage.create_time ?? rawMessage.createTime ?? metadata.timestamp) || null;
     updateConversationPreview(
       id,
       contentToText(rawMessage.content, metadata),
       metadata.model_slug || metadata.default_model_slug || metadata.model || '',
+      updateTime,
     );
   }
 
-  function updateConversationPreview(id, text, model = '') {
+  function updateConversationPreview(id, text, model = '', updateTime = null) {
     const existing = conversationMap.get(id) || null;
     const previous = existing || normalizeConversationMeta({
       id,
@@ -1397,11 +1489,12 @@
       route: 'c',
     });
     const preview = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 160);
-    if (existing && !preview && !model) return;
+    if (existing && !preview && !model && !updateTime) return;
     const updated = normalizeConversationMeta({
       ...previous,
       last: preview || previous.last,
       model: model || previous.model,
+      update_time: updateTime || previous.update_time,
     }, previous);
     locallyPromotedConversationIds.add(id);
     const next = new Map([[id, updated]]);
@@ -1420,18 +1513,35 @@
   function toggleSidebar() {
     if (!compactLayout) return;
     if (mobilePanel !== 'sidebar') lastActiveMobileTrigger = document.querySelector('.mobile-sidebar-button');
+    const willOpen = mobilePanel !== 'sidebar';
     mobilePanel = mobilePanel === 'sidebar' ? 'none' : 'sidebar';
     if (mobilePanel === 'none' && lastActiveMobileTrigger) {
-      lastActiveMobileTrigger.focus?.();
+      if (lastActiveMobileTrigger?.isConnected) lastActiveMobileTrigger.focus?.();
+      else focusComposer();
+    } else if (willOpen) {
+      queueMicrotask(() => {
+        const target = document.querySelector('#slimgpt-mobile-sidebar .conversation-search input') ||
+          document.querySelector('#slimgpt-mobile-sidebar button:not([disabled])');
+        target?.focus?.();
+      });
     }
   }
 
   function toggleOverview() {
     if (!compactLayout) return;
     if (mobilePanel !== 'overview') lastActiveMobileTrigger = document.querySelector('.mobile-overview-button');
+    const willOpen = mobilePanel !== 'overview';
     mobilePanel = mobilePanel === 'overview' ? 'none' : 'overview';
     if (mobilePanel === 'none' && lastActiveMobileTrigger) {
-      lastActiveMobileTrigger.focus?.();
+      if (lastActiveMobileTrigger?.isConnected) lastActiveMobileTrigger.focus?.();
+      else focusComposer();
+    } else if (willOpen) {
+      queueMicrotask(() => {
+        const target = document.querySelector('#slimgpt-mobile-overview .overview-item.active') ||
+          document.querySelector('#slimgpt-mobile-overview .overview-item') ||
+          document.querySelector('#slimgpt-mobile-overview button:not([disabled])');
+        target?.focus?.();
+      });
     }
   }
 
@@ -1480,13 +1590,37 @@
     if (prev !== 'none' && lastActiveMobileTrigger) {
       const trigger = lastActiveMobileTrigger;
       lastActiveMobileTrigger = null;
-      queueMicrotask(() => trigger?.focus?.());
+      queueMicrotask(() => {
+        if (trigger?.isConnected) trigger.focus?.();
+        else focusComposer();
+      });
+    } else if (prev !== 'none') {
+      queueMicrotask(focusComposer);
     }
   }
-</script>
 
+  function openShortcutsModal(trigger = null) {
+    lastActiveModalTrigger = trigger || (document.activeElement?.isConnected ? document.activeElement : null);
+    showShortcutsModal = true;
+    void tick().then(() => {
+      shortcutsModalEl?.querySelector('.shortcuts-close-btn')?.focus?.();
+    });
+  }
+
+  function closeShortcutsModal() {
+    showShortcutsModal = false;
+    queueMicrotask(() => {
+      if (lastActiveModalTrigger?.isConnected) {
+        lastActiveModalTrigger.focus?.();
+      } else {
+        focusComposer();
+    }
+      lastActiveModalTrigger = null;
+    });
+  }
+</script>
 <Page class={`slimgpt-page ${compactLayout ? 'compact-layout' : 'desktop-layout'}`}>
-  <Navbar class="mobile-navbar">
+  <Navbar class={`mobile-navbar ${mobilePanel !== 'none' ? 'drawer-open' : ''}`}>
     <NavLeft>
       <button
         type="button"
@@ -1509,12 +1643,15 @@
         aria-label={`对话状态：${conversationWorkLabel}`}
         title={conversationWorkLabel}
       ></span>
+      {#if statusState !== 'online'}
+        <span class={`mobile-status-badge ${statusState}`}>{statusLabel}</span>
+      {/if}
     </div>
     <NavRight>
       <button
         type="button"
         class="button button-small mobile-official-button"
-        title="暂时切换至官方页面"
+        title="暂时切换至官方页面（可点击宿主页面右下角的 SlimGPT 浮动按钮随时返回）"
         onclick={() => transport.openOfficial(currentConversationId)}
       >官方</button>
       <button
@@ -1540,6 +1677,16 @@
       <ConversationSidebar
         {conversations}
         currentId={currentConversationId}
+        {loadingConversationId}
+        {navigationTimedOutId}
+        historySyncState={currentHistorySyncState}
+        {sendInFlight}
+        historyComplete={currentRecord?.canonicalComplete === true}
+        hasExportableContent={currentHasRenderableContent}
+        exportError={sidebarExportError}
+        {sidebarNotice}
+        onRetryHistorySync={retryHistorySync}
+        onClearNotice={() => { sidebarNotice = ''; sidebarExportError = ''; }}
         {statusLabel}
         {statusState}
         {captures}
@@ -1562,12 +1709,12 @@
             <span class="work-dot" class:working={conversationActivelyWorking} aria-hidden="true"></span>
             {conversationWorkLabel}
           </span>
-          <Button small onClick={() => transport.openOfficial(currentConversationId)}>暂时显示官方界面</Button>
+          <Button small onClick={() => transport.openOfficial(currentConversationId)} title="暂时切换至官方页面（可点击宿主页面右下角的 SlimGPT 浮动按钮随时返回）">暂时显示官方界面</Button>
           <button
             type="button"
             class="button button-small header-shortcuts-button"
-            title="查看键盘快捷键 (?)"
-            onclick={() => showShortcutsModal = true}
+            title="查看键盘快捷键 (? 或 Ctrl+/)"
+            onclick={(event) => openShortcutsModal(event.currentTarget)}
           >快捷键</button>
         </div>
       </header>
@@ -1582,6 +1729,9 @@
             conversationKey={displayConversationId || 'new'}
             onActiveChange={(index) => activeTurnIndex = index}
             onBranch={stepBranch}
+            onRetry={handleRetrySend}
+            onDismiss={handleDismissPendingUser}
+            streaming={conversationActivelyWorking}
           />
         {:else if !conversationHistoryPending}
           <div class="empty-state">
@@ -1590,8 +1740,8 @@
             <p>登录、网络和发送仍由当前 ChatGPT 页面处理；SlimGPT 负责会话呈现，并在覆盖显示时暂停官方界面的布局和绘制。</p>
             <div class="empty-actions">
               <Button outline small onClick={newChat}>开始新对话</Button>
-              <Button outline small onClick={() => transport.openOfficial(currentConversationId)}>查看官方界面</Button>
-              <Button outline small onClick={() => showShortcutsModal = true}>快捷键指南</Button>
+              <Button outline small onClick={() => transport.openOfficial(currentConversationId)} title="暂时切换至官方页面（可点击宿主页面右下角的 SlimGPT 浮动按钮随时返回）">查看官方界面</Button>
+              <Button outline small onClick={(event) => openShortcutsModal(event.currentTarget)}>快捷键指南</Button>
             </div>
             <div class="empty-shortcuts-hint">
               提示：在下方输入框输入消息按 Enter 即可发送，Shift + Enter 换行
@@ -1617,45 +1767,42 @@
           </div>
         {/if}
 
-        {#if status.bridgeError}
-          <div class="stage-guide-banner error" role="alert">
-            <div class="banner-text">
-              <strong>ChatGPT 页面连接失败</strong>
-              <span>桥接脚本未就绪或被官方界面拦截；请检查官方页面是否正常登录或刷新页面重试。</span>
-            </div>
-            <div class="banner-actions">
-              <Button small outline onClick={() => transport.openOfficial(currentConversationId)}>查看官方界面</Button>
-            </div>
+        {#if activeBanners.length}
+          <div class="stage-banner-stack" role="region" aria-label="状态提醒">
+            {#if topBanner}
+              <div class={`stage-guide-banner ${topBanner.level}${topBanner.actionKey === 'sync-error' ? ' history-sync-error' : ''}`} role={topBanner.level === 'error' ? 'alert' : 'status'}>
+                <div class="banner-text">
+                  <strong>{topBanner.title}</strong>
+                  <span>{topBanner.message}</span>
+                </div>
+                <div class="banner-actions">
+                  {#if topBanner.actionKey === 'bridge-error'}
+                    <Button small outline onClick={() => transport.openOfficial(currentConversationId)}>查看官方界面</Button>
+                  {:else if topBanner.actionKey === 'offline'}
+                    <Button small outline onClick={() => transport.send({ type: 'request-status' })}>重新检查连接</Button>
+                    <Button small outline onClick={() => transport.openOfficial(currentConversationId)}>查看官方页面</Button>
+                  {:else if topBanner.actionKey === 'sync-error' || topBanner.actionKey === 'resync'}
+                    <Button small outline disabled={!status.bridgeReady} onClick={retryHistorySync}>重试同步</Button>
+                  {/if}
+                </div>
+              </div>
+            {/if}
+            {#if secondaryBanners.length > 0}
+              <button type="button" class="stage-banner-expander" onclick={() => expandedBanners = !expandedBanners}>
+                {expandedBanners ? '收起其他提醒' : `还有 ${secondaryBanners.length} 项提醒 ▾`}
+              </button>
+              {#if expandedBanners}
+                {#each secondaryBanners as banner (banner.id)}
+                  <div class={`stage-guide-banner ${banner.level}`} role="status">
+                    <div class="banner-text">
+                      <strong>{banner.title}</strong>
+                      <span>{banner.message}</span>
+                    </div>
+                  </div>
+                {/each}
+              {/if}
+            {/if}
           </div>
-        {:else if !liveConnected}
-          <div class="stage-guide-banner offline" role="status">
-            <div class="banner-text">
-              <strong>未接管官方界面</strong>
-              <span>当前正连接 ChatGPT 页面，或者官方界面正处于活动状态。</span>
-            </div>
-            <div class="banner-actions">
-              <Button small outline onClick={() => transport.send({ type: 'request-status' })}>重新检查连接</Button>
-              <Button small outline onClick={() => transport.openOfficial(currentConversationId)}>查看官方页面</Button>
-            </div>
-          </div>
-        {/if}
-
-        {#if status.takeover === false && liveConnected}
-          <div class="takeover-restore-pill" role="status">
-            <span>官方界面正处于显示状态</span>
-            <button type="button" class="restore-action-btn" onclick={() => transport.send({ type: 'connect' })}>
-              回到 SlimGPT
-            </button>
-          </div>
-        {/if}
-
-        {#if historySyncProblem}
-          <div class="history-sync-notice history-sync-error" role="status" aria-live="polite">
-            <span>{historySyncProblem}</span>
-            <Button small disabled={!status.bridgeReady} onClick={retryHistorySync}>重试同步</Button>
-          </div>
-        {:else if currentHistorySyncState?.state === 'loading' && currentRecord?.canonicalSyncError}
-          <div class="history-sync-notice" role="status">正在重新读取完整历史，已有内容保持不变。</div>
         {/if}
 
         {#if conversationWorkState === 'running' && !conversationBlockingLoad}
@@ -1674,12 +1821,14 @@
       </section>
 
       <Composer
+        bind:this={composerRef}
         bind:value={draft}
         thinkingLevel={effectiveThinkingLevel}
         onThinkingLevelChange={handleThinkingLevelChange}
         disabled={!transport.supportsLiveChat || !status.bridgeReady}
         loading={conversationPending}
         busy={sendInFlight}
+        generating={conversationWorkState === 'running'}
         status={composerStatus}
         error={composerError}
         onSend={sendMessage}
@@ -1697,25 +1846,27 @@
         unresolvedCount={unresolvedTurns.reduce((total, turn) => total + turn.replies.length, 0)}
         activeIndex={activeTurnIndex}
         onSelect={selectOverviewMessage}
+        streaming={conversationActivelyWorking}
       />
     </div>
 
     {#if compactLayout && mobilePanel !== 'none'}
-      <button class="sidebar-scrim" aria-label="关闭侧栏" onclick={closeMobilePanels}></button>
+      <button class="sidebar-scrim" aria-label={getScrimAriaLabel(mobilePanel)} onclick={closeMobilePanels}></button>
     {/if}
   </div>
 
   {#if showShortcutsModal}
     <div
+      bind:this={shortcutsModalEl}
       class="shortcuts-modal-backdrop"
       role="presentation"
-      onclick={(event) => { if (event.target === event.currentTarget) showShortcutsModal = false; }}
-      onkeydown={(event) => { if (event.target === event.currentTarget && (event.key === 'Escape' || event.key === 'Enter' || event.key === ' ')) showShortcutsModal = false; }}
+      onclick={(event) => { if (event.target === event.currentTarget) closeShortcutsModal(); }}
+      onkeydown={(event) => trapModalKeydown(event, shortcutsModalEl, closeShortcutsModal)}
     >
       <div class="shortcuts-modal" role="dialog" aria-modal="true" aria-labelledby="shortcuts-title">
         <div class="shortcuts-modal-header">
           <strong id="shortcuts-title">键盘快捷键指南</strong>
-          <button type="button" class="shortcuts-close-btn" aria-label="关闭" onclick={() => showShortcutsModal = false}>✕</button>
+          <button type="button" class="shortcuts-close-btn" aria-label="关闭" onclick={closeShortcutsModal}>✕</button>
         </div>
         <div class="shortcuts-grid">
           <div class="shortcut-row">
@@ -1725,6 +1876,10 @@
           <div class="shortcut-row">
             <kbd>Shift + Enter</kbd>
             <span>在输入框中换行</span>
+          </div>
+          <div class="shortcut-row">
+            <kbd>← / →</kbd>
+            <span>在问答轮次间前后翻页</span>
           </div>
           <div class="shortcut-row">
             <kbd>↑ / ↓</kbd>
@@ -1743,8 +1898,12 @@
             <span>关闭打开的侧栏、概览抽屉或弹窗</span>
           </div>
           <div class="shortcut-row">
-            <kbd>?</kbd>
+            <kbd>? / Ctrl + /</kbd>
             <span>打开 / 关闭本快捷键指南</span>
+          </div>
+          <div class="shortcut-row">
+            <kbd>Esc</kbd>
+            <span>关闭指南并返回焦点</span>
           </div>
         </div>
       </div>

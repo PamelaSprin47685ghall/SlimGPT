@@ -1,5 +1,6 @@
 import {
   CHECKED,
+  TABLE,
   HREF,
   LANG,
   SRC,
@@ -95,6 +96,10 @@ function createParser(root) {
     if (node.tagName === 'A') {
       node.target = '_blank';
       node.rel = 'noreferrer noopener';
+    } else if (type === TABLE) {
+      wrapTable(node);
+    } else if (type === CODE_BLOCK || type === CODE_FENCE) {
+      ensureCodeShell(node);
     } else if (node.tagName === 'IMG') {
       node.loading = 'lazy';
       node.referrerPolicy = 'no-referrer';
@@ -107,8 +112,25 @@ function createParser(root) {
   renderer.add_text = (data, text) => {
     const node = data.nodes[data.index];
     if (node?.tagName === 'IMG') node.alt += text;
-    else default_add_text(data, text);
+    else {
+      default_add_text(data, text);
+      if (node?.tagName === 'A' && /^来源 \d+$/.test(node.textContent?.trim() || '')) {
+        node.classList.add('citation-badge');
+        if (!node.getAttribute('title') && node.getAttribute('href')) {
+          try {
+            const u = new URL(node.getAttribute('href'));
+            node.setAttribute('title', u.hostname);
+          } catch {}
+        } else if (node.getAttribute('title') && node.getAttribute('href')) {
+          try {
+            const u = new URL(node.getAttribute('href'));
+            node.setAttribute('title', `${node.getAttribute('title')} (${u.hostname})`);
+          } catch {}
+        }
+      }
+    }
   };
+
   renderer.set_attr = setSafeAttribute;
   renderer.end_token = (data) => {
     const node = data.nodes[data.index];
@@ -167,10 +189,18 @@ function setSafeAttribute(data, type, value) {
   if (type === HREF) {
     const destination = parseMarkdownDestination(value);
     const url = sanitizeMarkdownUrl(destination.href, false);
-    if (url) node.setAttribute('href', url);
-    else node.removeAttribute('href');
+    if (url) {
+      node.setAttribute('href', url);
+      node.classList.remove('link-sanitized');
+      node.removeAttribute('tabindex');
+    } else {
+      node.removeAttribute('href');
+      node.classList.add('link-sanitized');
+      node.tabIndex = 0;
+      node.setAttribute('title', '已拦截不安全或不受支持的链接协议');
+    }
     if (url && destination.title) node.setAttribute('title', destination.title);
-    else node.removeAttribute('title');
+    else if (url) node.removeAttribute('title');
     return;
   }
   if (type === SRC) {
@@ -187,6 +217,12 @@ function setSafeAttribute(data, type, value) {
     if (language) {
       node.dataset.language = language;
       node.classList.add(`language-${language}`);
+      const block = node.closest?.('.code-block');
+      if (block) {
+        block.dataset.language = language;
+        const langLabel = block.querySelector('.code-lang');
+        if (langLabel) langLabel.textContent = language;
+      }
     }
     return;
   }
@@ -210,8 +246,9 @@ function finalizeNode(data) {
 }
 
 function finalizeCodeBlock(code) {
+  ensureCodeShell(code);
+  const wrapper = code.closest('.code-block');
   const pre = code.parentElement;
-  if (!pre || pre.parentElement?.classList.contains('code-block')) return;
   pre.tabIndex = 0;
   pre.setAttribute('role', 'region');
   pre.setAttribute('aria-label', '代码，可滚动');
@@ -219,6 +256,16 @@ function finalizeCodeBlock(code) {
     .find((name) => name.startsWith('language-'))?.slice(9));
   const source = code.textContent || '';
   code.innerHTML = highlightCode(source, language);
+}
+
+function ensureCodeShell(code) {
+  const pre = code.parentElement;
+  if (!pre || pre.parentElement?.classList.contains('code-block')) return;
+  pre.tabIndex = 0;
+  pre.setAttribute('role', 'region');
+  pre.setAttribute('aria-label', '代码，可滚动');
+  const language = normalizeCodeLanguage(code.dataset.language || [...code.classList]
+    .find((name) => name.startsWith('language-'))?.slice(9));
 
   const wrapper = document.createElement('div');
   wrapper.className = 'code-block';
@@ -326,16 +373,19 @@ function highlightCode(source, language) {
     return escapeHtml(source);
   }
   if (/^(html|xml|svg)$/.test(language)) {
-    return highlightMatches(source, /<\/?([a-zA-Z][\w-]*)/g, (match) => {
+    return highlightMatches(source, /(<!--[\s\S]*?-->)|<\/?([a-zA-Z][\w-]*)/g, (match) => {
+      if (match[1]) {
+        return `<span class="tok-comment">${escapeHtml(match[1])}</span>`;
+      }
       const prefix = match[0].startsWith('</') ? '&lt;/' : '&lt;';
-      return `${prefix}<span class="tok-key">${escapeHtml(match[1])}</span>`;
+      return `${prefix}<span class="tok-key">${escapeHtml(match[2])}</span>`;
     });
   }
   const keywords = 'const|let|var|function|return|if|else|for|while|class|new|import|from|export|async|await|true|false|null|undefined|def|in|and|or|not|elif|is|lambda|with|as|yield|pass|raise|except|None|True|False|package|func|struct|go|chan|defer|fn|mut|pub|impl|trait|match|enum|self|Self|int|char|float|double|void|bool|public|private|protected|static|final|SELECT|FROM|WHERE|INSERT|INTO|UPDATE|DELETE|JOIN|LEFT|RIGHT|INNER|OUTER|ON|GROUP|BY|ORDER|HAVING|LIMIT|OFFSET|CREATE|TABLE|DROP|ALTER|INDEX';
-  const pattern = new RegExp(`(["'\\x60])(?:\\\\[\\s\\S]|(?!\\1)[^\\\\])*\\1|\\b(?:${keywords})\\b|\\b\\d+(?:\\.\\d+)?\\b`, 'g');
+  const pattern = new RegExp(`(//[^\\n]*|/\\*[\\s\\S]*?\\*/|#[^\\n]*)|(["'\\x60])(?:\\\\[\\s\\S]|(?!\\2)[^\\\\])*\\2|\\b(?:${keywords})\\b|\\b\\d+(?:\\.\\d+)?\\b`, 'g');
   return highlightMatches(source, pattern, (match) => {
     const token = match[0];
-    const className = /^["'`]/.test(token) ? 'tok-str' : /^\d/.test(token) ? 'tok-num' : 'tok-key';
+    const className = match[1] ? 'tok-comment' : match[2] ? 'tok-str' : /^\d/.test(token) ? 'tok-num' : 'tok-key';
     return `<span class="${className}">${escapeHtml(token)}</span>`;
   });
 }

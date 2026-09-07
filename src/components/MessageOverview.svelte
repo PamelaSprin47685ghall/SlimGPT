@@ -5,10 +5,15 @@
     turns = [],
     unresolvedCount = 0,
     activeIndex = 0,
+    streaming = false,
+    streamingIndex = -1,
     onSelect = () => {},
   } = $props();
 
   let listEl = $state(null);
+
+  // Defaults to the latest turn so HomePage only passes `streaming`.
+  const effectiveStreamingIndex = $derived(streamingIndex >= 0 ? streamingIndex : turns.length - 1);
 
   $effect(() => {
     const index = activeIndex;
@@ -36,6 +41,21 @@
     if (turn?.replies?.some((message) => message?.tool)) return '（工具调用）';
     return '（空对话轮次）';
   }
+
+  function questionText(turn) {
+    return clean(turn?.user?.text || turn?.user?.thought);
+  }
+
+  function answerText(turn) {
+    const answerMsg = turn?.replies?.find((message) => message?.role === 'assistant' && !message?.tool && (message?.text || message?.thought)) ||
+      turn?.replies?.find((message) => !message?.tool && (message?.text || message?.thought)) ||
+      turn?.replies?.find((message) => message?.text || message?.thought);
+    return clean(answerMsg?.text || answerMsg?.thought);
+  }
+
+  function toolCount(turn) {
+    return turn?.replies?.filter((message) => message?.tool).length || 0;
+  }
 </script>
 
 <aside class="message-overview">
@@ -54,17 +74,32 @@
       </div>
     {:else}
       {#each turns as turn, index (turn.id || index)}
+        {@const query = questionText(turn)}
+        {@const answer = answerText(turn)}
+        {@const tools = toolCount(turn)}
         <button
           type="button"
           class="overview-item"
           class:active={index === activeIndex}
           data-overview-index={index}
           aria-current={index === activeIndex ? 'true' : undefined}
+          aria-label={preview(turn)}
           onclick={() => onSelect(index)}
         >
           <span class="overview-role role-turn">Q/A</span>
-          <span class="overview-preview">{preview(turn)}</span>
-          <span class="overview-number">{index + 1}</span>
+          <span class="overview-text">
+            <span class="overview-query">{query || '（空提问）'}</span>
+            <span class="overview-answer">{answer || (tools ? `工具调用 ×${tools}` : '（空对话轮次）')}</span>
+          </span>
+          <span class="overview-meta">
+            {#if tools}
+              <span class="overview-tools" title={`本轮含 ${tools} 条工具调用`}>×{tools}</span>
+            {/if}
+            {#if streaming && index === effectiveStreamingIndex}
+              <span class="overview-live-dot" title="正在输出" aria-hidden="true"></span>
+            {/if}
+            <span class="overview-number">{index + 1}</span>
+          </span>
         </button>
       {/each}
     {/if}
@@ -77,10 +112,5 @@
   }
   .overview-item {
     transition: background-color 0.12s ease;
-  }
-  .overview-preview {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
   }
 </style>

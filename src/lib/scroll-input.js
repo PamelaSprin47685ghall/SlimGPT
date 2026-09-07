@@ -11,16 +11,61 @@ export function nestedScrollerCanConsume(target, boundary, delta, styleOf = glob
   if (!delta || !target || !boundary || typeof styleOf !== 'function') return false;
   let node = target.nodeType === 1 ? target : target?.parentElement;
   while (node && node !== boundary) {
-    try {
-      const style = styleOf(node);
-      if (style && node.scrollHeight > node.clientHeight + 1 && /^(auto|scroll|overlay)$/.test(style.overflowY)) {
-        const remaining = node.scrollHeight - node.clientHeight - node.scrollTop;
+    // Cheap checks first: getComputedStyle forces layout, so it must never run
+    // on the hot wheel path for nodes that cannot scroll vertically.
+    const scrollHeight = node.scrollHeight;
+    const clientHeight = node.clientHeight;
+    if (
+      typeof scrollHeight === 'number' &&
+      typeof clientHeight === 'number' &&
+      scrollHeight > clientHeight + 1
+    ) {
+      let scrollable = hasKnownVerticalScrollAffordance(node);
+      if (!scrollable) {
+        try {
+          const style = styleOf(node);
+          scrollable = Boolean(style) && /^(auto|scroll|overlay)$/.test(style.overflowY);
+        } catch {
+          // Ignore uncomputable nodes
+        }
+      }
+      if (scrollable) {
+        const remaining = scrollHeight - clientHeight - node.scrollTop;
         if (delta < 0 ? node.scrollTop > 1 : remaining > 1) return true;
       }
-    } catch {
-      // Ignore uncomputable nodes
     }
     node = node.parentElement;
+  }
+  return false;
+}
+
+// Fast-path allowlist for the scroll containers this app actually renders.
+// Matching nodes skip computed-style inspection; dimension + position checks
+// above still apply. Anything without these markers falls back to styleOf.
+const KNOWN_SCROLLABLE_CLASSES = new Set([
+  'table-wrap',
+  'message-content',
+  'message-text',
+  'tool-payload',
+  'tool-content',
+  'single-message-scroller',
+  'conversation-turn-content',
+  'overview-list',
+]);
+
+function hasKnownVerticalScrollAffordance(node) {
+  try {
+    // An explicitly clipped inline overflow always wins over the allowlist.
+    const inlineOverflowY = node?.style?.overflowY;
+    if (inlineOverflowY === 'hidden' || inlineOverflowY === 'visible' || inlineOverflowY === 'clip') return false;
+    if (node?.tagName === 'PRE') return true;
+    const list = node?.classList;
+    if (!list || typeof list.contains !== 'function') return false;
+    for (const name of KNOWN_SCROLLABLE_CLASSES) {
+      if (list.contains(name)) return true;
+    }
+  } catch {
+    // Ignore uncomputable nodes
   }
   return false;
 }

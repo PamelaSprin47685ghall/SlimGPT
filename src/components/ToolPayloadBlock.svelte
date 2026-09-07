@@ -3,7 +3,9 @@
   import { extractToolCallIds, loadToolFormatter, presentToolPayload } from '../lib/tool-presentation.js';
   import { copyText } from '../lib/clipboard.js';
 
-  let { tool } = $props();
+  let { tool, streaming = false, isError = false } = $props();
+  let userToggled = $state(false);
+  let manualOpen = $state(false);
   let copied = $state(false);
   let copyError = $state(false);
   let copiedId = $state(false);
@@ -17,6 +19,53 @@
   const presentation = $derived(presentToolPayload(tool?.payload, { formatter, raw: rawMode }));
   const displayRaw = $derived(presentation.format === 'RAW');
   const callIds = $derived(extractToolCallIds(tool));
+
+  // When streaming prop is explicitly provided (boolean), follow streaming. Otherwise default to true (expanded).
+  let isOpen = $state(true);
+
+  function toggleOpen() {
+    manualOpen = !isOpen;
+    isOpen = manualOpen;
+    userToggled = true;
+  }
+
+  $effect(() => {
+    // When streaming changes and user has not manually toggled:
+    if (!userToggled && typeof streaming === 'boolean') {
+      isOpen = streaming;
+    }
+  });
+
+  const toolName = $derived(tool?.name || 'tool');
+  const isSuccess = $derived(!isError && tool?.status !== 'failed');
+  const summaryStatus = $derived(isSuccess ? '✓' : '✗');
+
+  const keyArg = $derived.by(() => {
+    const payload = tool?.payload;
+    if (!payload) return '';
+    if (typeof payload === 'string') {
+      try {
+        const parsed = JSON.parse(payload);
+        if (typeof parsed === 'object' && parsed !== null) {
+          return extractKeyFromObject(parsed);
+        }
+      } catch {
+        return payload.slice(0, 40).replace(/\s+/g, ' ').trim();
+      }
+    } else if (typeof payload === 'object') {
+      return extractKeyFromObject(payload);
+    }
+    return '';
+  });
+
+  function extractKeyFromObject(obj) {
+    for (const key of ['query', 'q', 'url', 'search_query', 'command', 'action', 'prompt', 'code']) {
+      if (typeof obj[key] === 'string' && obj[key].trim()) return `${key}: ${obj[key].trim()}`;
+    }
+    const firstKey = Object.keys(obj)[0];
+    if (firstKey && typeof obj[firstKey] === 'string') return `${firstKey}: ${obj[firstKey].trim()}`;
+    return '';
+  }
 
   onMount(() => {
     loadToolFormatter().then((module) => { if (alive) formatter = module; })
@@ -73,8 +122,18 @@
   }
 </script>
 
-<div class="tool-payload-block" data-tool-kind={tool?.kind || ''}>
-  <div class="tool-code-header">
+<div class="tool-payload-block" data-tool-kind={tool?.kind || ''} class:collapsed={!isOpen}>
+  <div class="tool-summary-bar">
+    <button type="button" class="tool-summary-toggle" onclick={toggleOpen} aria-expanded={isOpen}>
+      <span class="tool-summary-status" class:is-error={!isSuccess}>{summaryStatus}</span>
+      <span class="tool-summary-name">{toolName}</span>
+      {#if keyArg}
+        <span class="tool-summary-arg" title={keyArg}>{keyArg}</span>
+      {/if}
+      <span class="tool-summary-toggle-text">{isOpen ? '收起 ▲' : '展开 ▼'}</span>
+    </button>
+  </div>
+  <div class="tool-code-header" hidden={!isOpen}>
     <span class="tool-code-language">{presentation.format}</span>
     <span class="tool-code-name" title={tool?.title || tool?.name || 'tool'}>
       {tool?.name || 'tool'}{tool?.title ? ` · ${tool.title}` : ''}
@@ -116,10 +175,43 @@
   {/if}
   <!-- Scrollable logs must be reachable by keyboard, even though they are read-only. -->
   <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-  <pre class="tool-toml-pre" role="region" tabindex="0" aria-label="工具内容，可滚动">{#if displayRaw}<code>{presentation.text}</code>{:else}<code class="hljs language-toml">{@html presentation.html}</code>{/if}</pre>
+  <pre class="tool-toml-pre" role="region" tabindex={isOpen ? '0' : '-1'} aria-label="工具内容，可滚动" aria-hidden={!isOpen} hidden={!isOpen}>{#if displayRaw}<code>{presentation.text}</code>{:else}<code class="hljs language-toml">{@html presentation.html}</code>{/if}</pre>
 </div>
 
 <style>
+  .tool-summary-bar {
+    display: flex;
+    align-items: center;
+    width: 100%;
+    background: color-mix(in srgb, var(--slim-soft) 76%, var(--slim-code));
+    border-bottom: 1px solid var(--slim-line);
+  }
+  .tool-payload-block.collapsed .tool-summary-bar {
+    border-bottom: none;
+  }
+  .tool-summary-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    min-height: 32px;
+    padding: 6px 12px;
+    background: transparent;
+    border: none;
+    font: inherit;
+    color: var(--slim-text);
+    cursor: pointer;
+    text-align: left;
+  }
+  .tool-summary-toggle:hover {
+    background: color-mix(in srgb, var(--slim-soft) 90%, var(--slim-code));
+  }
+  .tool-summary-status { font-weight: 700; color: #22735e; }
+  .tool-summary-status.is-error { color: var(--slim-danger); }
+  .tool-summary-name { font-weight: 600; font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .tool-summary-arg { font-size: 10.5px; color: var(--slim-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: min(50vw, 400px); }
+  .tool-summary-toggle-text { margin-left: auto; font-size: 10px; color: var(--slim-muted); flex: none; }
+
   .tool-code-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
   .tool-format-notice { padding: 8px 12px; font-size: 12px; color: var(--slim-muted); }
   .tool-call-ids { display: inline-flex; align-items: center; gap: 6px; overflow: hidden; }

@@ -34,6 +34,9 @@ function messageSection(message, level = 2) {
     ? `${tool.kind === 'tool-call' ? '工具调用' : '工具结果'} · ${heading(tool.name || message.name || 'Tool')}`
     : heading(message.name || ROLE_LABELS[message.role] || message.role || '消息');
   const parts = [];
+  if (message.role === 'assistant' && message.model) {
+    parts.push(`> 模型：${heading(message.model)}`);
+  }
   if (message.error || /^(?:failed|error)$/.test(message.status || '')) parts.push('> 生成异常。');
   else if (/^(?:cancelled|canceled|interrupted|incomplete|aborted|stopped)$/.test(message.status || '')) parts.push('> 此项生成已中断或未完成。');
   if (message.cacheRedacted) parts.push('> 此项来自本地缓存，其中的凭据字段已省略。');
@@ -71,6 +74,21 @@ export function buildConversationMarkdown(title, messages = [], options = {}) {
       }
     }
   }
+
+  const footerLines = [];
+  footerLines.push(`导出时间: ${new Date().toISOString()}`);
+  if (options.conversationId) footerLines.push(`会话标识: ${options.conversationId}`);
+  if (options.createTime) footerLines.push(`创建时间: ${options.createTime}`);
+  if (options.updateTime) footerLines.push(`更新时间: ${options.updateTime}`);
+  if (options.historyComplete === false) {
+    footerLines.push('历史状态: 局部不完整（历史尚未同步完整）');
+  }
+  const footer = [
+    '---',
+    ...footerLines,
+    '---',
+  ].join('\n');
+  sections.push(footer);
 
   return `${sections.join('\n\n')}\n`;
 }

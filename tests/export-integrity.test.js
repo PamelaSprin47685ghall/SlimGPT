@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildConversationMarkdown, markdownFilename } from '../src/lib/export.js';
+import { buildConversationMarkdown, markdownFilename, hasExportableMessage } from '../src/lib/export.js';
 
 test('export retains reasoning, tool calls, tool results and final answer as separate items', () => {
   const output = buildConversationMarkdown('Complete turn', [

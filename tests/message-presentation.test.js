@@ -7,6 +7,13 @@ test('model labels never invent a different family or version', () => {
   assert.equal(formatModelLabel('gpt-5.4-pro'), 'GPT-5.4-pro');
   assert.equal(formatModelLabel('text-o3-pro-latest'), 'o3-pro');
   assert.equal(formatModelLabel('custom-prototype-model'), 'custom-prototype-model');
+  assert.equal(formatModelLabel('o1-preview'), 'o1-preview');
+  assert.equal(formatModelLabel('o3-mini'), 'o3-mini');
+  assert.equal(formatModelLabel('o3-pro'), 'o3-pro');
+  assert.equal(formatModelLabel('g-12345678-code-reviewer'), 'GPT · code reviewer');
+  assert.equal(formatModelLabel('gizmo-translator'), 'GPT · translator');
+  assert.equal(formatModelLabel('Web'), '');
+  assert.equal(formatModelLabel('Mobile'), '');
 });
 
 test('all terminal message states stop streaming UI', () => {

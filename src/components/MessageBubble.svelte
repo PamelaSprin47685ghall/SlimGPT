@@ -7,11 +7,17 @@
 
   let {
     message,
+    onRetry = () => {},
+    onEdit = () => {},
+    onDismiss = () => {},
     onBranch = () => {},
   } = $props();
 
   let copied = $state(false);
   let copyError = $state(false);
+  let thoughtCopied = $state(false);
+  let thoughtCopyError = $state(false);
+  let thoughtCopyTimer = null;
   let userToggled = $state(false);
   let thoughtManualState = $state(false);
   let copyTimer = null;
@@ -27,7 +33,10 @@
     thoughtManualState = false;
     copied = false;
     copyError = false;
+    thoughtCopied = false;
+    thoughtCopyError = false;
     clearTimeout(copyTimer);
+    clearTimeout(thoughtCopyTimer);
   });
 
   const hasText = $derived(Boolean(String(message?.text || '').trim()));
@@ -47,13 +56,14 @@
 
   onDestroy(() => {
     clearTimeout(copyTimer);
+    clearTimeout(thoughtCopyTimer);
     for (const timer of codeCopyTimers.values()) clearTimeout(timer);
     codeCopyTimers.clear();
   });
 
   async function copyMessage() {
     const key = messageKey;
-    const text = String(message?.text || (message?.thought ? `【思考过程】\n${message.thought}` : ''));
+    const text = String(message?.text || (message?.thought ? message.thought : ''));
     if (!text) return;
     try {
       await copyText(text);
@@ -67,6 +77,25 @@
     }
     clearTimeout(copyTimer);
     copyTimer = setTimeout(() => { copied = false; copyError = false; }, 2400);
+  }
+
+  async function copyThought(e) {
+    e?.stopPropagation?.();
+    const key = messageKey;
+    const text = String(message?.thought || '');
+    if (!text) return;
+    try {
+      await copyText(text);
+      if (key !== messageKey) return;
+      thoughtCopied = true;
+      thoughtCopyError = false;
+    } catch {
+      if (key !== messageKey) return;
+      thoughtCopied = false;
+      thoughtCopyError = true;
+    }
+    clearTimeout(thoughtCopyTimer);
+    thoughtCopyTimer = setTimeout(() => { thoughtCopied = false; thoughtCopyError = false; }, 2400);
   }
 
   async function handleBubbleClick(event) {
@@ -93,6 +122,27 @@
       codeCopyTimers.delete(copyBtn);
     }, 2400));
   }
+
+  const errorDetail = $derived.by(() => {
+    if (!isError) return '';
+    const msgErr = message?.error;
+    if (typeof msgErr === 'string' && msgErr.trim()) return msgErr.trim();
+    if (typeof msgErr?.message === 'string' && msgErr.message.trim()) return msgErr.message.trim();
+    if (typeof msgErr?.detail === 'string' && msgErr.detail.trim()) return msgErr.detail.trim();
+    const metaErr = message?.metadata?.error;
+    if (typeof metaErr === 'string' && metaErr.trim()) return metaErr.trim();
+    if (typeof metaErr?.message === 'string' && metaErr.message.trim()) return metaErr.message.trim();
+    if (typeof metaErr?.detail === 'string' && metaErr.detail.trim()) return metaErr.detail.trim();
+    return '';
+  });
+
+  // Long assistant bubbles get a bottom toolbar
+  const showBottomToolbar = $derived.by(() => {
+    if (message?.tool) return false;
+    if (isUser && isError) return true;
+    if (!isUser && ((hasText && (message?.text?.length || 0) > 300) || isError)) return true;
+    return false;
+  });
 </script>
 
 <div
@@ -194,10 +244,17 @@
     <div class="message-bubble" onclick={handleBubbleClick}>
       {#if hasThought}
         <div class="thought-block" class:open={thoughtOpen}>
-          <button
-            type="button"
+          <div
             class="thought-header"
             onclick={toggleThought}
+            onkeydown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                toggleThought();
+              }
+            }}
+            role="button"
+            tabindex="0"
             aria-expanded={thoughtOpen}
           >
             <span class="thought-icon">💭</span>
@@ -205,8 +262,16 @@
             {#if message?.thinkingDuration}
               <span class="thought-duration">（用时 {message.thinkingDuration}）</span>
             {/if}
+            <button
+              type="button"
+              class="thought-copy-btn"
+              class:copied={thoughtCopied}
+              onclick={copyThought}
+              aria-label="复制思考过程"
+              title="复制思考过程"
+            >{thoughtCopied ? '已复制' : thoughtCopyError ? '复制失败' : '复制思考过程'}</button>
             <span class="thought-toggle">{thoughtOpen ? '收起 ▲' : '展开 ▼'}</span>
-          </button>
+          </div>
           {#if thoughtOpen}
             <IncrementalMarkdown class="thought-content" source={message.thought} streaming={isStreaming} />
           {/if}
@@ -214,7 +279,7 @@
       {/if}
 
       {#if message?.tool}
-        <ToolPayloadBlock tool={message.tool} />
+        <ToolPayloadBlock tool={message.tool} streaming={isStreaming} {isError} />
       {:else if hasText}
         <IncrementalMarkdown source={message.text} streaming={isStreaming} />
       {:else if !message?.tool && hasThought && isStreaming && !message?.endTurn}
@@ -232,10 +297,39 @@
           <strong>官方消息（非文本内容）</strong>
           <span>这条消息包含 SlimGPT 尚未识别的内容类型，已原样保留。可点击「暂时显示官方界面」查看完整内容。</span>
         </div>
-      {:else if !message?.tool && isError}
-        <div class="error-notice">⚠️ 消息生成失败或被官方界面中断</div>
       {:else if !message?.tool && !hasThought}
         <div class="empty-notice">（无文字内容）</div>
+      {/if}
+
+      {#if isError && !message?.tool}
+        <div class="error-footer-banner" role="alert">
+          <div class="error-banner-main">
+            <span class="error-banner-icon">⚠️</span>
+            <span class="error-banner-title">消息生成失败或被官方界面中断</span>
+          </div>
+          {#if errorDetail}
+            <div class="error-banner-detail">{errorDetail}</div>
+          {/if}
+        </div>
+      {/if}
+
+      {#if showBottomToolbar}
+        <div class="message-bottom-toolbar">
+          {#if isUser}
+            {#if isError}
+              <button type="button" class="bubble-action-btn retry-btn" onclick={() => onRetry(message)}>重试</button>
+              <button type="button" class="bubble-action-btn edit-btn" onclick={() => onEdit(message)}>编辑</button>
+              <button type="button" class="bubble-action-btn dismiss-btn" onclick={() => onDismiss(message)}>放弃</button>
+            {:else}
+              <button type="button" class="bubble-action-btn edit-btn" onclick={() => onEdit(message)}>编辑</button>
+            {/if}
+          {:else}
+            <button type="button" class="bubble-action-btn copy-btn" class:copied onclick={copyMessage}>{copied ? '已复制' : copyError ? '复制失败' : '复制回答'}</button>
+            {#if isError}
+              <button type="button" class="bubble-action-btn retry-btn" onclick={() => onRetry(message)}>重试</button>
+            {/if}
+          {/if}
+        </div>
       {/if}
       {#if message?.cacheRedacted}
         <div class="unrecognized-notice" role="note">此项来自本地缓存，其中的凭据字段已省略；重新同步后可查看服务器提供的内容。</div>
@@ -247,6 +341,28 @@
 <style>
   .message-bubble {
     position: relative;
+  }
+  .thought-copy-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    margin-right: 8px;
+    padding: 1px 6px;
+    border: 1px solid var(--slim-line);
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--slim-surface) 80%, transparent);
+    color: var(--slim-muted);
+    font: 500 9.5px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    cursor: pointer;
+    transition: color 0.15s ease, border-color 0.15s ease;
+  }
+  .thought-copy-btn:hover {
+    color: var(--f7-theme-color);
+    border-color: var(--f7-theme-color);
+  }
+  .thought-copy-btn.copied {
+    color: var(--f7-theme-color);
+    border-color: var(--f7-theme-color);
   }
   .role-user .message-meta {
     flex-direction: row-reverse;

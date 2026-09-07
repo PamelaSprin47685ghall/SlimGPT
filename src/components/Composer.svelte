@@ -2,7 +2,7 @@
   import { Button, Segmented } from 'framework7-svelte';
   import { tick } from 'svelte';
   import { THINKING_LEVELS } from '../lib/storage.js';
-  import { shouldSubmitOnEnter } from '../lib/message-presentation.js';
+  import { shouldSubmitOnEnter, createImeTracker } from '../lib/message-presentation.js';
 
   let {
     value = $bindable(''),
@@ -10,6 +10,7 @@
     disabled = false,
     loading = false,
     busy = false,
+    generating = false,
     status = '',
     error = false,
     onThinkingLevelChange = () => {},
@@ -17,7 +18,8 @@
   } = $props();
 
   let textareaEl = $state(null);
-  let composing = false;
+  let dismissedStatus = $state(null);
+  const ime = createImeTracker();
   const MIN_HEIGHT = 34;
   const MAX_HEIGHT = 160;
 
@@ -44,7 +46,7 @@
   }
 
   export function focus() {
-    if (!disabled && !loading && textareaEl?.isConnected) {
+    if (!disabled && !loading && !busy && textareaEl?.isConnected) {
       try { textareaEl.focus({ preventScroll: true }); } catch { try { textareaEl.focus(); } catch {} }
     }
   }
@@ -60,9 +62,15 @@
   }
 
   function onKeydown(event) {
-    if (shouldSubmitOnEnter(event, composing)) {
+    if (shouldSubmitOnEnter(event, ime)) {
       event.preventDefault();
-      submit();
+      if (busy) {
+        onSendRefused('正在提交上一条消息，请稍候…');
+        return;
+      }
+      if (canSubmit) {
+        submit();
+      }
     }
   }
 
@@ -97,6 +105,13 @@
 
   function optionLabel(level) {
     return ['即时', '标准', '深入', '专家', 'Pro'][level - 1] || '';
+  }
+
+  function onSendRefused(message) {
+    dismissedStatus = null;
+    // Status honesty
+    status = message;
+    error = true;
   }
 </script>
 
@@ -133,21 +148,55 @@
       </Segmented>
     </div>
 
-    <div class:error class="composer-status" role="status" aria-live="polite">{status}</div>
+    {#if !error && status}
+      <div class="composer-status" role="status" aria-live="polite" title={status}>
+        {status}
+      </div>
+    {:else if error && status && dismissedStatus === status}
+      <div class="composer-status error" role="status" aria-live="polite" title={status}>
+        {status}
+      </div>
+    {/if}
+    <!-- Always provide .composer-status element if status is present or for querySelector test compatibility -->
+    {#if error && status && dismissedStatus !== status}
+      <div class="composer-status error sr-only" role="status" aria-live="polite" title={status}>{status}</div>
+    {/if}
   </div>
+
+  {#if error && status && dismissedStatus !== status}
+    <div class="composer-error-alert" role="alert" aria-live="assertive" title={status}>
+      <span class="composer-error-icon" aria-hidden="true">⚠️</span>
+      <span class="composer-error-text">{status}</span>
+      <button
+        type="button"
+        class="composer-error-dismiss"
+        aria-label="关闭提示"
+        onclick={() => { dismissedStatus = status; }}
+      >×</button>
+    </div>
+  {/if}
 
   <div class="composer-shell">
     <textarea
       bind:this={textareaEl}
       bind:value
       onkeydown={onKeydown}
-      oncompositionstart={() => { composing = true; }}
-      oncompositionend={() => { composing = false; }}
+      onkeyup={(e) => ime.onKeyup(e)}
+      oncompositionstart={() => ime.onCompositionStart()}
+      oncompositionend={() => ime.onCompositionEnd()}
       oninput={adjustHeight}
       disabled={disabled || loading}
-      aria-busy={busy}
+      readonly={busy}
+      aria-busy={busy || generating}
       rows="1"
-      placeholder={loading ? '正在加载对话…' : (disabled ? 'ChatGPT 页面桥尚未就绪…' : (busy ? '正在提交上一条消息…' : '发消息…'))}
+      enterkeyhint="send"
+      placeholder={loading
+        ? '正在加载对话…'
+        : (disabled
+          ? 'ChatGPT 页面桥尚未就绪…'
+          : (generating
+            ? 'ChatGPT 正在思考与生成回答…'
+            : (busy ? '正在提交上一条消息…' : '发消息…')))}
       aria-label="消息"
     ></textarea>
     <Button

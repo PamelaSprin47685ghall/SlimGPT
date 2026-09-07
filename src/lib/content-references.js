@@ -18,7 +18,7 @@ export function renderContentReferences(text, metadata = {}) {
     if (type === 'cite' || type === 'filecite') {
       const known = [...(references.get(marker) || [])];
       for (const id of parts) known.push(...(references.get(id) || []));
-      const unique = [...new Map(known.map((item) => [item.url, item])).values()];
+      const unique = [...new Map(known.map((item) => [item.url, item])).values()].filter((item) => item.url);
       return unique.length ? unique.map(link).join(' ') : '〔来源信息未同步〕';
     }
     if (type === 'entity') {
@@ -33,7 +33,7 @@ export function renderContentReferences(text, metadata = {}) {
       products: '商品卡片', product: '商品卡片', finance: '行情图表',
       forecast: '天气卡片', schedule: '赛程', standing: '排名',
     };
-    const known = references.get(marker) || [];
+    const known = (references.get(marker) || []).filter((item) => item.url);
     return known.length ? known.map(link).join(' ') : `〔${labels[type] || '官方卡片'}：暂未展开〕`;
   }));
 }

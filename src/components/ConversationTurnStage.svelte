@@ -8,9 +8,13 @@
     unresolved = [],
     activeIndex = 0,
     conversationKey = 'default',
+    streaming = false,
     onActiveChange = () => {},
     onBranch = () => {},
     onRepairProtocol = () => {},
+    onRetry = () => {},
+    onDismiss = () => {},
+    onEdit = () => {},
   } = $props();
 
   let scroller = $state(null);
@@ -20,11 +24,13 @@
   let previousTurnCount = 0;
   let tailPinned = $state(false);
   let canScroll = $state(false);
+  let scrollProgress = $state(0);
   let boundaryDirection = $state(0);
   let boundaryProgress = $state(0);
   let boundaryOffsetPx = $state(0);
   let boundaryReady = $state(false);
   let boundaryCommitDelta = 0;
+  let boundarySettleTimer = null;
   let lastAdvanceAt = 0;
   let touchStartY = null;
   let edgeSettleToken = 0;
@@ -38,6 +44,15 @@
   );
   const hasRenderableContent = $derived(Boolean(activeTurn || showUnresolved));
   const TAIL_STICKY_DISTANCE = 56;
+  const canPrev = $derived(activeIndex > 0);
+  const canNext = $derived(activeIndex < turnCount - 1);
+  const replyList = $derived(activeTurn?.replies || []);
+  const thoughtIdx = $derived(replyList.findIndex((message) => message?.thought));
+  const toolIdx = $derived(replyList.findIndex((message) => message?.tool));
+  const answerIdx = $derived(replyList.findIndex((message) => (message?.role === 'assistant') && (message?.text || message?.thought)));
+  const hasThought = $derived(thoughtIdx >= 0);
+  const hasTools = $derived(toolIdx >= 0);
+  const hasAnswer = $derived(answerIdx >= 0);
 
   $effect(() => {
     const key = conversationKey;
@@ -114,11 +129,50 @@
   }
 
   function resetBoundaryRunway() {
+    cancelBoundarySettle();
     boundaryDirection = 0;
     boundaryProgress = 0;
     boundaryOffsetPx = 0;
     boundaryReady = false;
     boundaryCommitDelta = 0;
+  }
+
+  function cancelBoundarySettle() {
+    if (boundarySettleTimer) {
+      clearTimeout(boundarySettleTimer);
+      boundarySettleTimer = null;
+    }
+  }
+
+  // Runway honesty: a ready-but-idle overlay must never freeze over content.
+  // ~180ms after the last wheel/touch/key nudge with no further activity, a
+  // ready runway auto-commits the turn change; an unready one decays away.
+  function scheduleBoundarySettle() {
+    cancelBoundarySettle();
+    boundarySettleTimer = setTimeout(() => {
+      boundarySettleTimer = null;
+      if (!boundaryDirection) return;
+      const direction = boundaryDirection;
+      if (boundaryReady && canAdvance(direction)) {
+        resetBoundaryRunway();
+        advance(direction);
+      } else {
+        resetBoundaryRunway();
+      }
+    }, 180);
+  }
+
+  function prefersReducedMotion() {
+    try {
+      return typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+    } catch {
+      return false;
+    }
+  }
+
+  function runwayOffset(direction) {
+    if (!scroller || prefersReducedMotion()) return 0;
+    return -direction * Math.pow(boundaryProgress, 0.85) * Math.min(180, scroller.clientHeight * 0.25);
   }
 
   function pushBoundary(direction, amount) {
@@ -132,19 +186,21 @@
 
     if (boundaryDirection && boundaryDirection !== direction) {
       boundaryProgress = Math.max(0, boundaryProgress - magnitude / distance);
-      boundaryOffsetPx = -boundaryDirection * Math.pow(boundaryProgress, 0.85) * Math.min(180, scroller.clientHeight * 0.25);
+      boundaryOffsetPx = runwayOffset(boundaryDirection);
       boundaryReady = boundaryProgress >= 1;
       boundaryCommitDelta = 0;
       if (boundaryProgress <= 0.001) resetBoundaryRunway();
+      else scheduleBoundarySettle();
       return true;
     }
 
     if (!boundaryDirection) boundaryDirection = direction;
     if (boundaryProgress < 1) {
       boundaryProgress = Math.min(1, boundaryProgress + magnitude / distance);
-      boundaryOffsetPx = -direction * Math.pow(boundaryProgress, 0.85) * Math.min(180, scroller.clientHeight * 0.25);
+      boundaryOffsetPx = runwayOffset(direction);
       boundaryReady = boundaryProgress >= 1;
       boundaryCommitDelta = 0;
+      scheduleBoundarySettle();
       return true;
     }
 
@@ -152,6 +208,8 @@
     if (boundaryCommitDelta >= 36) {
       resetBoundaryRunway();
       advance(direction);
+    } else {
+      scheduleBoundarySettle();
     }
     return true;
   }
@@ -179,10 +237,13 @@
     canScroll = scroller.scrollHeight > scroller.clientHeight + 4;
     const remaining = Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop);
     tailPinned = lastTurnActive && remaining <= TAIL_STICKY_DISTANCE;
+    const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    scrollProgress = max > 0 ? Math.max(0, Math.min(1, scroller.scrollTop / max)) : 0;
   }
 
   function advance(direction) {
     if (!turns.length) return;
+    cancelBoundarySettle();
     const now = performance.now();
     if (now - lastAdvanceAt < 240) return;
     const next = Math.max(0, Math.min(turns.length - 1, activeIndex + direction));
@@ -206,35 +267,76 @@
     updateTailPinned();
   }
 
+  function stepTurn(direction) {
+    if (!canAdvance(direction)) return;
+    cancelEdgeSettle();
+    resetBoundaryRunway();
+    advance(direction);
+  }
+
+  function scrollElementWithinTurn(element) {
+    if (!scroller || !element) return;
+    cancelEdgeSettle();
+    resetBoundaryRunway();
+    const scrollerBox = scroller.getBoundingClientRect();
+    const elementBox = element.getBoundingClientRect();
+    const top = scroller.scrollTop + elementBox.top - scrollerBox.top - 12;
+    const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    scroller.scrollTo({ top: Math.max(0, Math.min(max, top)), behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
+    updateTailPinned();
+  }
+
+  // Jump chips scroll within the mounted turn only; they never change turns.
+  function scrollToSection(kind) {
+    if (!scroller || !content) return;
+    if (kind === 'question') {
+      scrollElementWithinTurn(content.querySelector('.turn-question'));
+      return;
+    }
+    const index = kind === 'thought' ? thoughtIdx : kind === 'tool' ? toolIdx : answerIdx;
+    if (index == null || index < 0) return;
+    scrollElementWithinTurn(content.querySelectorAll('.turn-message.turn-reply')[index]);
+  }
+
   function isEditableTarget(target) {
-    if (!(target instanceof Element)) return false;
-    return Boolean(target.closest('input, textarea, select, button, a, pre, .table-wrap, [contenteditable="true"], [role="textbox"]'));
+    return Boolean(target.closest('input, textarea, select, [contenteditable="true"], [role="textbox"]'));
+  }
+
+  function selectionActive() {
+    try {
+      return Boolean(window.getSelection?.()?.toString());
+    } catch {
+      return false;
+    }
   }
 
   function handleKeydown(event) {
     if (!hasRenderableContent || !scroller || isEditableTarget(event.target)) return;
     if (event.altKey || event.ctrlKey || event.metaKey) return;
 
-    if (event.key === 'ArrowLeft') {
-      if (canAdvance(-1)) {
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+      // Horizontal arrows still page turns from inside pre/.table-wrap: only a
+      // real text selection or Shift (selection extension) keeps native behavior.
+      if (event.shiftKey || selectionActive()) return;
+      const direction = event.key === 'ArrowLeft' ? -1 : 1;
+      if (canAdvance(direction)) {
         event.preventDefault();
         cancelEdgeSettle();
         resetBoundaryRunway();
-        advance(-1);
-      }
-      return;
-    }
-    if (event.key === 'ArrowRight') {
-      if (canAdvance(1)) {
-        event.preventDefault();
-        cancelEdgeSettle();
-        resetBoundaryRunway();
-        advance(1);
+        advance(direction);
       }
       return;
     }
 
     if (!['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End'].includes(event.key)) return;
+    // Shift/selection keeps native behavior everywhere below.
+    if (event.shiftKey || selectionActive()) return;
+    // Vertical arrows keep native scroll-container behavior: when focus sits
+    // inside a nested scroller that can still consume the motion, let it.
+    if ((event.key === 'ArrowUp' || event.key === 'ArrowDown') && event.target instanceof Element) {
+      const probe = event.key === 'ArrowDown' ? 40 : -40;
+      if (nestedScrollerCanConsume(event.target, scroller, probe)) return;
+    }
     cancelEdgeSettle();
 
     if (event.key === 'Home' || event.key === 'End') {
@@ -321,6 +423,7 @@
 
   onDestroy(() => {
     cancelEdgeSettle();
+    cancelBoundarySettle();
   });
 </script>
 
@@ -330,13 +433,38 @@
   {#if hasRenderableContent}
     <div class="single-message-position turn-stage-header-badges" aria-live="polite">
       {#if activeTurn}
-        <span>{activeIndex + 1} / {turns.length}</span>
+        <span class="turn-stepper" role="group" aria-label="问答轮次切换">
+          <button
+            type="button"
+            class="turn-step"
+            disabled={!canPrev}
+            aria-label="上一轮问答"
+            title="上一轮问答 (←)"
+            onclick={() => stepTurn(-1)}
+          >‹</button>
+          <span class="turn-count">{activeIndex + 1} / {turns.length}</span>
+          <button
+            type="button"
+            class="turn-step"
+            disabled={!canNext}
+            aria-label="下一轮问答"
+            title="下一轮问答 (→)"
+            onclick={() => stepTurn(1)}
+          >›</button>
+        </span>
         <span>一轮问答</span>
+        {#if canScroll}
+          <span class="turn-scroll-progress" aria-hidden="true"><i style={`width:${Math.round(scrollProgress * 100)}%`}></i></span>
+        {/if}
         {#if lastTurnActive && canScroll}
           {#if tailPinned}
-            <span class="tail-follow-pill active" title="当前紧跟最新回复流式输出">
-              <span class="tail-follow-dot"></span>跟随输出
-            </span>
+            {#if streaming}
+              <span class="tail-follow-pill active" title="当前紧跟最新回复流式输出">
+                <span class="tail-follow-dot"></span>跟随输出
+              </span>
+            {:else}
+              <span class="tail-follow-pill settled" title="已在底部">已在底部</span>
+            {/if}
           {:else}
             <button
               type="button"
@@ -353,6 +481,20 @@
         <span>解析待修复</span>
       {/if}
     </div>
+    {#if activeTurn && (hasThought || hasTools || hasAnswer)}
+      <nav class="turn-jump-chips" aria-label="本轮内容跳转">
+        <button type="button" onclick={() => scrollToSection('question')} title="跳到本轮提问">提问</button>
+        {#if hasThought}
+          <button type="button" onclick={() => scrollToSection('thought')} title="跳到本轮思考过程">思考</button>
+        {/if}
+        {#if hasTools}
+          <button type="button" onclick={() => scrollToSection('tool')} title="跳到本轮工具调用">工具</button>
+        {/if}
+        {#if hasAnswer}
+          <button type="button" onclick={() => scrollToSection('answer')} title="跳到本轮回答">回答</button>
+        {/if}
+      </nav>
+    {/if}
     <div
       class="single-message-scroller"
       bind:this={scroller}
@@ -371,11 +513,11 @@
       >
         {#if activeTurn}
           <section class="turn-message turn-question">
-            <MessageBubble message={activeTurn.user} {onBranch} />
+            <MessageBubble message={activeTurn.user} {onBranch} {onRetry} {onDismiss} {onEdit} />
           </section>
           {#each activeTurn.replies as reply (reply.observationKey || reply.itemId || reply.id || reply.nodeId)}
             <section class={`turn-message turn-reply role-${reply?.role || 'unknown'}`}>
-              <MessageBubble message={reply} {onBranch} />
+              <MessageBubble message={reply} {onBranch} {onRetry} {onDismiss} {onEdit} />
             </section>
           {/each}
         {/if}
@@ -395,7 +537,7 @@
                       <pre>{JSON.stringify(reply.ownershipFailure, null, 2)}</pre>
                     </details>
                   {/if}
-                  <MessageBubble message={reply} {onBranch} />
+                  <MessageBubble message={reply} {onBranch} {onRetry} {onDismiss} {onEdit} />
                 </section>
               {/each}
             </div>
@@ -416,7 +558,7 @@
           <span class="turn-boundary-arrow">{boundaryDirection > 0 ? '↓' : '↑'}</span>
           <span class="turn-boundary-text">
             {#if boundaryReady}
-              {boundaryDirection > 0 ? '松开或继续向下进入下一轮问答' : '松开或继续向上返回上一轮问答'}
+              {boundaryDirection > 0 ? '继续滚动进入下一轮问答' : '继续滚动返回上一轮问答'}
             {:else}
               {boundaryDirection > 0 ? '继续向下滚动 · 下一轮问答' : '继续向上滚动 · 上一轮问答'}
             {/if}
@@ -506,5 +648,120 @@
   .turn-boundary-arrow {
     font-weight: bold;
     font-size: 12px;
+  }
+  .turn-stepper {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+  }
+  .turn-step {
+    display: inline-grid;
+    place-items: center;
+    min-width: 22px;
+    height: 22px;
+    padding: 0 4px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--slim-muted);
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .turn-step:hover:not(:disabled) {
+    background: var(--slim-soft);
+    border-color: var(--slim-line);
+    color: var(--f7-theme-color);
+  }
+  .turn-step:disabled {
+    opacity: 0.35;
+    cursor: default;
+  }
+  .turn-count {
+    min-width: 44px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+  }
+  .turn-scroll-progress {
+    display: inline-block;
+    width: 56px;
+    height: 3px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--slim-line) 70%, transparent);
+    overflow: hidden;
+    vertical-align: middle;
+  }
+  .turn-scroll-progress > i {
+    display: block;
+    height: 100%;
+    border-radius: inherit;
+    background: color-mix(in srgb, var(--f7-theme-color) 65%, transparent);
+  }
+  .turn-jump-chips {
+    position: absolute;
+    top: 44px;
+    right: 16px;
+    z-index: 2;
+    display: inline-flex;
+    gap: 4px;
+    padding: 3px;
+    border: 1px solid var(--slim-line);
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--slim-bg) 92%, transparent);
+    backdrop-filter: blur(8px);
+    pointer-events: auto;
+  }
+  .turn-jump-chips button {
+    padding: 2px 9px;
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--slim-muted);
+    font-size: 10px;
+    line-height: 1.6;
+    cursor: pointer;
+  }
+  .turn-jump-chips button:hover {
+    background: var(--slim-soft);
+    color: var(--f7-theme-color);
+  }
+  .tail-follow-pill.settled {
+    background: var(--slim-surface);
+    color: var(--slim-muted);
+    border: 1px solid var(--slim-line);
+  }
+  .turn-boundary-progress {
+    position: absolute;
+    left: 18px;
+    right: 18px;
+    bottom: 9px;
+    height: 3px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--slim-line) 75%, transparent);
+    overflow: hidden;
+  }
+  .turn-boundary-progress::after {
+    content: "";
+    display: block;
+    height: 100%;
+    width: var(--progress, 0%);
+    border-radius: inherit;
+    background: var(--f7-theme-color);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .conversation-turn-content {
+      will-change: auto;
+    }
+    .tail-follow-dot {
+      animation: none;
+    }
+    .turn-boundary-pill,
+    .turn-boundary-pill.pill-ready {
+      transform: none;
+      transition: none;
+    }
+    .turn-boundary-progress::after {
+      transition: none;
+    }
   }
 </style>
