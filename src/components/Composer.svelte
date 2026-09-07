@@ -18,7 +18,6 @@
     onSend = () => {},
     onStop = () => {},
     onCancelSend = () => {},
-    onRetry = null,
     onReturnToLatestBranch = null,
   } = $props();
 
@@ -44,6 +43,9 @@
   let historyDraft = $state('');
 
   const canSubmit = $derived(!disabled && !loading && !busy && !generating && !readonlyBranch && Boolean(value.trim()));
+  // Reasons-not-dead-buttons: the slot stays clickable; this only drives the
+  // `aria-disabled` + `.composer-send-disabled` look. Real guards live in submit().
+  const sendAriaDisabled = $derived(generating ? (disabled || loading) : !canSubmit);
   const sendTitle = $derived(readonlyBranch ? '当前正在只读查看历史分支；请切回最新分支后再发送' : '发送');
   const showCharCount = $derived(value.length > 500);
   const charCountWarn = $derived(value.length > 30000);
@@ -112,8 +114,19 @@
       showLocalNotice('正在提交上一条消息，请稍候…');
       return;
     }
+    if (disabled) {
+      showLocalNotice('ChatGPT 页面桥尚未就绪，稍候再试');
+      return;
+    }
+    if (loading) {
+      showLocalNotice('正在加载对话，请稍候…');
+      return;
+    }
     const message = value.trim();
-    if (!message || disabled || loading) return;
+    if (!message) {
+      showLocalNotice('消息为空，未发送');
+      return;
+    }
     clearLocalNotice();
     onSend(message, {
       thinkingLevel,
@@ -123,13 +136,20 @@
   }
 
   // Structural send slot: `.composer-shell .send-button` ALWAYS exists so a
-  // programmatic `.click()` never throws on a missing node. In generating
-  // mode the same 34px circular slot becomes the stop control (stop-mode
-  // class, ■ icon, onStop action, disabled only on bridge/loading); in
-  // send mode it keeps the existing disabled send + readonly reason.
+  // programmatic `.click()` never throws on a missing node. The slot never
+  // uses the HTML `disabled` attribute (it would swallow clicks); instead
+  // `aria-disabled` + `.composer-send-disabled` render the disabled look
+  // while every click still reaches submit()/onStop so the exact refusal
+  // reason surfaces as a notice. In generating mode the same 34px slot
+  // becomes the stop control (stop-mode class, ■ icon, onStop action,
+  // aria-disabled only on bridge/loading); in send mode it keeps the
+  // readonly reason via submit().
   function handleSlotClick() {
     if (generating) {
-      if (disabled || loading) return;
+      if (disabled || loading) {
+        showLocalNotice('ChatGPT 页面桥尚未就绪，稍候再试');
+        return;
+      }
       onStop();
       return;
     }
@@ -209,15 +229,6 @@
     adjustHeight();
   }
 
-  function retryCurrentDraft() {
-    dismissedStatus = status;
-    if (onRetry) {
-      onRetry();
-      return;
-    }
-    if (value.trim()) submit();
-  }
-
   function afterHistoryJump() {
     adjustHeight();
     queueMicrotask(() => {
@@ -230,16 +241,43 @@
     });
   }
 
-  // ArrowUp with an empty textarea recalls this conversation's last sent
-  // user text; ArrowDown moves forward again. Returns true when handled.
+  // Caret-line predicates (pure; mirrored in tests/composer-converge5.test.js):
+  // first line ⇔ no '\n' before selectionStart; last line ⇔ no '\n' after it.
+  function isCaretOnFirstLine(text, selectionStart) {
+    const value = String(text || '');
+    const index = Math.max(0, Math.min(selectionStart ?? value.length, value.length));
+    return !value.slice(0, index).includes('\n');
+  }
+
+  function isCaretOnLastLine(text, selectionStart) {
+    const value = String(text || '');
+    const index = Math.max(0, Math.min(selectionStart ?? value.length, value.length));
+    return !value.slice(index).includes('\n');
+  }
+
+  // Caret-aware history recall: ArrowUp recalls only from the first line,
+  // ArrowDown advances only from the last line. Any other caret position or
+  // a non-collapsed selection keeps native caret movement so cursor motion
+  // never destroys edited text. Typing exits recall mode (onTextareaInput).
+  // Returns true when handled.
   function recallHistory(event) {
     if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return false;
     if (event.shiftKey || event.ctrlKey || event.metaKey || event.altKey) return false;
     if (ime.isComposing) return false;
     const list = Array.isArray(recentUserMessages) ? recentUserMessages : [];
+    if (!list.length) return false;
+    if (textareaEl?.isConnected) {
+      const start = textareaEl.selectionStart ?? value.length;
+      const end = textareaEl.selectionEnd ?? value.length;
+      if (start !== end) return false;
+      if (event.key === 'ArrowUp' && !isCaretOnFirstLine(value, start)) return false;
+      if (event.key === 'ArrowDown' && !isCaretOnLastLine(value, start)) return false;
+    } else if (event.key === 'ArrowUp' && historyIndex === -1 && value !== '') {
+      // No caret info (unfocused): keep the old empty-only behavior so a
+      // blind recall never clobbers an edited draft.
+      return false;
+    }
     if (event.key === 'ArrowUp') {
-      if (historyIndex === -1 && value !== '') return false;
-      if (!list.length) return false;
       event.preventDefault();
       if (historyIndex === -1) {
         historyDraft = value;
@@ -329,11 +367,12 @@
           >{optionLabel(item.level)}</Button>
         {/each}
       </Segmented>
+      <div class="composer-thinking-caption">部分模型忽略此设置（仅推理模型生效）</div>
     </div>
 
     {#if busy}
       <div class="composer-sending" role="status" title="正在等待官方输入框确认">
-        <span>发送中…{sendRemaining}s</span>
+        <span>发送中…{sendRemaining}s（超时自动取消）</span>
         <button type="button" class="composer-cancel-send-btn" onclick={() => onCancelSend()} title="不再等待，直接按发送失败处理（草稿保留）">取消等待</button>
       </div>
     {/if}
@@ -365,13 +404,7 @@
     <div class="composer-error-alert" role="alert" aria-live="assertive" title={status}>
       <span class="composer-error-icon" aria-hidden="true">⚠️</span>
       <span class="composer-error-text">{status}</span>
-      <button
-        type="button"
-        class="composer-error-retry"
-        aria-label="就地重试"
-        title="用当前草稿重试发送"
-        onclick={retryCurrentDraft}
-      >重试</button>
+      <span class="composer-error-hint">请在上方失败卡片重试或改写</span>
       <button
         type="button"
         class="composer-error-dismiss"
@@ -418,11 +451,11 @@
       >回到最新分支</button>
     {/if}
       <Button
-      class={`send-button${generating ? ' stop-mode stop-button' : ''}`}
+      class={`send-button${generating ? ' stop-mode stop-button' : ''}${sendAriaDisabled ? ' composer-send-disabled' : ''}`}
         fill
         round
       style={generating ? 'font-size: 13px;' : undefined}
-      disabled={generating ? (disabled || loading) : !canSubmit}
+      aria-disabled={sendAriaDisabled}
       onClick={handleSlotClick}
       aria-label={generating ? '停止回答' : '发送'}
       title={generating ? '停止回答' : sendTitle}

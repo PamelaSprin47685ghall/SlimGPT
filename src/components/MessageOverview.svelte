@@ -30,6 +30,46 @@
       .trim();
   }
 
+  // Rank11 code-aware overview: when the filter query matches inside a
+  // fenced code block, keep the matching code line in the preview instead
+  // of stripping the hit.
+  function findCodeHitLine(text, query) {
+    const q = String(query || '').trim().toLowerCase();
+    if (!q) return '';
+    const blocks = String(text || '').match(/```[\s\S]*?(?:```|$)/g) || [];
+    for (const block of blocks) {
+      const lines = block.replace(/```[^\n]*\n?/, '').replace(/```\s*$/, '').split('\n');
+      for (const line of lines) {
+        if (line.toLowerCase().includes(q)) {
+          const hit = line.trim().slice(0, 120);
+          if (hit) return hit;
+        }
+      }
+    }
+    return '';
+  }
+
+  function findAnswerMessage(turn) {
+    return turn?.replies?.find((message) => message?.role === 'assistant' && !message?.tool && (message?.text || message?.thought)) ||
+      turn?.replies?.find((message) => !message?.tool && (message?.text || message?.thought)) ||
+      turn?.replies?.find((message) => message?.text || message?.thought);
+  }
+
+  function answerPreview(turn, index, query) {
+    const answerMsg = findAnswerMessage(turn);
+    const raw = answerMsg?.text || answerMsg?.thought || '';
+    const hit = findCodeHitLine(raw, query);
+    if (hit) return hit;
+    return clean(raw);
+  }
+
+  function questionPreview(turn, query) {
+    const raw = turn?.user?.text || turn?.user?.thought || '';
+    const hit = findCodeHitLine(raw, query);
+    if (hit) return hit;
+    return questionText(turn);
+  }
+
   function getStreamingFallback(turn) {
     const hasThought = turn?.replies?.some((m) => m?.thought || m?.isThinking);
     return hasThought ? '正在思考…' : '正在生成…';
@@ -164,6 +204,15 @@
       aria-label="过滤问答轮次"
       onkeydown={handleFilterKeydown}
     />
+    {#if filterQuery}
+      <button
+        type="button"
+        class="overview-filter-clear"
+        onclick={() => filterQuery = ''}
+        aria-label="清空过滤"
+        title="一键清空过滤"
+      >一键清空</button>
+    {/if}
   </div>
 
   <div class="overview-list" bind:this={listEl} onkeydown={handleListKeydown} role="region" aria-label="问答轮次列表">
@@ -177,8 +226,8 @@
       </div>
     {:else}
       {#each filteredTurns as { turn, index } (turn.id || index)}
-        {@const query = questionText(turn)}
-        {@const answer = answerText(turn)}
+        {@const query = questionPreview(turn, filterQuery)}
+        {@const answer = answerPreview(turn, index, filterQuery)}
         {@const tools = toolCount(turn)}
         {@const branch = hasBranch(turn)}
         {@const isStreaming = streaming && index === effectiveStreamingIndex}

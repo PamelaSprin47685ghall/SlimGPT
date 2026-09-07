@@ -17,6 +17,7 @@ export function prioritizeBanners({
   conversationBlockingLoad = false,
   conversationTimedOut = false,
   dismissedBannerIds = null,
+  browserOffline = false,
 } = {}) {
   const banners = [];
 
@@ -86,10 +87,23 @@ export function prioritizeBanners({
     });
   }
 
+  // Priority 5: native browser offline hint. Lowest precedence: it never
+  // overrides bridge-error / sync-error, and auto-clears when the browser
+  // goes back online (browserOffline flips false). Always shown while offline.
+  if (browserOffline) {
+    banners.push({
+      id: 'network-offline',
+      priority: 5,
+      level: 'offline',
+      title: '网络已断开',
+      message: '浏览器处于离线状态，请检查网络连接；网络恢复后此提醒会自动消失。',
+      actionKey: null,
+    });
+  }
   // Session-memory dismissal: notice-level (non-error) banners the user closed
   // stay hidden; error-level banners (bridge-error, sync-error) are never dismissed.
   if (dismissedBannerIds?.size) {
-    return banners.filter((banner) => banner.level === 'error' || !dismissedBannerIds.has(banner.id));
+    return banners.filter((banner) => banner.level === 'error' || banner.id === 'network-offline' || !dismissedBannerIds.has(banner.id));
   }
   return banners;
 }
@@ -206,6 +220,61 @@ export function trapModalKeydown(event, modalElement, onClose) {
 /**
  * Returns dynamic accessible name for the mobile scrim button.
  */
+/** localStorage key for notice-level dismissed banner ids (string set). */
+export const DISMISSED_NOTICES_STORAGE_KEY = 'slimgpt:dismissed-notices';
+
+/** Banner levels whose dismissals must never persist (always resurface). */
+const NON_PERSISTED_DISMISSAL_LEVELS = new Set(['error', 'warning', 'offline']);
+
+/** True when a dismissal may persist. Only notice-level (info/notice) persists. */
+export function isPersistableBannerDismissal(bannerOrLevel) {
+  const level = typeof bannerOrLevel === 'string' ? bannerOrLevel : bannerOrLevel && bannerOrLevel.level;
+  if (typeof level !== 'string' || level.length === 0) return false;
+  return !NON_PERSISTED_DISMISSAL_LEVELS.has(level);
+}
+/** Persists notice ids as JSON array. Denied storage never throws. */
+export function saveDismissedNoticeIds(ids, storage) {
+  const store = storage || (typeof window !== 'undefined' ? window.localStorage : null);
+  if (!store || !store.setItem) return;
+  try {
+    const list = ids instanceof Set ? [...ids] : (Array.isArray(ids) ? ids : []);
+    const clean = list.filter((id) => typeof id === 'string' && id.length > 0);
+    store.setItem(DISMISSED_NOTICES_STORAGE_KEY, JSON.stringify(clean));
+  } catch {
+    // Private-mode / denied storage: session memory still applies.
+  }
+}
+/** Loads persisted notice ids. Corrupt/missing/denied storage yields empty Set. */
+export function loadDismissedNoticeIds(storage) {
+  const store = storage || (typeof window !== 'undefined' ? window.localStorage : null);
+  try {
+    const raw = store && store.getItem ? store.getItem(DISMISSED_NOTICES_STORAGE_KEY) : null;
+    if (!raw) return new Set();
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.filter((id) => typeof id === 'string' && id.length > 0));
+  } catch {
+    return new Set();
+  }
+}
+/** Maps banner actionKey to action buttons. Same mapping for top and secondary. */
+export function getBannerActions(bannerOrKey) {
+  const actionKey = typeof bannerOrKey === 'string' ? bannerOrKey : bannerOrKey && bannerOrKey.actionKey;
+  if (actionKey === 'bridge-error') return [{ key: 'open-official', label: '查看官方界面' }];
+  if (actionKey === 'offline') {
+    return [{ key: 'recheck', label: '重新检查连接' }, { key: 'open-official', label: '查看官方界面' }];
+  }
+  if (actionKey === 'sync-error' || actionKey === 'resync') return [{ key: 'retry-sync', label: '重试同步' }];
+  return [];
+}
+/** Compact predicate: width <= 960, or coarse-only pointer with width <= 1100. */
+export function isCompactLayout(input) {
+  const opts = input || {};
+  const w = Number(opts.width) || 0;
+  if (w <= 960) return true;
+  if (opts.hasCoarsePointer && !opts.hasFinePointer && w <= 1100) return true;
+  return false;
+}
 export function getScrimAriaLabel(mobilePanel) {
   return mobilePanel === 'overview' ? '关闭消息概览' : '关闭会话侧栏';
 }

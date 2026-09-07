@@ -1,14 +1,15 @@
 <script>
   import { onDestroy, onMount } from 'svelte';
-  import { extractToolCallIds, extractToolKeyArg, extractToolDuration, getGlobalToolFoldPref, loadToolFormatter, presentToolPayload } from '../lib/tool-presentation.js';
+  import { extractToolCallIds, extractToolKeyArg, extractToolDuration, extractToolPairingState, getGlobalToolFoldPref, loadToolFormatter, presentToolPayload } from '../lib/tool-presentation.js';
   import { copyText } from '../lib/clipboard.js';
 
-  let { tool, streaming = false, isError = false } = $props();
+  let { tool, message = null, streaming = false, isError = false } = $props();
   let userToggled = $state(false);
   let manualOpen = $state(false);
   let copied = $state(false);
   let copyError = $state(false);
   let copiedCallId = $state('');
+  let copyCallIdError = $state('');
   let rawMode = $state(false);
   let formatter = $state.raw(null);
   let loadFailed = $state(false);
@@ -18,8 +19,8 @@
 
   const presentation = $derived(presentToolPayload(tool?.payload, { formatter, raw: rawMode }));
   const displayRaw = $derived(presentation.format === 'RAW');
-  const callIds = $derived(extractToolCallIds(tool));
-  const duration = $derived(extractToolDuration(tool));
+  const callIds = $derived(extractToolCallIds(tool, message));
+  const duration = $derived(extractToolDuration(tool, message));
   const ioLabel = $derived(tool?.kind === 'tool-result' ? '[输出]' : '[入参]');
 
   // Compute initial fold from global pref (localStorage 'slimgpt-tools-fold') unless streaming
@@ -49,6 +50,12 @@
   });
 
   const keyArg = $derived(extractToolKeyArg(tool?.payload, tool));
+  const pairingState = $derived(extractToolPairingState(tool, message));
+  const primaryCallId = $derived(callIds.length > 0 ? callIds[0] : (tool?.callId || tool?.toolCallId || ''));
+  const callIdSuffix = $derived.by(() => {
+    if (!primaryCallId) return '';
+    return primaryCallId.length > 6 ? `…${primaryCallId.slice(-6)}` : primaryCallId;
+  });
 
   onMount(() => {
     loadToolFormatter().then((module) => { if (alive) formatter = module; })
@@ -96,12 +103,14 @@
       await copyText(id);
       if (!alive) return;
       copiedCallId = id;
+      copyCallIdError = '';
     } catch {
       if (!alive) return;
       copiedCallId = '';
+      copyCallIdError = id;
     }
     clearTimeout(idCopyTimer);
-    idCopyTimer = setTimeout(() => { copiedCallId = ''; }, 2400);
+    idCopyTimer = setTimeout(() => { copiedCallId = ''; copyCallIdError = ''; }, 2400);
   }
 </script>
 
@@ -111,6 +120,12 @@
       <span class="tool-summary-status" class:is-running={isRunning} class:is-error={!isRunning && !isSuccess}>{summaryStatus}</span>
       <span class="tool-io-label">{ioLabel}</span>
       <span class="tool-summary-name">{toolName}</span>
+      {#if callIdSuffix}
+        <span class="tool-call-suffix" title={`调用标识: ${primaryCallId}`}>{callIdSuffix}</span>
+      {/if}
+      {#if pairingState}
+        <span class="tool-pairing-state" class:paired={pairingState === '已配对'} class:waiting={pairingState === '等待结果'} class:none={pairingState === '无结果'}>{pairingState}</span>
+      {/if}
       {#if keyArg}
         <span class="tool-summary-arg" title={keyArg}>{keyArg}</span>
       {/if}
@@ -133,12 +148,13 @@
             type="button"
             class="tool-call-id-btn"
             class:copied={copiedCallId === id}
+            class:copy-error={copyCallIdError === id}
             onclick={() => copyCallId(id)}
             title={`点击复制调用标识：${id}`}
-            aria-label={copiedCallId === id ? `已复制调用标识 ${id}` : `复制调用标识 ${id}`}
+            aria-label={copiedCallId === id ? `已复制调用标识 ${id}` : copyCallIdError === id ? `复制调用标识失败 ${id}` : `复制调用标识 ${id}`}
           >
             <span class="tool-call-id-label">ID:</span>
-            <span class="tool-call-id-val">{copiedCallId === id ? '已复制' : id}</span>
+            <span class="tool-call-id-val">{copiedCallId === id ? '已复制' : copyCallIdError === id ? '复制失败' : id}</span>
           </button>
         {/each}
       </div>
@@ -199,6 +215,18 @@
   .tool-duration { font-size: 10px; color: var(--slim-muted); margin-left: 2px; }
   .tool-io-label-header { font-size: 9.5px; font-weight: 700; color: var(--slim-muted); opacity: 0.9; }
   .tool-summary-name { font-weight: 600; font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .tool-call-suffix { font-size: 10px; color: var(--slim-muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; opacity: 0.85; }
+  .tool-pairing-state {
+    font-size: 9.5px;
+    padding: 1px 5px;
+    border-radius: 4px;
+    border: 1px solid var(--slim-line);
+    background: var(--slim-soft);
+    color: var(--slim-muted);
+  }
+  .tool-pairing-state.paired { color: #22735e; border-color: color-mix(in srgb, #22735e 30%, var(--slim-line)); }
+  .tool-pairing-state.waiting { color: #d48806; border-color: color-mix(in srgb, #d48806 30%, var(--slim-line)); }
+  .tool-pairing-state.none { color: var(--slim-muted); opacity: 0.7; }
   .tool-summary-arg { font-size: 10.5px; color: var(--slim-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: min(50vw, 400px); }
   .tool-summary-toggle-text { margin-left: auto; font-size: 10px; color: var(--slim-muted); flex: none; }
 
@@ -224,6 +252,7 @@
     transition: color 0.15s ease, border-color 0.15s ease;
   }
   .tool-call-id-btn:hover, .tool-call-id-btn.copied { color: var(--f7-theme-color); border-color: var(--f7-theme-color); }
+  .tool-call-id-btn.copy-error { color: var(--slim-danger); border-color: var(--slim-danger); }
   .tool-call-id-label { opacity: 0.65; flex: none; }
   .tool-call-id-val { overflow: hidden; text-overflow: ellipsis; }
   .tool-id-copied-tip { font-size: 9.5px; color: var(--f7-theme-color); flex: none; }

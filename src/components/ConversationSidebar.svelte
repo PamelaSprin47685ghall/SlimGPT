@@ -9,6 +9,9 @@
     groupConversations,
     highlightTitle,
     isContentHit,
+    buildTruncationLabel,
+    getPinnedIds,
+    togglePinnedId,
   } from '../lib/sidebar-helpers.js';
 
   let {
@@ -37,6 +40,7 @@
     onSelect = () => {},
     onRetryHistorySync = () => {},
     onClearNotice = () => {},
+    onClearExportError = () => {},
   } = $props();
 
   const workLabel = $derived(
@@ -49,31 +53,79 @@
   const activelyWorking = $derived(workState === 'running' || workState === 'starting');
 
   let query = $state('');
+  let debouncedQuery = $state('');
+  let searchInputRef = null;
   let pageLimit = $state(100);
   let cleanExport = $state(false);
   let copied = $state(false);
   let copyTimer = null;
+  let noticeDismissTimer = null;
+  let bucketEpoch = $state(Date.now());
+  let pinnedIds = $state(getPinnedIds());
 
   $effect(() => {
-    const _ = query;
+    const handler = () => {
+      bucketEpoch = Date.now();
+    };
+    window.addEventListener('focus', handler);
+    document.addEventListener('visibilitychange', handler);
+    return () => {
+      window.removeEventListener('focus', handler);
+      document.removeEventListener('visibilitychange', handler);
+    };
+  });
+
+  $effect(() => {
+    const raw = query;
+    const timer = setTimeout(() => {
+      debouncedQuery = raw;
+    }, 150);
+    return () => clearTimeout(timer);
+  });
+
+  $effect(() => {
+    const _ = debouncedQuery;
     pageLimit = 100;
   });
 
-  const searchResult = $derived(filterConversations(conversations, query, pageLimit));
+  $effect(() => {
+    clearTimeout(noticeDismissTimer);
+    if (sidebarNotice) {
+      const isErrorNotice = typeof sidebarNotice === 'string' && (sidebarNotice.includes('错误') || sidebarNotice.includes('失败'));
+      if (!isErrorNotice) {
+        noticeDismissTimer = setTimeout(() => {
+          onClearNotice();
+        }, 6000);
+      }
+    }
+    return () => clearTimeout(noticeDismissTimer);
+  });
+
+  const searchResult = $derived(filterConversations(conversations, debouncedQuery, pageLimit, pinnedIds));
   const filtered = $derived(searchResult.visible);
   const totalMatches = $derived(searchResult.total);
   const isCapped = $derived(searchResult.isCapped);
-  const grouped = $derived(groupConversations(filtered));
-  const hasQuery = $derived(Boolean(query.trim()));
+  const grouped = $derived(groupConversations(filtered, new Date(bucketEpoch), pinnedIds));
+  const hasQuery = $derived(Boolean(debouncedQuery.trim()));
+  const corpusCachedCount = $derived(
+    typeof cachedCount === 'number' && Number.isFinite(cachedCount)
+      ? cachedCount
+      : conversations.filter((c) => Boolean(c?.searchText)).length
+  );
+  const truncationLine = $derived(buildTruncationLabel(conversations.length, filtered.length));
 
   const syncPill = $derived(historySyncPillLabel(historySyncState));
   const syncFull = $derived(historySyncStatusLabel(historySyncState));
   const syncRetryable = $derived(isHistorySyncRetryable(historySyncState));
   const syncLoading = $derived(historySyncState?.state === 'loading');
+  const syncIsAuthDead = $derived(
+    historySyncState?.state === 'error' && (historySyncState?.status === 401 || historySyncState?.status === 403)
+  );
 
   function handleKeydown(event) {
     if (event.key === 'Escape' && query) {
       query = '';
+      debouncedQuery = '';
       event.stopPropagation();
       event.preventDefault();
       return;
@@ -89,6 +141,42 @@
       const first = root?.querySelector?.('.conversation-item');
       if (first) first.focus();
     }
+  }
+
+  function handleItemKeydown(event, conversationId) {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      const root = event.currentTarget?.closest?.('.conversation-sidebar');
+      if (!root) return;
+      const items = Array.from(root.querySelectorAll('.conversation-item'));
+      const currentIndex = items.indexOf(event.currentTarget);
+      if (currentIndex === -1) return;
+      if (event.key === 'ArrowDown') {
+        const nextIndex = (currentIndex + 1) % items.length;
+        items[nextIndex]?.focus();
+      } else {
+        const prevIndex = (currentIndex - 1 + items.length) % items.length;
+        items[prevIndex]?.focus();
+      }
+      return;
+    }
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      handleSelect(conversationId);
+      return;
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      if (searchInputRef) {
+        searchInputRef.focus();
+      }
+      return;
+    }
+  }
+
+  function handleTogglePin(event, conversationId) {
+    event.stopPropagation();
+    pinnedIds = togglePinnedId(conversationId);
   }
 
   function formatModel(item) {
@@ -167,7 +255,18 @@
 
   {#if sidebarNotice}
     <div class="sidebar-inline-notice warning" role="alert">
-      <span>{sidebarNotice}</span>
+      {#if typeof sidebarNotice === 'object' && sidebarNotice !== null}
+        <span>{sidebarNotice.text || ''}</span>
+        {#if Array.isArray(sidebarNotice.actions)}
+          <span class="notice-actions">
+            {#each sidebarNotice.actions as act}
+              <button type="button" class="notice-action-btn" onclick={act.action}>{act.label}</button>
+            {/each}
+          </span>
+        {/if}
+      {:else}
+        <span>{sidebarNotice}</span>
+      {/if}
       <button type="button" class="notice-close-btn" onclick={onClearNotice} aria-label="关闭提示">×</button>
     </div>
   {/if}
@@ -175,7 +274,7 @@
   {#if exportError}
     <div class="sidebar-inline-notice error" role="alert">
       <span>{exportError}</span>
-      <button type="button" class="notice-close-btn" onclick={onClearNotice} aria-label="关闭提示">×</button>
+      <button type="button" class="notice-close-btn" onclick={onClearExportError} aria-label="关闭提示">×</button>
     </div>
   {/if}
 
@@ -216,15 +315,21 @@
 
   <label class="search-box conversation-search">
     <input
+      bind:this={searchInputRef}
       bind:value={query}
       onkeydown={handleKeydown}
       placeholder="搜索会话标题或内容… (Esc 清除)"
       autocomplete="off"
     />
     {#if query}
-      <button type="button" class="search-clear-icon" onclick={() => query = ''} aria-label="清除搜索">×</button>
+      <button type="button" class="search-clear-icon" onclick={() => { query = ''; debouncedQuery = ''; }} aria-label="清除搜索">×</button>
     {/if}
   </label>
+  {#if debouncedQuery.trim()}
+    <div class="corpus-coverage-caption" role="note">
+      全文检索仅覆盖已缓存的 {corpusCachedCount} 个会话标题+正文，其余仅标题
+    </div>
+  {/if}
 
   <div class="sidebar-section-title">
     <span>会话</span>
@@ -267,9 +372,10 @@
           {@const modelLabel = formatModel(conversation)}
           {@const snippet = preview(conversation)}
           {@const isCompact = !modelLabel && !snippet}
-          {@const titleParts = highlightTitle(conversation.title || 'Untitled', query)}
-          {@const contentHit = hasQuery && isContentHit(conversation, query)}
+          {@const titleParts = highlightTitle(conversation.title || 'Untitled', debouncedQuery)}
+          {@const contentHit = hasQuery && isContentHit(conversation, debouncedQuery)}
           {@const showBranch = isCurrent && branchLabel}
+          {@const isPinned = pinnedIds.includes(conversation.id)}
           <button
             type="button"
             class:active={isCurrent}
@@ -279,6 +385,7 @@
             aria-current={isCurrent ? 'page' : undefined}
             class="conversation-item"
             onclick={() => handleSelect(conversation.id)}
+            onkeydown={(e) => handleItemKeydown(e, conversation.id)}
             title={isTimedOut
               ? `${conversation.title || 'Untitled'}（加载超时，点击重试）`
               : ((conversation.title || 'Untitled') + (showBranch ? `（${branchLabel}）` : ''))}
@@ -299,6 +406,18 @@
               {:else if isTimedOut}
                 <span class="retry-pill" title="加载超时，点击重试">重试</span>
               {/if}
+              <span
+                role="button"
+                tabindex="0"
+                class="pin-toggle-btn"
+                class:pinned={isPinned}
+                aria-pressed={isPinned}
+                title={isPinned ? '取消置顶' : '置顶'}
+                onclick={(e) => handleTogglePin(e, conversation.id)}
+                onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handleTogglePin(e, conversation.id); } }}
+              >
+                {isPinned ? '★' : '☆'}
+              </span>
               <span
                 class="conversation-time"
                 title={fullSidebarDateTime(conversation.update_time || conversation.updatedAt)}
@@ -335,7 +454,7 @@
     <div class="index-status-line">
       {#if conversations.length}
         <span class="captures-count" title={`共 ${conversations.length} 个会话`}>
-          共 {conversations.length} 个会话 · 列表已就绪{#if typeof cachedCount === 'number' && cachedCount > 0}（缓存 {cachedCount}/24）{/if}
+          {truncationLine}{#if typeof cachedCount === 'number' && cachedCount > 0} · 缓存 {cachedCount}/24{/if}
         </span>
       {:else}
         <span class="captures-count">等待同步会话列表</span>
@@ -353,6 +472,16 @@
         {:else}
           <span class="sync-label" title="正在同步当前对话历史">当前对话历史：同步中…</span>
         {/if}
+        {#if syncIsAuthDead}
+          <button
+            type="button"
+            class="refresh-history-btn auth-redirect"
+            onclick={onShowOfficial}
+            title="去官方界面登录以恢复完整历史同步"
+          >
+            去官方界面登录
+          </button>
+        {:else}
         <button
           type="button"
           class="refresh-history-btn"
@@ -362,6 +491,7 @@
         >
           {syncLoading ? '同步中…' : '刷新历史'}
         </button>
+        {/if}
       </div>
     {/if}
     <div class="footer-security-note">登录凭据不会离开 ChatGPT 页面</div>
@@ -446,6 +576,24 @@
     border-radius: 8px;
     font-size: 11px;
     line-height: 1.35;
+  }
+  .notice-actions {
+    display: inline-flex;
+    gap: 6px;
+    align-items: center;
+  }
+  .notice-action-btn {
+    background: var(--slim-surface, #ffffff);
+    border: 1px solid currentColor;
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 10.5px;
+    font-weight: 600;
+    color: inherit;
+    cursor: pointer;
+  }
+  .notice-action-btn:hover {
+    opacity: 0.85;
   }
   .sidebar-inline-notice.warning {
     background: var(--slim-warning-bg, rgba(232, 201, 138, 0.15));
@@ -533,6 +681,34 @@
     cursor: pointer;
     padding: 0 4px;
   }
+  .corpus-coverage-caption {
+    font-size: 9.5px;
+    color: var(--slim-muted);
+    padding: 2px 4px 6px;
+    line-height: 1.3;
+  }
+  .pin-toggle-btn {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    font-size: 12px;
+    line-height: 1;
+    color: var(--slim-muted);
+    border-radius: 3px;
+    cursor: pointer;
+    user-select: none;
+    transition: color 0.15s ease, transform 0.15s ease;
+  }
+  .pin-toggle-btn:hover {
+    color: var(--slim-text);
+    transform: scale(1.15);
+  }
+  .pin-toggle-btn.pinned {
+    color: #e0a63c;
+  }
   .count-hint {
     font-size: 9px;
     color: var(--slim-muted);
@@ -542,8 +718,13 @@
     flex: none;
     font-size: 9.5px;
     font-weight: 700;
-    color: var(--slim-warning, #b87b14);
+    color: #875404;
     white-space: nowrap;
+  }
+  @media (prefers-color-scheme: dark) {
+    .branch-badge {
+      color: var(--slim-warning, #e8c98a);
+    }
   }
   .body-hit-badge {
     flex: none;
@@ -569,10 +750,16 @@
     font-size: 8.5px;
     padding: 1px 4px;
     border-radius: 4px;
-    background: color-mix(in srgb, var(--slim-danger, #e74c3c) 15%, transparent);
-    color: var(--slim-danger, #e74c3c);
-    border: 1px solid var(--slim-danger, #e74c3c);
+    background: color-mix(in srgb, var(--slim-danger, #a82d22) 15%, transparent);
+    color: #a82d22;
+    border: 1px solid #a82d22;
     flex: none;
+  }
+  @media (prefers-color-scheme: dark) {
+    .retry-pill {
+      color: var(--slim-danger, #e78278);
+      border-color: var(--slim-danger, #e78278);
+    }
   }
   .index-status-line {
     display: flex;

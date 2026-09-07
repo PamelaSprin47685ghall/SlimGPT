@@ -25,6 +25,7 @@
   --f7-searchbar-bg-color: transparent;
   --f7-bars-bg-color: var(--slim-bg);
   --f7-navbar-height: 48px;
+  --slim-vv-offset: 0px;
   color-scheme: light dark;
 }
 
@@ -61,6 +62,7 @@
 /* Inset box-shadow focus variant for list and chip rows */
 .conversation-item:focus-visible,
 .overview-item:focus-visible,
+.turn-step:focus-visible,
 .turn-jump-chips button:focus-visible,
 .turn-boundary-pill:focus-visible,
 .status-pill:focus-visible,
@@ -80,7 +82,7 @@
   outline: none;
 }
 
-html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; background: var(--slim-bg); color: var(--slim-text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; background: var(--slim-bg); color: var(--slim-text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; }
 .slimgpt-page .page-content { overflow: hidden; padding-top: 0 !important; }
 .app-shell { display: grid; grid-template-columns: clamp(270px, 19vw, 350px) minmax(0, 1fr) clamp(250px, 17vw, 320px); width: 100%; height: 100%; position: relative; overflow: hidden; }
 .sidebar-host { min-width: 0; min-height: 0; border-right: 1px solid var(--slim-line); background: var(--slim-panel); }
@@ -215,7 +217,10 @@ html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; backg
 .slimgpt-page.compact-layout .overview-item { min-height: 44px; }
 .overview-number { color: var(--slim-muted); font: 10.5px/1 ui-monospace, SFMono-Regular, Menlo, monospace; text-align: right; }
 .overview-empty { padding: 30px 12px; color: var(--slim-muted); font-size: 11px; text-align: center; }
-.overview-filter-box { padding: 6px 10px; border-bottom: 1px solid var(--slim-line); }
+.overview-filter-box .overview-filter-input { flex: 1 1 0; min-width: 0; width: auto; }
+.overview-filter-clear { flex: none; height: 28px; padding: 0 10px; border: 1px solid var(--slim-line); border-radius: 6px; background: var(--slim-surface); color: var(--slim-muted); font-size: 11px; white-space: nowrap; cursor: pointer; }
+.overview-filter-clear:hover { border-color: var(--f7-theme-color); color: var(--f7-theme-color); }
+.overview-filter-box { display: flex; align-items: center; gap: 6px; padding: 6px 10px; border-bottom: 1px solid var(--slim-line); }
 .overview-filter-input {
   width: 100%;
   height: 28px;
@@ -261,6 +266,13 @@ html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; backg
 .turn-boundary-runway.up { top: 0; background: linear-gradient(to bottom, color-mix(in srgb, var(--slim-bg) 85%, transparent), transparent); border-bottom: 1px solid color-mix(in srgb, var(--slim-line) 40%, transparent); }
 .turn-boundary-runway .turn-boundary-pill { position: sticky; top: 50%; max-width: 78%; padding: 8px 12px; border: 1px solid var(--slim-line); border-radius: 999px; background: color-mix(in srgb, var(--slim-surface) 88%, transparent); text-align: center; box-shadow: 0 4px 18px rgba(0,0,0,.045); }
 .turn-boundary-runway.closing { height: 0 !important; opacity: 0 !important; }
+/* Reading converge5: unresolved count chip, N/M overview button, copy feedback */
+.turn-unresolved-chip { padding: 1px 8px; border: 1px solid color-mix(in srgb, var(--f7-theme-color) 45%, var(--slim-line)); border-radius: 999px; background: color-mix(in srgb, var(--f7-theme-color) 10%, transparent); color: var(--f7-theme-color); font-size: 10.5px; line-height: 1.6; white-space: nowrap; cursor: pointer; }
+.turn-unresolved-chip:hover { background: color-mix(in srgb, var(--f7-theme-color) 18%, transparent); }
+button.turn-count-btn { border: 1px solid transparent; border-radius: 6px; background: transparent; color: inherit; font: inherit; cursor: pointer; }
+button.turn-count-btn:hover { background: var(--slim-soft); border-color: var(--slim-line); color: var(--f7-theme-color); }
+.turn-copy-btn.copied { color: var(--f7-theme-color); border-color: color-mix(in srgb, var(--f7-theme-color) 55%, var(--slim-line)); }
+.turn-copy-btn.copy-failed { color: #cf6258; border-color: color-mix(in srgb, #cf6258 55%, var(--slim-line)); }
 .turn-boundary-runway.ready .turn-boundary-pill { color: var(--f7-theme-color); border-color: color-mix(in srgb, var(--f7-theme-color) 55%, var(--slim-line)); }
 .message-card { display: flex; align-items: flex-start; gap: 12px; width: 100%; }
 .message-card.role-user { flex-direction: row-reverse; }
@@ -609,6 +621,7 @@ html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; backg
   max-width: 100%;
   height: auto;
   border-radius: 8px;
+  cursor: zoom-in;
 }
 
 /* Table styling */
@@ -630,6 +643,11 @@ html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; backg
   padding: 4px 8px;
   border-bottom: 1px solid var(--slim-line);
   background: color-mix(in srgb, var(--slim-soft) 50%, var(--slim-surface));
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  width: 100%;
+  box-sizing: border-box;
 }
 .table-copy-btn {
   display: inline-flex;
@@ -658,6 +676,9 @@ html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; backg
   padding: 9px 13px;
   border-bottom: 1px solid var(--slim-line);
   border-right: 1px solid var(--slim-line);
+  min-width: 60px;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 .message-markdown th:last-child,
 .message-markdown td:last-child {
@@ -919,6 +940,23 @@ equation-inline {
   color: var(--f7-theme-color);
   border-color: var(--f7-theme-color);
 }
+@media (pointer: coarse) {
+  .math-copy-btn {
+    opacity: 1;
+    top: 4px;
+    right: 4px;
+  }
+}
+@media (max-width: 640px) {
+  .message-markdown .math-block {
+    padding-top: 28px;
+  }
+  .math-copy-btn {
+    opacity: 1;
+    top: 4px;
+    right: 4px;
+  }
+}
 .message-markdown .math-block .katex-display {
   margin: 0;
 }
@@ -962,7 +1000,7 @@ equation-inline {
 .history-sync-notice.history-sync-error { border-color: color-mix(in srgb, var(--slim-danger) 45%, var(--slim-line)); background: color-mix(in srgb, var(--slim-danger) 10%, var(--slim-panel)); color: var(--slim-danger); }
 
 /* Stage Banner Stack */
-.stage-banner-stack { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); z-index: 25; width: min(720px, calc(100% - 32px)); display: flex; flex-direction: column; gap: 8px; box-sizing: border-box; pointer-events: none; }
+.stage-banner-stack { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); z-index: 25; width: min(720px, calc(100% - 32px)); max-height: min(46vh, 320px); overflow-y: auto; overflow-x: hidden; scrollbar-width: thin; display: flex; flex-direction: column; gap: 8px; box-sizing: border-box; pointer-events: none; }
 .stage-banner-stack > * { pointer-events: auto; }
 .stage-banner-expander { display: inline-flex; align-items: center; justify-content: center; align-self: center; gap: 6px; padding: 4px 12px; border: 1px solid var(--slim-line); border-radius: 999px; background: color-mix(in srgb, var(--slim-surface) 90%, transparent); color: var(--slim-muted); font-size: 11px; cursor: pointer; backdrop-filter: blur(4px); box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04); }
 .stage-banner-expander:hover { color: var(--slim-text); border-color: var(--f7-theme-color); }
@@ -992,6 +1030,9 @@ equation-inline {
   padding: 0;
 }
 .stage-guide-banner .banner-dismiss-btn:hover { background: var(--slim-soft); color: var(--slim-text); }
+/* 24px visual button, 36px touch hit via ::after (no layout shift) */
+.stage-guide-banner .banner-dismiss-btn { position: relative; }
+.stage-guide-banner .banner-dismiss-btn::after { content: ""; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 100%; min-width: 36px; height: 100%; min-height: 36px; }
 .stage-banner-expander {
   position: relative;
   min-height: 32px;
@@ -1022,7 +1063,27 @@ equation-inline {
 /* Mobile navbar status badge */
 .mobile-status-badge { display: inline-flex; align-items: center; padding: 2px 6px; border-radius: 999px; font-size: 10.5px; font-weight: 600; line-height: 1; border: 1px solid var(--slim-line); color: var(--slim-muted); background: var(--slim-soft); }
 .mobile-status-badge.error { color: var(--slim-danger); border-color: color-mix(in srgb, var(--slim-danger) 45%, var(--slim-line)); background: var(--slim-danger-bg); }
-.mobile-status-badge.offline { color: var(--slim-warning); border-color: color-mix(in srgb, var(--slim-warning) 45%, var(--slim-line)); background: var(--slim-warning-bg); }
+.mobile-status-badge.offline { color: #875404; border-color: color-mix(in srgb, var(--slim-warning) 45%, var(--slim-line)); background: var(--slim-warning-bg); }
+@media (prefers-color-scheme: dark) {
+  .mobile-status-badge.offline { color: var(--slim-warning); }
+}
+
+/* Notch safe-area for the mobile navbar (shell-owned; F7 inner keeps its height) */
+.mobile-navbar { padding-top: env(safe-area-inset-top); padding-left: env(safe-area-inset-left); padding-right: env(safe-area-inset-right); }
+/* >=36px touch hits for small navbar buttons without layout shift */
+.mobile-navbar .button-small { position: relative; }
+.mobile-navbar .button-small::after { content: ""; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 100%; min-width: 36px; height: 100%; min-height: 36px; }
+/* Coarse pointers: hide navbar 快捷键 buttons to fit 360px. The guide stays
+   reachable via the empty-state 快捷键指南 button and ? / Ctrl+/ on hardware
+   keyboards, so shortcuts remain discoverable without the navbar entry. */
+@media (pointer: coarse) {
+  .mobile-shortcuts-button, .header-shortcuts-button { display: none; }
+}
+/* Under 400px the offline badge collapses to dot + short truncated text */
+@media (max-width: 400px) {
+  .mobile-status-badge { gap: 4px; max-width: 72px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mobile-status-badge::before { content: ""; width: 6px; height: 6px; border-radius: 999px; background: currentColor; flex: none; }
+}
 
 /* Branch return banner extracted from inline style with 4.5:1 text contrast */
 .branch-return-banner {
@@ -1102,7 +1163,7 @@ body.slimgpt-drawer-open { overflow: hidden; }
 
 
 /* Composer styling */
-.composer-wrap { padding: 8px 18px calc(12px + env(safe-area-inset-bottom)); border-top: 1px solid var(--slim-line); background: var(--slim-bg); }
+.composer-wrap { padding: 8px calc(18px + env(safe-area-inset-right)) calc(12px + env(safe-area-inset-bottom) + var(--slim-vv-offset, 0px)) calc(18px + env(safe-area-inset-left)); border-top: 1px solid var(--slim-line); background: var(--slim-bg); }
 .composer-top-bar {
   display: flex;
   align-items: center;
@@ -1187,21 +1248,21 @@ body.slimgpt-drawer-open { overflow: hidden; }
   opacity: 0.75;
   transition: opacity 0.15s ease;
 }
-.composer-error-alert .composer-error-retry {
-  flex: none;
-  padding: 2px 10px;
-  border: 1px solid currentColor;
-  border-radius: 6px;
-  background: transparent;
-  color: inherit;
-  font-size: 11px;
-  line-height: 1.4;
-  cursor: pointer;
-  opacity: 0.9;
-  transition: opacity 0.15s ease, background-color 0.15s ease;
-}
-.composer-error-alert .composer-error-retry:hover { opacity: 1; background: color-mix(in srgb, #cf6258 14%, transparent); }
 .composer-error-alert .composer-error-dismiss:hover { opacity: 1; }
+.composer-error-hint { flex: none; color: var(--slim-muted); font-size: 11px; white-space: nowrap; }
+/* Action notice above the composer: distinct channel for non-send failures,
+   restored drafts, stall recovery and take-back-after-stop. The text span
+   mirrors .composer-status so query harnesses keep reading notices. */
+.composer-action-notice { display: flex; align-items: center; gap: 8px; max-width: 1100px; margin: 0 auto 6px; padding: 6px 12px; border: 1px solid var(--slim-line); border-radius: 8px; background: var(--slim-surface); color: var(--slim-text); font-size: 11.5px; line-height: 1.4; }
+.composer-action-notice .composer-action-notice-text { flex: 1; min-width: 0; text-align: left; white-space: normal; overflow: visible; }
+.composer-action-notice-btn { flex: none; padding: 2px 10px; border: 1px solid var(--f7-theme-color); border-radius: 6px; background: transparent; color: var(--f7-theme-color); font-size: 11px; line-height: 1.4; cursor: pointer; }
+.composer-action-notice-btn:hover { background: color-mix(in srgb, var(--f7-theme-color) 10%, transparent); }
+.composer-action-notice-dismiss { flex: none; background: none; border: none; color: var(--slim-muted); font-size: 16px; line-height: 1; cursor: pointer; padding: 0 4px; }
+.composer-action-notice-dismiss:hover { color: var(--slim-text); }
+/* Thinking-level honesty caption under the segmented control. */
+.composer-thinking-caption { grid-column: 1 / -1; color: var(--slim-muted); font-size: 10.5px; }
+/* Disabled-look for the always-clickable send slot (aria-disabled only). */
+.composer-send-disabled { opacity: 0.45; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border-width: 0; }
 .composer-shell { display: flex; align-items: flex-end; gap: 9px; max-width: 1100px; margin: 0 auto; padding: 6px 9px 6px 13px; border: 1px solid var(--slim-line); border-radius: 18px; background: var(--slim-surface); transition: border-color 0.15s ease, box-shadow 0.15s ease; }
 .composer-shell:focus-within { border-color: var(--f7-theme-color); box-shadow: 0 0 0 3px color-mix(in srgb, var(--f7-theme-color) 30%, transparent); }
@@ -1317,11 +1378,14 @@ body.slimgpt-drawer-open { overflow: hidden; }
   .role-user .message-bubble { border-radius: 15px 5px 15px 15px; }
   .role-assistant .message-bubble { border-radius: 5px 15px 15px 15px; }
   .message-markdown { font-size: 14.5px; line-height: 1.66; }
-  .composer-wrap { padding-left: 10px; padding-right: 10px; }
-  .composer-top-bar { display: grid; grid-template-columns: minmax(0, 1fr); justify-content: stretch; gap: 6px; margin-bottom: 7px; }
+  .composer-wrap { padding-left: calc(10px + env(safe-area-inset-left)); padding-right: calc(10px + env(safe-area-inset-right)); }
+  .composer-top-bar { display: flex; flex-wrap: nowrap; align-items: center; gap: 8px; margin-bottom: 7px; overflow-x: auto; white-space: nowrap; scrollbar-width: thin; }
+  .composer-top-bar > * { flex: 0 0 auto; min-width: 0; }
+  .composer-top-bar > .thinking-control { flex: 1 1 auto; min-width: 260px; max-width: 100%; }
   .thinking-control { grid-template-columns: minmax(0, 1fr); gap: 5px; }
   .thinking-control-copy { padding: 0 3px; }
   .thinking-control-tip { margin-left: auto; text-align: right; }
+  .thinking-segmented { flex: 1 1 auto; min-width: 260px; max-width: 100%; }
   .thinking-segmented .button { height: 30px; padding: 0 5px; font-size: 10.5px; }
   .composer-status { min-height: 13px; padding: 0 3px; text-align: left; }
   .composer-hint { display: none; }
@@ -1382,3 +1446,23 @@ body.slimgpt-drawer-open { overflow: hidden; }
 .slimgpt-page.compact-layout .desktop-chat-header { display: none; }
 .slimgpt-page.desktop-layout .mobile-navbar,
 .slimgpt-page.desktop-layout .sidebar-scrim { display: none !important; }
+
+/* Print: clean black-on-white document. Screen layout untouched (print-only). */
+@media print {
+  .mobile-navbar,
+  .sidebar-host,
+  .overview-host,
+  .composer-wrap,
+  .stage-banner-stack,
+  .history-sync-notice,
+  .sidebar-scrim,
+  .shortcuts-modal-backdrop,
+  .work-indicator,
+  .desktop-chat-header { display: none !important; }
+  html, body, #app { height: auto !important; overflow: visible !important; background: #fff !important; }
+  .slimgpt-page .page-content { overflow: visible !important; padding-top: 0 !important; }
+  .app-shell, .chat-pane { display: block !important; height: auto !important; overflow: visible !important; }
+  .single-message-stage, .single-message-content, .single-message-scroller { position: static !important; height: auto !important; overflow: visible !important; }
+  .chat-pane * { max-height: none !important; overflow: visible !important; -webkit-mask: none !important; mask: none !important; box-shadow: none !important; }
+  .chat-pane, .chat-pane * { background: #fff !important; color: #000 !important; border-color: #ccc !important; }
+}

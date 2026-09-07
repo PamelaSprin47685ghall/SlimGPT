@@ -4,11 +4,17 @@ const ROLE_LABELS = {
   system: 'System',
   tool: 'Tool',
 };
+import { extractSourcesList, getOrderedMessageSources, safeReferenceUrl } from './content-references.js';
 const filenameEncoder = new TextEncoder();
 
 function heading(value) {
   return String(value ?? '').replace(/[\r\n\u2028\u2029\u0000-\u001f]+/g, ' ').trim()
     .replace(/[\\`*_\[\]<>]/g, '\\$&');
+}
+
+function sanitizeSourceTitle(value) {
+  const raw = String(value ?? '').replace(/[\r\n\u2028\u2029\u0000-\u001f]+/g, ' ').trim();
+  return raw.slice(0, 200).trim();
 }
 
 export function hasExportableMessage(message) {
@@ -89,6 +95,37 @@ export function buildConversationMarkdown(title, messages = [], options = {}) {
         const section = messageSection(message, 4, options);
         if (section) sections.push(section);
       }
+    }
+  }
+
+  const allMessages = [...messages];
+  for (const group of unresolved) {
+    if (Array.isArray(group?.replies)) allMessages.push(...group.replies);
+  }
+  const messagesWithSources = [];
+  for (const msg of allMessages) {
+    const orderedSources = getOrderedMessageSources(msg);
+    if (orderedSources.length) messagesWithSources.push({ message: msg, sources: orderedSources });
+  }
+  if (messagesWithSources.length) {
+    const formatList = (srcs) => srcs.map((item, index) => {
+      const num = index + 1;
+      const safeUrl = safeReferenceUrl(item.url) || item.url;
+      const title = sanitizeSourceTitle(item.title);
+      const label = title ? `${title} — ${safeUrl}` : safeUrl;
+      return `[${num}] ${label}`;
+    }).join('\n');
+
+    if (messagesWithSources.length === 1) {
+      sections.push(`## 参考来源\n\n${formatList(messagesWithSources[0].sources)}`);
+    } else {
+      const sourceSections = ['## 参考来源'];
+      for (let i = 0; i < messagesWithSources.length; i += 1) {
+        const { message: msg, sources: srcs } = messagesWithSources[i];
+        const msgLabel = msg.name || ROLE_LABELS[msg.role] || msg.role || '消息';
+        sourceSections.push(`### ${heading(msgLabel)}（第 ${i + 1} 项）\n\n${formatList(srcs)}`);
+      }
+      sections.push(sourceSections.join('\n\n'));
     }
   }
 

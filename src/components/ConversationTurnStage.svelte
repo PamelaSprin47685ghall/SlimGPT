@@ -1,5 +1,5 @@
 <script>
-  import { onDestroy, tick } from 'svelte';
+  import { onDestroy, tick, untrack } from 'svelte';
   import MessageBubble from './MessageBubble.svelte';
   import { nestedScrollerCanConsume, wheelDeltaPixels } from '../lib/scroll-input.js';
 
@@ -18,6 +18,7 @@
     onEdit = () => {},
     onQuote = () => {},
     onCopyTurn = () => {},
+    onOpenOverview = () => {},
   } = $props();
 
   let scroller = $state(null);
@@ -25,7 +26,59 @@
   let pendingEdge = 'start';
   let previousKey = '';
   let previousTurnCount = 0;
+  // Rank1 scroll memory: per-turn scrollTop map. Keyed by conversation + turn
+  // identity so back-and-forth flips restore offsets instead of forcing edges.
+  const turnScrollTops = new Map();
+  // Programmatic edge settles (turn switches, boundary landings) must not
+  // poison scroll memory: their scroll events carry the settle target, not
+  // a user offset. Revisiting a turn landed at the bottom would otherwise
+  // restore the bottom, and a within-turn PageDown would hit the boundary
+  // runway instead of scrolling.
+  let suppressRememberTop = null;
+  // Rank10 copy feedback: '' | 'copied' | 'failed' (2.4s inline confirm).
+  let copyTurnStatus = $state('');
+  let copyTurnTimer = null;
+  // Rank6 multi jump chips: cycle cursor per kind, reset on turn switch.
+  let thoughtCycle = $state(0);
+  let toolCycle = $state(0);
+  let answerCycle = $state(0);
+  // Rank8 settle guard: track rAF handles so stale frames never fire.
+  let edgeSettleRafs = [];
+
+  function turnKeyFor(index) {
+    const turn = turns[index];
+    const id = turn?.id || turn?.user?.observationKey || turn?.user?.itemId || turn?.user?.nodeId || turn?.user?.id;
+    return `${conversationKey}::${id ?? 'idx-' + index}`;
+  }
+
+  function rememberScrollTop() {
+    if (!scroller) return;
+    if (suppressRememberTop != null && Math.abs(scroller.scrollTop - suppressRememberTop) <= 1) return;
+    suppressRememberTop = null;
+    turnScrollTops.set(turnKeyFor(activeIndex), scroller.scrollTop);
+  }
+  // Pure follow/target predicates (mirrored in tests/reading-converge5.test.js).
+  // shouldFollowOnGrowth: a cached pinned=false must not veto following
+  // when the viewport IS at the bottom as content grows.
+  function shouldFollowOnGrowth(pinned, liveAtBottom) {
+    return Boolean(pinned || liveAtBottom);
+  }
+  // resolveSameTurnTarget: a same-turn re-settle while following the tail
+  // re-affirms the live end instead of restoring a just-superseded
+  // remembered offset (anti-yank); all other cases honor memory/edge.
+  function resolveSameTurnTarget({ sameTurn, followingTail, savedOffset, edge }) {
+    if (sameTurn && followingTail) return 'end';
+    return savedOffset != null && edge !== 'end' ? savedOffset : edge;
+  }
   let tailPinned = $state(false);
+  // Live tail authority: derived from actual distance on every scroll event
+  // (synthetic or native), refreshed on every stream follow. Growth alone
+  // never clears it, so a cached pinned=false can't strand a tail reader.
+  // Only a genuine scroll away from the bottom parks the reader.
+  let tailLiveAtBottom = false;
+  // Previously settled turn key: distinguishes same-turn re-settles
+  // (streaming growth re-running the turn effect) from genuine switches.
+  let previousTurnKey = '';
   let canScroll = $state(false);
   let scrollProgress = $state(0);
   let boundaryDirection = $state(0);
@@ -53,16 +106,25 @@
     unresolved.length > 0 && (turnCount === 0 || lastTurnActive)
   );
   const hasRenderableContent = $derived(Boolean(activeTurn || showUnresolved));
-  const TAIL_STICKY_DISTANCE = 56;
+  const TAIL_STICKY_DISTANCE = 32;
   const canPrev = $derived(activeIndex > 0);
   const canNext = $derived(activeIndex < turnCount - 1);
   const replyList = $derived(activeTurn?.replies || []);
-  const thoughtIdx = $derived(replyList.findIndex((message) => message?.thought));
-  const toolIdx = $derived(replyList.findIndex((message) => message?.tool));
-  const answerIdx = $derived(replyList.findIndex((message) => (message?.role === 'assistant') && (message?.text || message?.thought)));
-  const hasThought = $derived(thoughtIdx >= 0);
-  const hasTools = $derived(toolIdx >= 0);
-  const hasAnswer = $derived(answerIdx >= 0);
+  // Rank6: collect ALL indices per kind so chips can cycle multi-match turns.
+  const thoughtIndices = $derived(replyList.map((message, index) => (message?.thought || message?.isThinking) ? index : -1).filter((index) => index >= 0));
+  const toolIndices = $derived(replyList.map((message, index) => (message?.tool ? index : -1)).filter((index) => index >= 0));
+  const answerIndices = $derived(replyList.map((message, index) => (message?.role === 'assistant' && (message?.text || message?.thought)) ? index : -1).filter((index) => index >= 0));
+  const hasThought = $derived(thoughtIndices.length > 0);
+  const hasTools = $derived(toolIndices.length > 0);
+  const hasAnswer = $derived(answerIndices.length > 0);
+  const thoughtLabel = $derived(thoughtIndices.length > 1 ? `思考 ${Math.min(thoughtCycle, thoughtIndices.length - 1) + 1}/${thoughtIndices.length}` : '思考');
+  const toolLabel = $derived(toolIndices.length > 1 ? `工具 ${Math.min(toolCycle, toolIndices.length - 1) + 1}/${toolIndices.length}` : '工具');
+  const answerLabel = $derived(answerIndices.length > 1 ? `回答 ${Math.min(answerCycle, answerIndices.length - 1) + 1}/${answerIndices.length}` : '回答');
+  // Rank10 unresolved honesty: count chip when off-tail with pending items.
+  const unresolvedCount = $derived(unresolved.reduce((total, group) => total + (group?.replies?.length || 0), 0));
+  const showOffTailUnresolvedChip = $derived(unresolvedCount > 0 && turnCount > 0 && !lastTurnActive);
+  // Rank4 branch-during-stream: live tail turn while generating.
+  const branchLive = $derived(streaming && lastTurnActive);
 
   $effect(() => {
     const isStreaming = streaming;
@@ -91,6 +153,17 @@
       return;
     }
     const conversationChanged = key !== previousKey;
+    if (conversationChanged) {
+      turnScrollTops.clear();
+      suppressRememberTop = null;
+    }
+    // Rank4: clamp defensively without yanking scroll — no settle, no edge.
+    if (index < 0 || index >= count) {
+      previousKey = key;
+      previousTurnCount = count;
+      onActiveChange(Math.max(0, Math.min(count - 1, index)));
+      return;
+    }
     const appendedTurn = !conversationChanged && count > previousTurnCount;
     const wasOnLastTurn = previousTurnCount > 0 && index === previousTurnCount - 1;
     if (appendedTurn) {
@@ -105,20 +178,61 @@
       tailPinned = false;
       return;
     }
+    // Rank1: restore saved offset for visited turns; fresh entries
+    // (streaming tail, first open, boundary crossing) use the edge.
+    const nextKey = turnKeyFor(index);
+    // Same-turn content growth (streaming re-running this effect via the
+    // turns read in turnKeyFor) must NEVER re-settle scroll: no memory
+    // restore, no edge apply. The RO path owns growth frames (follow iff
+    // tailLiveAtBottom || tailPinned, else hands off). Detached frames also
+    // cancel stale programmatic settles so a 60/140/260ms 'end' timer queued
+    // while at the tail cannot yank a reader who scrolled away during the
+    // settle window (ordering harden, not timing). Genuine switches,
+    // conversation changes, and explicit navigation fall through to the
+    // settle + memory path below. Scroll-away clears tailLiveAtBottom /
+    // tailPinned synchronously in handleStageScroll, so no stale follow
+    // authority survives a synthetic scroll event.
+    const sameTurnGrowth = !conversationChanged && previousTurnKey !== '' && nextKey === previousTurnKey;
+   if (sameTurnGrowth) {
+      previousKey = key;
+     previousTurnCount = count;
+      const liveFollowing = untrack(() => lastTurnActive && (tailPinned || tailLiveAtBottom));
+      if (!liveFollowing) cancelEdgeSettle();
+      return;
+    }
+    // Rank6/9: fresh turn identity resets jump-chip cycle cursors.
+    // Only genuine switches reach here; growth frames above must not reset
+    // chip cycling.
+    thoughtCycle = 0;
+    toolCycle = 0;
+    answerCycle = 0;
+    const savedOffset = turnScrollTops.get(nextKey);
     const edge = conversationChanged ? 'start' : pendingEdge;
+    // Genuine switch: drop stale live-tail authority, then honor
+    // memory/edge. Same-turn tail follow never reaches here (RO owns it).
+    // untrack: pin reads are point-in-time; they must not resubscribe.
+    tailLiveAtBottom = false;
+    const followingTail = untrack(() => lastTurnActive && (tailPinned || tailLiveAtBottom));
+    const target = resolveSameTurnTarget({ sameTurn: false, followingTail, savedOffset, edge });
     previousKey = key;
     previousTurnCount = count;
+    previousTurnKey = nextKey;
     pendingEdge = 'start';
     resetBoundaryRunway();
-    settleEdge(edge);
+    cancelEdgeSettle();
+    settleScroll(target);
   });
 
   $effect(() => {
     const node = content;
     if (!node || typeof ResizeObserver === 'undefined') return;
     const observer = new ResizeObserver(() => {
-      if (tailPinned && lastTurnActive && !boundaryDirection && scroller) {
+      // Live tail authority: follow when pinned OR actually at the bottom.
+      // tailLiveAtBottom is derived from live distance on scroll events and
+      // refreshed below, so growth alone can never strand a tail reader.
+      if (lastTurnActive && !boundaryDirection && scroller && shouldFollowOnGrowth(tailPinned, tailLiveAtBottom)) {
         scroller.scrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+        tailLiveAtBottom = true;
       }
       updateScrollability();
     });
@@ -129,31 +243,57 @@
   function cancelEdgeSettle() {
     edgeSettleToken += 1;
     for (const timer of edgeSettleTimers.splice(0)) clearTimeout(timer);
+    for (const raf of edgeSettleRafs.splice(0)) {
+      try {
+        cancelAnimationFrame(raf);
+      } catch {
+        // ignore missing rAF handles in non-DOM runtimes
+      }
+    }
   }
 
-  function settleEdge(edge) {
+  function applyScrollTarget(target) {
+    if (!scroller) return;
+    const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    const next = typeof target === 'number'
+      ? Math.max(0, Math.min(max, target))
+      : (target === 'end' ? max : 0);
+    suppressRememberTop = next;
+    scroller.scrollTop = next;
+    updateTailPinned();
+  }
+
+  // Rank8: generation-token guard — every async apply re-checks the token
+  // so stale timeouts/rAFs from a previous turn never fire after a switch.
+  function settleScroll(target) {
     cancelEdgeSettle();
     const token = edgeSettleToken;
     void tick().then(() => {
       if (!scroller || token !== edgeSettleToken) return;
-      const apply = () => {
-        if (!scroller || token !== edgeSettleToken) return;
-        scroller.scrollTop = edge === 'end'
-          ? Math.max(0, scroller.scrollHeight - scroller.clientHeight)
-          : 0;
-        updateTailPinned();
-      };
-      apply();
-      requestAnimationFrame(() => {
-        apply();
-        requestAnimationFrame(apply);
+      applyScrollTarget(target);
+      const raf1 = requestAnimationFrame(() => {
+        if (token !== edgeSettleToken) return;
+        applyScrollTarget(target);
+        const raf2 = requestAnimationFrame(() => {
+          if (token !== edgeSettleToken) return;
+          applyScrollTarget(target);
+        });
+        edgeSettleRafs.push(raf2);
       });
-      if (edge === 'end') {
-        edgeSettleTimers.push(setTimeout(apply, 60));
-        edgeSettleTimers.push(setTimeout(apply, 140));
-        edgeSettleTimers.push(setTimeout(apply, 260));
+      edgeSettleRafs.push(raf1);
+      if (target === 'end') {
+        for (const delay of [60, 140, 260]) {
+          edgeSettleTimers.push(setTimeout(() => {
+            if (token !== edgeSettleToken) return;
+            applyScrollTarget(target);
+          }, delay));
+        }
       }
     });
+  }
+
+  function settleEdge(edge) {
+    settleScroll(edge);
   }
 
   function canAdvance(direction) {
@@ -248,7 +388,7 @@
     boundaryCommitDelta += magnitude;
     if (boundaryCommitDelta >= 36) {
       resetBoundaryRunway();
-      advance(direction);
+      advance(direction, { fromBoundary: true });
     } else {
       scheduleBoundarySettle(settleDelay);
     }
@@ -277,13 +417,36 @@
     if (!scroller) return;
     canScroll = scroller.scrollHeight > scroller.clientHeight + 4;
     const remaining = Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop);
-    tailPinned = lastTurnActive && remaining <= TAIL_STICKY_DISTANCE;
+    // Rank5 tail stick continuity: only auto-stick while already pinned; a
+    // user upward scroll unpins until they return to the bottom (<=2px).
+    if (!lastTurnActive) {
+      tailPinned = false;
+    } else if (tailPinned) {
+      tailPinned = remaining <= TAIL_STICKY_DISTANCE;
+    } else {
+      tailPinned = remaining <= 2;
+    }
     const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
     scrollProgress = max > 0 ? Math.max(0, Math.min(1, scroller.scrollTop / max)) : 0;
   }
 
-  function advance(direction) {
+  function handleStageScroll() {
+    rememberScrollTop();
+    // Live at-bottom derivation: actual distance right now, whether this
+    // scroll event is synthetic (fixture setup) or native, trusted or not.
+    if (scroller) {
+      tailLiveAtBottom =
+        Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) <= 2;
+    }
+    updateTailPinned();
+  }
+
+  // Rank1: plain flips (stepper/arrows/J-K/overview) never set pendingEdge —
+  // the turn effect restores the saved offset. Only runway boundary commits
+  // pass fromBoundary to force the landing edge and drop the saved offset.
+  function advance(direction, opts = {}) {
     if (!turns.length) return;
+    cancelEdgeSettle();
     resetBoundaryRunway();
     const now = performance.now();
     if (now - lastAdvanceAt < 240) return;
@@ -292,7 +455,10 @@
     lastAdvanceAt = now;
     inertiaLockedUntil = now + 350;
     inertiaLockDirection = direction;
-    pendingEdge = direction < 0 ? 'end' : 'start';
+    if (opts.fromBoundary) {
+      pendingEdge = direction < 0 ? 'end' : 'start';
+      turnScrollTops.delete(turnKeyFor(next));
+    }
     onActiveChange(next);
   }
 
@@ -307,14 +473,24 @@
     cancelEdgeSettle();
     resetBoundaryRunway();
     scroller.scrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    tailLiveAtBottom = true;
     updateTailPinned();
   }
 
-  function stepTurn(direction) {
-    if (!canAdvance(direction)) return;
+  // Rank9: Shift+click jumps ±5 turns; plain click stays ±1.
+  function stepTurn(direction, event = null) {
+    if (!turns.length) return;
+    const stride = event?.shiftKey ? 5 : 1;
+    const now = performance.now();
+    if (now - lastAdvanceAt < 240) return;
+    const next = Math.max(0, Math.min(turns.length - 1, activeIndex + direction * stride));
+    if (next === activeIndex) return;
+    lastAdvanceAt = now;
     cancelEdgeSettle();
     resetBoundaryRunway();
-    advance(direction);
+    inertiaLockedUntil = now + 350;
+    inertiaLockDirection = direction;
+    onActiveChange(next);
   }
 
   function scrollElementWithinTurn(element) {
@@ -340,19 +516,78 @@
   }
 
   // Jump chips scroll within the mounted turn only; they never change turns.
-  function scrollToSection(kind) {
+  // Rank6: chips cycle through ALL matches per kind (工具 2/3 style);
+  // single-match turns behave exactly as before.
+  function cycleJump(kind) {
     if (!scroller || !content) return;
     if (kind === 'question') {
       scrollElementWithinTurn(content.querySelector('.turn-question'));
       return;
     }
-    const index = kind === 'thought' ? thoughtIdx : kind === 'tool' ? toolIdx : answerIdx;
-    if (index == null || index < 0) return;
-    scrollElementWithinTurn(content.querySelectorAll('.turn-message.turn-reply')[index]);
+    const indices = kind === 'thought' ? thoughtIndices : kind === 'tool' ? toolIndices : answerIndices;
+    if (!indices.length) return;
+    const cursor = kind === 'thought' ? thoughtCycle : kind === 'tool' ? toolCycle : answerCycle;
+    const pick = indices[cursor % indices.length];
+    scrollElementWithinTurn(content.querySelectorAll('.turn-message.turn-reply')[pick]);
+    const next = (cursor + 1) % indices.length;
+    if (kind === 'thought') thoughtCycle = next;
+    else if (kind === 'tool') toolCycle = next;
+    else answerCycle = next;
   }
 
+  // Rank4 branch guard: no branch switching on the live tail while running.
+  function handleBranch(nodeId, delta) {
+    if (branchLive) return;
+    onBranch(nodeId, delta);
+  }
+
+  function jumpToLatestTurn() {
+    if (turnCount <= 0 || lastTurnActive) return;
+    cancelEdgeSettle();
+    resetBoundaryRunway();
+    pendingEdge = 'end';
+    turnScrollTops.delete(turnKeyFor(turnCount - 1));
+    onActiveChange(turnCount - 1);
+  }
+
+  // Rank10 copy local feedback: 已复制/复制失败 inline 2.4s; HomePage
+  // copyTurnMarkdown already falls back to the composer notice on failure.
+  async function handleCopyTurn() {
+    if (copyTurnTimer) {
+      clearTimeout(copyTurnTimer);
+      copyTurnTimer = null;
+    }
+    let ok = false;
+    try {
+      ok = (await onCopyTurn(activeTurn)) !== false;
+    } catch {
+      ok = false;
+    }
+    copyTurnStatus = ok ? 'copied' : 'failed';
+    copyTurnTimer = setTimeout(() => {
+      copyTurnStatus = '';
+      copyTurnTimer = null;
+    }, 2400);
+  }
   function isEditableTarget(target) {
     return Boolean(target.closest('input, textarea, select, [contenteditable="true"], [role="textbox"]'));
+  }
+
+  // Rank2 arrow scope denylist: ArrowLeft/Right flip turns whenever the
+  // event target is inside the stage, EXCEPT interactive/editable nests
+  // (button, input, textarea, select, a[href], [contenteditable], code-shell
+  // buttons) and horizontal-scroll blocks. The composer is never hijacked.
+  const ARROW_FLIP_DENY_SELECTOR = 'button, input, textarea, select, a[href], [contenteditable], [role="textbox"], [role="button"], pre, .table-wrap, .math-block, .tool-toml-pre, .tool-payload-block, .code-block, .code-shell';
+
+  function isArrowTurnFlipDenied(target) {
+    if (!target || target === document.body || target === document.documentElement) return false;
+    if (!(target instanceof Element)) return false;
+    if (target.closest?.('.composer-shell')) return true;
+    if (target.closest?.('.conversation-sidebar, .message-overview, .desktop-chat-header, .mobile-navbar')) return true;
+    if (target.closest?.(ARROW_FLIP_DENY_SELECTOR)) return true;
+    if (target.closest?.('.conversation-turn-stage, .single-message-scroller')) return false;
+    if (target === scroller) return false;
+    return true;
   }
 
   function selectionActive() {
@@ -375,6 +610,7 @@
       const targetIndex = event.key === 'Home' ? 0 : turns.length - 1;
       if (targetIndex !== activeIndex) {
         pendingEdge = event.key === 'Home' ? 'start' : 'end';
+        turnScrollTops.delete(turnKeyFor(targetIndex));
         if (event.key === 'Home') tailPinned = false;
         else tailPinned = true;
         onActiveChange(targetIndex);
@@ -391,18 +627,12 @@
 
     if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
       if (event.shiftKey || selectionActive()) return;
-      const insideBlock = event.target?.closest?.('pre, .table-wrap, .math-block, .tool-toml-pre, .tool-payload-block');
-      if (insideBlock) return;
-      const isStageShell = event.target === scroller ||
-        event.target?.classList?.contains?.('single-message-scroller') ||
-        event.target?.classList?.contains?.('conversation-turn-stage') ||
-        event.target === document.body;
-      if (!isStageShell) return;
+      // Rank2: denylist scope — flip whenever the target is inside the stage
+      // EXCEPT interactive/editable nests; never hijack the composer.
+      if (isArrowTurnFlipDenied(event.target)) return;
       const direction = event.key === 'ArrowLeft' ? -1 : 1;
       if (canAdvance(direction)) {
         event.preventDefault();
-        cancelEdgeSettle();
-        resetBoundaryRunway();
         advance(direction);
       }
       return;
@@ -531,7 +761,7 @@
     if (boundaryDirection && boundaryReady) {
       const direction = boundaryDirection;
       resetBoundaryRunway();
-      advance(direction);
+      advance(direction, { fromBoundary: true });
       return;
     }
     if (boundaryDirection) {
@@ -549,6 +779,10 @@
     cancelEdgeSettle();
     cancelBoundarySettle();
     cancelBoundaryClosing();
+    if (copyTurnTimer) {
+      clearTimeout(copyTurnTimer);
+      copyTurnTimer = null;
+    }
   });
 
   function handleSelectionChange() {
@@ -607,27 +841,44 @@
             class="turn-step"
             disabled={!canPrev}
             aria-label="上一轮问答"
-            title="上一轮问答 (←)"
-            onclick={() => stepTurn(-1)}
+            title="上一轮问答 (←)，Shift+点击一次跳 5 轮"
+            onclick={(event) => stepTurn(-1, event)}
           >‹</button>
-          <span class="turn-count">{activeIndex + 1} / {turns.length}</span>
+          <button
+            type="button"
+            class="turn-count turn-count-btn"
+            onclick={() => onOpenOverview()}
+            title="打开消息概览，快速跳转问答轮次"
+            aria-label={`打开消息概览，当前第 ${activeIndex + 1} 轮，共 ${turns.length} 轮`}
+          >{activeIndex + 1} / {turns.length}</button>
           <button
             type="button"
             class="turn-step"
             disabled={!canNext}
             aria-label="下一轮问答"
-            title="下一轮问答 (→)"
-            onclick={() => stepTurn(1)}
+            title="下一轮问答 (→)，Shift+点击一次跳 5 轮"
+            onclick={(event) => stepTurn(1, event)}
           >›</button>
         </span>
         {#if onCopyTurn}
           <button
             type="button"
             class="turn-step turn-copy-btn"
-            onclick={() => onCopyTurn(activeTurn)}
+            class:copied={copyTurnStatus === 'copied'}
+            class:copy-failed={copyTurnStatus === 'failed'}
+            onclick={handleCopyTurn}
             aria-label="复制本轮问答"
             title="复制本轮问答 Markdown"
-          >复制本轮</button>
+          >{copyTurnStatus === 'copied' ? '已复制' : copyTurnStatus === 'failed' ? '复制失败' : '复制本轮'}</button>
+        {/if}
+        {#if showOffTailUnresolvedChip}
+          <button
+            type="button"
+            class="turn-unresolved-chip"
+            onclick={jumpToLatestTurn}
+            title="有未关联消息在最新一轮，点击跳到最新一轮"
+            aria-label={`有 ${unresolvedCount} 条未关联消息，点击跳到最新一轮`}
+          >未关联 {unresolvedCount} · 去最新</button>
         {/if}
         <span>一轮问答</span>
         {#if canScroll}
@@ -640,22 +891,22 @@
     </div>
     {#if activeTurn && (hasThought || hasTools || hasAnswer)}
       <nav class="turn-jump-chips" aria-label="本轮内容跳转">
-        <button type="button" onclick={() => scrollToSection('question')} title="跳到本轮提问">提问</button>
+        <button type="button" onclick={() => cycleJump('question')} title="跳到本轮提问">提问</button>
         {#if hasThought}
-          <button type="button" onclick={() => scrollToSection('thought')} title="跳到本轮思考过程">思考</button>
+          <button type="button" onclick={() => cycleJump('thought')} title={thoughtIndices.length > 1 ? `跳到本轮思考过程（共 ${thoughtIndices.length} 处，点击循环切换）` : '跳到本轮思考过程'}>{thoughtLabel}</button>
         {/if}
         {#if hasTools}
-          <button type="button" onclick={() => scrollToSection('tool')} title="跳到本轮工具调用">工具</button>
+          <button type="button" onclick={() => cycleJump('tool')} title={toolIndices.length > 1 ? `跳到本轮工具调用（共 ${toolIndices.length} 处，点击循环切换）` : '跳到本轮工具调用'}>{toolLabel}</button>
         {/if}
         {#if hasAnswer}
-          <button type="button" onclick={() => scrollToSection('answer')} title="跳到本轮回答">回答</button>
+          <button type="button" onclick={() => cycleJump('answer')} title={answerIndices.length > 1 ? `跳到本轮回答（共 ${answerIndices.length} 处，点击循环切换）` : '跳到本轮回答'}>{answerLabel}</button>
         {/if}
       </nav>
     {/if}
     <div
       class="single-message-scroller"
       bind:this={scroller}
-      onscroll={updateTailPinned}
+      onscroll={handleStageScroll}
       onmouseup={handleSelectionChange}
       onwheel={handleWheel}
       ontouchstart={handleTouchStart}
@@ -672,11 +923,11 @@
       >
         {#if activeTurn}
           <section class="turn-message turn-question">
-            <MessageBubble message={activeTurn.user} {onBranch} {onRetry} {onDismiss} {onEdit} />
+            <MessageBubble message={activeTurn.user} onBranch={handleBranch} branchDisabled={branchLive} {onRetry} {onDismiss} {onEdit} {onQuote} />
           </section>
           {#each activeTurn.replies as reply (reply.observationKey || reply.itemId || reply.id || reply.nodeId)}
             <section class={`turn-message turn-reply role-${reply?.role || 'unknown'}`}>
-              <MessageBubble message={reply} {onBranch} {onRetry} {onDismiss} {onEdit} />
+              <MessageBubble message={reply} onBranch={handleBranch} branchDisabled={branchLive} {onRetry} {onDismiss} {onEdit} {onQuote} />
             </section>
           {/each}
           {#if streaming && lastTurnActive && (!activeTurn.replies || activeTurn.replies.length === 0)}
@@ -712,7 +963,7 @@
                       <pre>{JSON.stringify(reply.ownershipFailure, null, 2)}</pre>
                     </details>
                   {/if}
-                  <MessageBubble message={reply} {onBranch} {onRetry} {onDismiss} {onEdit} />
+                  <MessageBubble message={reply} onBranch={handleBranch} branchDisabled={branchLive} {onRetry} {onDismiss} {onEdit} {onQuote} />
                 </section>
               {/each}
             </div>

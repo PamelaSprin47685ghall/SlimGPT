@@ -122,8 +122,12 @@ export function extractToolKeyArg(payload, tool = null) {
     }
     const objRes = extractKeyFromObject(target);
     if (objRes) return objRes;
+    const scalar = findFirstMeaningfulScalar(target);
+    if (scalar) return scalar;
   } else if (typeof target === 'string' && target.trim()) {
     return target.slice(0, 60).replace(/\s+/g, ' ').trim();
+  } else if (typeof target === 'number' && Number.isFinite(target)) {
+    return String(target);
   }
   const callId = tool?.callId || tool?.toolCallId || (tool?.callIds && tool.callIds[0]) || '';
   if (typeof callId === 'string' && callId.trim()) {
@@ -133,8 +137,30 @@ export function extractToolKeyArg(payload, tool = null) {
 }
 
 function formatShortCallId(id) {
-  if (id.length <= 16) return id;
-  return `${id.slice(0, 8)}…${id.slice(-6)}`;
+  if (!id) return '';
+  if (id.length <= 8) return id;
+  return `…${id.slice(-6)}`;
+}
+
+export function extractToolPairingState(tool, message = null) {
+  const state = tool?.pairingState ?? tool?.resultState ?? tool?.pairing ?? tool?.pairingStatus ??
+    message?.pairingState ?? message?.resultState ?? message?.pairing ?? message?.pairingStatus;
+  if (typeof state === 'string' && state.trim()) {
+    const s = state.trim().toLowerCase();
+    if (s === 'paired' || s === '已配对') return '已配对';
+    if (s === 'waiting' || s === 'pending' || s === 'waiting_result' || s === '等待结果') return '等待结果';
+    if (s === 'none' || s === 'no_result' || s === 'unpaired' || s === '无结果') return '无结果';
+    return state.trim();
+  }
+  const paired = tool?.paired ?? message?.paired;
+  if (typeof paired === 'boolean') {
+    return paired ? '已配对' : '无结果';
+  }
+  const hasResult = tool?.hasResult ?? tool?.has_result ?? message?.hasResult ?? message?.has_result;
+  if (typeof hasResult === 'boolean') {
+    return hasResult ? '已配对' : '等待结果';
+  }
+  return '';
 }
 
 function extractKeyFromObject(obj) {
@@ -150,6 +176,32 @@ function extractKeyFromObject(obj) {
     if (['id', 'call_id', 'callId', 'type', 'name'].includes(key)) continue;
     const formatted = formatKeyValue(key, val);
     if (formatted) return formatted;
+  }
+  return findFirstMeaningfulScalar(obj);
+}
+
+function findFirstMeaningfulScalar(val, depth = 0) {
+  if (depth > 6 || val == null) return '';
+  if (typeof val === 'string') {
+    const trimmed = val.trim();
+    if (trimmed && !/^[0-9a-f]{8}-[0-9a-f]{4}/i.test(trimmed) && !/^(true|false|null|undefined)$/i.test(trimmed)) {
+      return trimmed.length > 60 ? trimmed.slice(0, 60).replace(/\s+/g, ' ').trim() + '…' : trimmed.replace(/\s+/g, ' ').trim();
+    }
+  }
+  if (typeof val === 'number' && Number.isFinite(val)) {
+    return String(val);
+  }
+  if (Array.isArray(val)) {
+    for (const item of val) {
+      const res = findFirstMeaningfulScalar(item, depth + 1);
+      if (res) return res;
+    }
+  } else if (typeof val === 'object') {
+    for (const [k, v] of Object.entries(val)) {
+      if (['id', 'call_id', 'callId', 'tool_call_id', 'type', 'name'].includes(k)) continue;
+      const res = findFirstMeaningfulScalar(v, depth + 1);
+      if (res) return `${k}: ${res}`;
+    }
   }
   return '';
 }

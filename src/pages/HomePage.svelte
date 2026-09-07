@@ -9,7 +9,7 @@
   import { createConversationStreamReader } from '../lib/conversation-stream.js';
   import { historySyncMessage } from '../lib/history-sync.js';
   import { matchesPendingTurn } from '../lib/pending-turn.js';
-  import { prioritizeBanners, createStalenessTracker, trapModalKeydown, getScrimAriaLabel } from '../lib/shell-helpers.js';
+  import { prioritizeBanners, createStalenessTracker, trapModalKeydown, getScrimAriaLabel, isCompactLayout, getBannerActions, loadDismissedNoticeIds, saveDismissedNoticeIds, isPersistableBannerDismissal } from '../lib/shell-helpers.js';
   import { buildConversationMarkdown, buildTurnMarkdown, downloadConversationMarkdown, hasExportableMessage } from '../lib/export.js';
   import { copyText } from '../lib/clipboard.js';
   import { humanizeError, isTerminalMessage } from '../lib/message-presentation.js';
@@ -69,10 +69,22 @@
   let sidebarExportError = $state('');
   let composerStatus = $state('');
   let composerError = $state(false);
+  // Separate notice channel rendered ABOVE the composer (Gap1): non-send
+  // failures, restored drafts, stall recovery and take-back-after-stop.
+  // Never a send-retry: { kind, text, actions: [{ label, onClick }] }.
+  let actionNotice = $state(null);
+  let restoredDraftNoticeText = '';
   let draft = $state('');
   let sendInFlight = $state(false);
   let pendingCommandId = null;
   let pendingCommandConversationId = null;
+  // New-chat draft tracking (Gap2): the key the draft lived under at submit
+  // (null for a fresh chat) plus its text, so confirm-clear works under the
+  // original key or the migrated uuid key. Peer P3 stop state alongside.
+  let submittedDraftKey = null;
+  let submittedDraftText = '';
+  let lastSubmittedText = '';
+  let userInitiatedStop = false;
   let compactLayout = $state(true);
   let mobilePanel = $state('none');
   let lastActiveMobileTrigger = null;
@@ -96,18 +108,82 @@
   }
 
   let expandedBanners = $state(false);
-  let dismissedBannerIds = $state(new Set());
+  let dismissedBannerIds = $state(loadDismissedNoticeIds());
+  // Session-only hides for the secondary banner stack: dismissing an
+  // error-level secondary entry collapses it this session, but it resurfaces
+  // as the top banner (prioritizeBanners never drops error-level entries).
+  let secondaryDismissedIds = $state(new Set());
+  // Native browser network state (window online/offline events, no polling).
+  let isBrowserOnline = $state(typeof navigator !== 'undefined' && typeof navigator.onLine === 'boolean' ? navigator.onLine : true);
   let statusStale = $state(false);
 
-  function dismissBanner(id) {
+  function dismissBanner(id, options = {}) {
     if (!id) return;
+    const banner = activeBanners.find((entry) => entry.id === id);
+    if (options.secondary) {
+      const nextSecondary = new Set(secondaryDismissedIds);
+      nextSecondary.add(id);
+      secondaryDismissedIds = nextSecondary;
+      // Error-level entries always resurface: keep them out of the
+      // persisted/session dismissal set so a promoted top banner still shows.
+      if (banner && banner.level === 'error') return;
+    }
     const next = new Set(dismissedBannerIds);
     next.add(id);
     dismissedBannerIds = next;
+    // Only notice-level dismissals persist; errors/warnings/offline states
+    // always resurface after reload.
+    if (banner && isPersistableBannerDismissal(banner)) {
+      const persisted = loadDismissedNoticeIds();
+      persisted.add(id);
+      saveDismissedNoticeIds(persisted);
+    }
   }
   let showShortcutsModal = $state(false);
   let panelPointerIntent = null;
   let activeTurnIndex = $state(0);
+  // Rank1 scroll memory (HomePage half): last activeTurnIndex per conversation
+  // in-memory + sessionStorage, plus the turn count seen when last viewing it
+  // so reselect restores the old position unless live activity arrived.
+  const turnIndexMemory = new Map();
+  const seenTurnCounts = new Map();
+  const TURN_INDEX_STORAGE_KEY = 'slimgpt-turn-index-v1';
+  function readStoredTurnIndex(key) {
+    try {
+      const raw = sessionStorage.getItem(`${TURN_INDEX_STORAGE_KEY}:${key}`);
+      if (raw == null) return null;
+      const parsed = JSON.parse(raw);
+      const index = Number(parsed?.index);
+      return Number.isFinite(index) && index >= 0 ? Math.floor(index) : null;
+    } catch {
+      return null;
+    }
+  }
+  function persistTurnIndex(key, index, count) {
+    turnIndexMemory.set(key, index);
+    try {
+      sessionStorage.setItem(`${TURN_INDEX_STORAGE_KEY}:${key}`, JSON.stringify({ index, count, at: Date.now() }));
+    } catch {
+      // sessionStorage unavailable (private mode) — in-memory map still works
+    }
+  }
+  function resolveRestoredTurnIndex(key, count) {
+    if (!count) return 0;
+    const savedIndex = turnIndexMemory.has(key) ? turnIndexMemory.get(key) : readStoredTurnIndex(key);
+    const seen = seenTurnCounts.get(key);
+    if (savedIndex == null) {
+      seenTurnCounts.set(key, count);
+      return count - 1;
+    }
+    const clamped = Math.max(0, Math.min(count - 1, savedIndex));
+    if (seen != null && count > seen) {
+      seenTurnCounts.set(key, count);
+      setComposerStatus('离开期间收到新内容，已定位到最新一轮');
+      return count - 1;
+    }
+    seenTurnCounts.set(key, count);
+    return clamped;
+  }
   let saveTimer = null;
   let persistInFlight = false;
   let persistQueued = false;
@@ -203,13 +279,15 @@
     return `分支 ${index}/${branched.siblingCount}`;
   });
   const liveConnected = $derived(status.bridgeReady && status.captureMode === 'page' && !statusStale);
-  const statusState = $derived(status.bridgeError ? 'error' : (liveConnected ? 'online' : (statusStale ? 'offline' : 'offline')));
+  const statusState = $derived(status.bridgeError ? 'error' : (!isBrowserOnline || !liveConnected ? 'offline' : 'online'));
   const statusLabel = $derived(
   status.bridgeError
     ? '连接失败'
-    : (status.takeover === false
-        ? (liveConnected ? '已连接（官方界面可见）' : '未连接')
-        : (liveConnected ? '已接管' : '连接中'))
+    : (!isBrowserOnline
+        ? '网络离线'
+        : (status.takeover === false
+          ? (liveConnected ? '已连接（官方界面可见）' : '未连接')
+          : (liveConnected ? '已接管' : '连接中')))
   );
   const activeBanners = $derived(prioritizeBanners({
     bridgeError: Boolean(status.bridgeError),
@@ -222,9 +300,10 @@
     conversationBlockingLoad,
     conversationTimedOut,
     dismissedBannerIds,
+    browserOffline: !isBrowserOnline,
   }));
   const topBanner = $derived(activeBanners[0] || null);
-  const secondaryBanners = $derived(activeBanners.slice(1));
+  const secondaryBanners = $derived(activeBanners.slice(1).filter((banner) => !secondaryDismissedIds.has(banner.id)));
   const conversationHistoryPending = $derived(Boolean(currentConversationId && !currentRecord?.canonicalComplete));
   const currentHistorySyncState = $derived(historySyncStates.get(currentConversationId));
   const historySyncProblem = $derived(historySyncMessage(currentHistorySyncState,
@@ -246,13 +325,14 @@
   const hasActiveLiveGeneration = $derived.by(() => {
     if (conversationWorkState !== 'running') return false;
     const lastReply = [...messages].reverse().find((m) => m?.role !== 'user');
-    if (lastReply) return !isTerminalMessage(lastReply);
-    const live = currentRecord?.observations || [];
-    const last = [...live].reverse().find((m) => m?.role !== 'user');
-    if (!last || isTerminalMessage(last)) return false;
-    const canonicalMsg = currentRecord?.payload?.mapping?.[last.id || last.nodeId]?.message;
-    if (canonicalMsg && isTerminalMessage(canonicalMsg)) return false;
-    return true;
+    // Visible-timeline tail only: finished DOM-capture residue lingers in
+    // `observations` without ever binding to a turn, so bare observations
+    // cannot tell a completed stream from real streaming. Only a
+    // non-terminal timeline tail (official SSE or live DOM turn growth)
+    // counts here; post-submit pre-first-token is covered by the
+    // open-submit disjunct of composerGenerating.
+    if (!lastReply) return false;
+    return !isTerminalMessage(lastReply);
   });
   // This conversation's recent sent user texts (oldest → newest) for the
   // composer's ArrowUp/Down history recall.
@@ -357,7 +437,7 @@
     if (key !== previousDisplayConversationId) {
       previousDisplayConversationId = key;
       previousTurnCount = count;
-      activeTurnIndex = Math.max(0, count - 1);
+      activeTurnIndex = resolveRestoredTurnIndex(key, count);
       return;
     }
     if (!count) {
@@ -365,27 +445,58 @@
       activeTurnIndex = 0;
       return;
     }
-    if (previousTurnCount === 0 || activeTurnIndex >= count) activeTurnIndex = count - 1;
+    // Fresh payload for the current conversation (initial load after switch):
+    // restore the remembered position instead of forcing latest.
+    if (previousTurnCount === 0) activeTurnIndex = resolveRestoredTurnIndex(key, count);
+    else if (activeTurnIndex >= count || activeTurnIndex < 0) activeTurnIndex = Math.max(0, Math.min(count - 1, activeTurnIndex));
     previousTurnCount = count;
+  });
+
+  // Remember the position on every change so reselect can restore it.
+  $effect(() => {
+    const key = displayConversationId || 'new';
+    // Loading placeholder (no turns yet, index reset to 0) is not a real
+    // position — persisting it would clobber the remembered index.
+    if (!turns.length && activeTurnIndex === 0) return;
+    persistTurnIndex(key, activeTurnIndex, turns.length);
   });
 
   onMount(() => {
     let unsubscribe = transport.subscribe(handleTransportMessage);
     let unsubscribeStorage = subscribeStorageChanges(handleStorageChange);
-    const layoutQuery = matchMedia('(max-width: 960px), (pointer: coarse)');
+    const layoutQuery = matchMedia('(max-width: 960px), (max-width: 1100px), (pointer: coarse), (pointer: fine)');
     const syncLayout = () => {
-      const touchCompact = navigator.maxTouchPoints > 0 && matchMedia('(pointer: coarse)').matches;
-      const nextCompact = window.innerWidth <= 960 || touchCompact;
+      // Coarse-only (touch without a fine pointer) keeps touch-sized targets
+      // up to 1100px; hybrid and desktop pointers keep 3 panes above 960px.
+      const nextCompact = isCompactLayout({
+        width: window.innerWidth,
+        hasCoarsePointer: matchMedia('(pointer: coarse)').matches,
+        hasFinePointer: matchMedia('(pointer: fine)').matches,
+      });
       if (nextCompact !== compactLayout) {
         compactLayout = nextCompact;
         mobilePanel = 'none';
       }
     };
+    // Soft-keyboard offset (event-driven): visualViewport shrinks when the
+    // keyboard opens; pad the composer by the covered height so input stays visible.
+    const syncViewportOffset = () => {
+      const viewport = window.visualViewport;
+      if (!viewport) return;
+      const offset = Math.max(0, Math.round((window.innerHeight || 0) - viewport.height));
+      document.documentElement.style.setProperty('--slim-vv-offset', `${offset}px`);
+    };
+    const handleBrowserOnline = () => { isBrowserOnline = true; };
+    const handleBrowserOffline = () => { isBrowserOnline = false; };
     layoutQuery.addEventListener?.('change', syncLayout);
     window.addEventListener('resize', syncLayout);
+    window.addEventListener('online', handleBrowserOnline);
+    window.addEventListener('offline', handleBrowserOffline);
     window.visualViewport?.addEventListener('resize', syncLayout);
+    window.visualViewport?.addEventListener('resize', syncViewportOffset);
     const handleGlobalKeydown = (event) => {
       if (event.key === 'Escape') {
+        if (window.__slimgptLightboxOpen) return;
         if (showShortcutsModal) {
           event.preventDefault();
           closeShortcutsModal();
@@ -418,6 +529,22 @@
         event.preventDefault();
         if (showShortcutsModal) closeShortcutsModal(); else openShortcutsModal();
       }
+      // Rank11 P4 keyboard: J/K and [ ] flip turns when NOT editing (the
+      // isEditing guard above already returned), no modal/drawer/lightbox is
+      // open, and no modifier is held.
+      if (!event.metaKey && !event.ctrlKey && !event.altKey &&
+        (event.key === 'j' || event.key === 'J' || event.key === 'k' || event.key === 'K' || event.key === '[' || event.key === ']')) {
+        if (showShortcutsModal) return;
+        if (compactLayout && mobilePanel !== 'none') return;
+        if (document.querySelector('.message-lightbox-scrim, dialog[open], .shortcuts-modal-backdrop')) return;
+        if (!turns.length) return;
+        const delta = (event.key === 'j' || event.key === 'J' || event.key === ']') ? 1 : -1;
+        const next = Math.max(0, Math.min(turns.length - 1, activeTurnIndex + delta));
+        if (next !== activeTurnIndex) {
+          event.preventDefault();
+          activeTurnIndex = next;
+        }
+      }
     };
     window.addEventListener('keydown', handleGlobalKeydown);
     const flushWhenHidden = () => {
@@ -425,6 +552,7 @@
     };
     document.addEventListener('visibilitychange', flushWhenHidden);
     syncLayout();
+    syncViewportOffset();
     transport.start();
     restoreIndex();
     restoreObservationLedger();
@@ -445,7 +573,10 @@
       clearPendingLiveEvents();
       layoutQuery.removeEventListener?.('change', syncLayout);
       window.removeEventListener('resize', syncLayout);
+      window.removeEventListener('online', handleBrowserOnline);
+      window.removeEventListener('offline', handleBrowserOffline);
       window.visualViewport?.removeEventListener('resize', syncLayout);
+      window.visualViewport?.removeEventListener('resize', syncViewportOffset);
       window.removeEventListener('keydown', handleGlobalKeydown);
       document.removeEventListener('visibilitychange', flushWhenHidden);
     };
@@ -821,6 +952,9 @@
     }));
     conversationRecords = next;
     schedulePersist();
+    // Generation watchdog (Gap8, COMPOSER): every accepted live chunk
+    // restarts the one-shot stall timer.
+    noteGenerationChunk();
     updateConversationPreviewFromMessage(id, event.message);
     if (id === currentConversationId) reconcilePending(id, event.message);
   }
@@ -1139,12 +1273,17 @@
     }
   }
 
-  function selectConversation(id) {
+ function selectConversation(id) {
     if (sendInFlight) {
       sidebarNotice = '消息提交中，请等待确认后再切换对话';
       setComposerStatus('消息提交中，请等待确认后再切换对话', true);
       return;
     }
+    // Background generation continues on switch (ChatGPT parity): a
+    // stale-running silent turn must never trap navigation. Always proceed;
+    // only leave a transient info notice when genuinely generating.
+    const wasGenerating = composerGenerating;
+    const isLeaving = id !== currentConversationId;
     // Allow re-click retry if timed out or incomplete
     const record = conversationRecords.get(id);
     const isTimedOut = navigationTimedOutId === id;
@@ -1157,7 +1296,7 @@
     }
     setCurrentConversation(id);
     thinkingLevelOverride = null;
-    sidebarNotice = '';
+    sidebarNotice = wasGenerating && isLeaving ? '上一个对话仍在生成中，可随时切回查看' : '';
     startConversationLoading(id);
     closeMobilePanels();
     if (transport.supportsLiveChat) {
@@ -1173,8 +1312,14 @@
       setComposerStatus('当前消息仍在提交，请等待确认后再新建对话', true);
       return;
     }
+    // Background generation continues on switch (ChatGPT parity): always
+    // proceed to the new chat; only leave a transient info notice when
+    // genuinely generating in the conversation being left.
+    const wasGenerating = composerGenerating;
+    const isLeaving = currentConversationId !== null;
     setCurrentConversation(null);
     thinkingLevelOverride = null;
+    sidebarNotice = wasGenerating && isLeaving ? '上一个对话仍在生成中，可随时切回查看' : '';
     newChatWorkState = 'unknown';
     finishConversationLoading();
     pendingUser = null;
@@ -1182,6 +1327,9 @@
     // null (setCurrentConversation already did when switching); it clears
     // only on confirmed send (handleComposerResult).
     draft = draftsByConversation.get(null) || '';
+    // Draft transparency (Gap7): announce a restored draft with an abandon
+    // affordance instead of silently resurrecting it.
+    showRestoredDraftNotice(null, draft);
     submittedStateByConversation.delete(null);
     clearPendingLiveEvents();
     closeMobilePanels();
@@ -1205,6 +1353,9 @@
     draftsByConversation.set(previousId, draft);
     currentConversationId = nextId;
     draft = draftsByConversation.get(nextId) || '';
+    // Draft transparency (Gap7): announce a restored draft with an abandon
+    // affordance instead of silently resurrecting it.
+    showRestoredDraftNotice(nextId, draft);
   }
 
   function bindPendingConversation(id) {
@@ -1303,7 +1454,8 @@
     const hasUnresolved = unresolvedTurns.some((group) => group.replies?.some(hasExportableMessage));
     if (!exportable.length && !hasUnresolved) {
       sidebarExportError = conversationHistoryPending ? '当前对话尚未加载，暂无可导出的内容' : '当前对话暂无可导出的消息';
-      setComposerStatus(sidebarExportError, true);
+      // Non-send failure (Gap1): separate notice channel, no send-retry.
+      setActionNotice(sidebarExportError, { kind: 'transient' });
       return;
     }
     const title = currentMeta?.title || 'ChatGPT Conversation';
@@ -1321,7 +1473,8 @@
       setComposerStatus(conversationHistoryPending ? `已导出当前已取得的内容（历史不完整）：${filename}` : `已导出 ${filename}`);
       sidebarExportError = '';
     } catch {
-      setComposerStatus('导出失败，未生成完整文件；当前聊天内容仍保留在页面中', true);
+      // Non-send failure (Gap1): separate notice channel, no send-retry.
+      setActionNotice('导出失败，未生成完整文件；当前聊天内容仍保留在页面中', { kind: 'transient' });
       sidebarExportError = '导出失败，未生成完整文件';
     }
   }
@@ -1333,7 +1486,8 @@
     const hasUnresolved = unresolvedTurns.some((group) => group.replies?.some(hasExportableMessage));
     if (!exportable.length && !hasUnresolved) {
       sidebarExportError = conversationHistoryPending ? '当前对话尚未加载，暂无可复制的内容' : '当前对话暂无可复制的消息';
-      setComposerStatus(sidebarExportError, true);
+      // Non-send failure (Gap1): separate notice channel, no send-retry.
+      setActionNotice(sidebarExportError, { kind: 'transient' });
       return false;
     }
     const title = currentMeta?.title || 'ChatGPT Conversation';
@@ -1351,7 +1505,8 @@
       sidebarExportError = '';
       return true;
     } catch {
-      setComposerStatus('复制失败，请手动选择并复制', true);
+      // Non-send failure (Gap1): separate notice channel, no send-retry.
+      setActionNotice('复制失败，请手动选择并复制', { kind: 'transient' });
       sidebarExportError = '复制失败，请手动选择并复制';
       return false;
     }
@@ -1363,7 +1518,8 @@
       includeTools: opts.includeTools !== false,
     });
     if (!content.trim()) {
-      setComposerStatus('本轮暂无可复制的内容', true);
+      // Non-send failure (Gap1): separate notice channel, no send-retry.
+      setActionNotice('本轮暂无可复制的内容', { kind: 'transient' });
       return false;
     }
     try {
@@ -1371,7 +1527,8 @@
       setComposerStatus('已复制本轮 Markdown');
       return true;
     } catch {
-      setComposerStatus('复制失败，请手动选择并复制', true);
+      // Non-send failure (Gap1): separate notice channel, no send-retry.
+      setActionNotice('复制失败，请手动选择并复制', { kind: 'transient' });
       return false;
     }
   }
@@ -1440,7 +1597,7 @@
     // Generation gate, done right: a stale 'running' work state with a
     // terminal observation still dispatches (no open turn), but post-submit
     // pre-first-token refuses (submitted && unsettled closes the hole).
-    if (hasActiveLiveGeneration || (hasOpenSubmit && !settledSinceSubmit)) {
+    if (composerGenerating) {
       setComposerStatus('正在生成回答，请稍候…');
       return;
     }
@@ -1449,6 +1606,17 @@
     const commandId = crypto.randomUUID();
     const thinkingLevel = options?.thinkingLevel || effectiveThinkingLevel;
     const levelObj = THINKING_LEVELS.find((item) => item.level === thinkingLevel) || THINKING_LEVELS[2];
+    // Track the submitted draft key + text (Gap2): null for a new chat, so
+    // confirm-clear matches under the original or the migrated uuid key.
+    // Also feeds Peer P3 take-back-after-stop. Sending consumes (not edits)
+    // a restored draft, so its abandon affordance goes away here.
+    submittedDraftKey = currentConversationId ?? null;
+    submittedDraftText = String(text || '').trim();
+    lastSubmittedText = String(text || '');
+    if (actionNotice?.kind === 'restored-draft') {
+      actionNotice = null;
+      restoredDraftNoticeText = '';
+    }
     sendInFlight = true;
     pendingCommandId = commandId;
     pendingCommandConversationId = currentConversationId;
@@ -1491,7 +1659,10 @@
       if (pendingCommandId !== commandId) return;
       cancelSendWait();
     }, SEND_COMMAND_WATCHDOG_MS);
-    setComposerStatus('正在通过 ChatGPT 页面发送；断线后不会自动重发');
+    // Calm copy (Gap11): no dread phrasing about disconnects.
+    setComposerStatus('正在经官方页面发送…');
+    // Generation watchdog (Gap8): one-shot stall timer, reset per chunk.
+    armGenerationWatchdog();
   }
 
   function handleComposerResult(message) {
@@ -1503,6 +1674,11 @@
     sendInFlight = false;
     pendingCommandId = null;
     pendingCommandConversationId = null;
+    // A result settles the submit through the normal path (Gap5/P3): stop
+    // the stall timer, and consume a pending user-stop without offering
+    // take-back here (take-back is only for running→stopped settles).
+    disarmGenerationWatchdog();
+    userInitiatedStop = false;
     if (!message.ok) {
       if (pendingUser) {
         pendingUser = {
@@ -1538,33 +1714,29 @@
       return;
     }
     if (submitted) {
-      const submittedText = submitted.text.trim();
-      if (
-        currentConversationId === submitted.conversationId &&
-        draft.trim() === submittedText
-      ) {
+      // Confirm-clears-draft under either key (Gap2): a new chat submits
+      // under the null key but settles after migrating to the bound uuid,
+      // so text equality — not key identity — decides the clear.
+      const submittedText = String(submitted.text ?? submittedDraftText ?? '').trim();
+      if (submittedText && draft.trim() === submittedText) {
         draft = '';
       }
-      const storedDraft = draftsByConversation.get(submitted.conversationId);
-      if (typeof storedDraft === 'string' && storedDraft.trim() === submittedText) {
-        draftsByConversation.set(submitted.conversationId, '');
+      if (submittedText) {
+        for (const key of [submitted.conversationId ?? null, submittedDraftKey ?? null, submittedConversationId ?? null, currentConversationId ?? null]) {
+          const storedDraft = draftsByConversation.get(key);
+          if (typeof storedDraft === 'string' && storedDraft.trim() === submittedText) {
+            draftsByConversation.set(key, '');
+          }
+        }
       }
     }
+    submittedDraftKey = null;
+    submittedDraftText = '';
     setComposerStatus('消息已发送（官方已确认）');
     queueMicrotask(focusComposer);
   }
 
-  // Composer error-alert 就地重试: resend the current draft text via the
-  // existing dispatch; with an empty draft, retry the failed pending text.
-  function handleComposerRetry() {
-    if (draft.trim()) {
-      sendMessage(draft.trim());
-      return;
-    }
-    if (pendingUser) handleRetrySend(pendingUser.message);
-  }
-
-  function handleRetrySend(targetMessage) {
+  function handleRetrySend(targetMessage, levelOverride = null) {
     // Assistant/tool retries resend the turn's USER text, never assistant
     // output. User/pending retries keep the message's own text.
     let textToRetry = '';
@@ -1581,7 +1753,11 @@
     if (pendingUser) {
       pendingUser = null;
     }
-    sendMessage(textToRetry);
+    const options = {};
+    if (typeof levelOverride === 'number') {
+      options.thinkingLevel = levelOverride;
+    }
+    sendMessage(textToRetry, options);
   }
 
   function messageIdentityMatches(a, b) {
@@ -1612,13 +1788,20 @@
   }
 
   function handleStopGeneration() {
-    if (conversationWorkState !== 'running') return;
-    transport.stopGeneration();
+    // Stop works pre-first-token (Gap5): starting/unknown with an open
+    // submit still dispatches; transport.js itself is untouched. Settles via
+    // the normal result path; Peer P3 take-back is offered on settle.
+    const hasOpen = pendingCommandId != null || submittedStateByConversation.has(currentConversationId ?? null);
+    const state = conversationWorkState;
+    if (state !== 'running' && state !== 'starting' && !(state === 'unknown' && hasOpen)) return;
+    userInitiatedStop = true;
+    if (pendingUser?.text) lastSubmittedText = pendingUser.text;
+    try { transport.stopGeneration(); } catch {}
     // The user explicitly ended the turn: free the gate for the next send.
     submittedStateByConversation.delete(currentConversationId ?? null);
     // A missing official stop control reports back as a command-error and
     // overwrites this optimistic notice; success flips the work state.
-    setComposerStatus('正在请求停止生成…');
+    setComposerStatus('正在停止…');
   }
 
   function handleDismissPendingUser() {
@@ -1754,6 +1937,134 @@
     }
   }
 
+  // Separate notice channel (Gap1): { kind, text, actions: [{ label, onClick }]}.
+  // A retry action, when present, must name its target explicitly (e.g.
+  // `重试发送`); non-send failures never carry one. Single-action shorthand
+  // supported via { actionLabel, onAction }.
+  function setActionNotice(text, opts = {}) {
+    if (!text) { actionNotice = null; return; }
+    const actions = Array.isArray(opts.actions)
+      ? opts.actions.filter((item) => item && item.label && typeof item.onClick === 'function')
+      : (opts.actionLabel && typeof opts.onAction === 'function'
+        ? [{ label: opts.actionLabel, onClick: opts.onAction }]
+        : []);
+    actionNotice = { kind: opts.kind || 'transient', text: String(text), actions };
+  }
+
+  function dismissActionNotice() {
+    actionNotice = null;
+  }
+
+  // Draft transparency (Gap7): a restored (non-empty, non-fresh) draft is
+  // announced with an abandon affordance; never silently resurrected.
+  function showRestoredDraftNotice(key, text) {
+    if (!text || !String(text).trim()) return;
+    if (actionNotice && actionNotice.kind !== 'restored-draft') return;
+    restoredDraftNoticeText = String(text);
+    setActionNotice('已恢复未发送草稿', {
+      kind: 'restored-draft',
+      actionLabel: '放弃',
+      onAction: () => abandonRestoredDraft(key),
+    });
+  }
+
+  function abandonRestoredDraft(key) {
+    // Abandon only discards the still-untouched restored text; if the user
+    // already typed something new, just dismiss the affordance instead.
+    if (!restoredDraftNoticeText || draft !== restoredDraftNoticeText) {
+      if (actionNotice?.kind === 'restored-draft') actionNotice = null;
+      restoredDraftNoticeText = '';
+      return;
+    }
+    const targetKey = key ?? currentConversationId;
+    draftsByConversation.delete(targetKey);
+    writeDraftsNow('', targetKey);
+    draft = '';
+    restoredDraftNoticeText = '';
+    if (actionNotice?.kind === 'restored-draft') actionNotice = null;
+  }
+
+  // Generation watchdog (Gap8): one-shot stall timer, restarted by every
+  // accepted chunk. Fires only while running with zero chunks for 10 min.
+  const GENERATION_STALL_TIMEOUT_MS = 10 * 60 * 1000;
+  let generationStallTimer = null;
+  let generationStallChunks = 0;
+
+  function onGenerationStall() {
+    generationStallTimer = null;
+    if (conversationWorkState !== 'running' || generationStallChunks > 0) return;
+    setActionNotice('长时间无响应，官方页面可能仍在生成', {
+      kind: 'stall',
+      actions: [
+        { label: '重新同步', onClick: resyncStalledConversation },
+        { label: '强制解除占用', onClick: forceReleaseGeneration },
+      ],
+    });
+  }
+
+  function armGenerationWatchdog() {
+    clearTimeout(generationStallTimer);
+    generationStallChunks = 0;
+    generationStallTimer = setTimeout(onGenerationStall, GENERATION_STALL_TIMEOUT_MS);
+  }
+
+  function noteGenerationChunk() {
+    if (generationStallTimer == null) return;
+    generationStallChunks += 1;
+    clearTimeout(generationStallTimer);
+    generationStallTimer = setTimeout(onGenerationStall, GENERATION_STALL_TIMEOUT_MS);
+  }
+
+  function disarmGenerationWatchdog() {
+    clearTimeout(generationStallTimer);
+    generationStallTimer = null;
+    generationStallChunks = 0;
+  }
+
+  function resyncStalledConversation() {
+    if (currentConversationId) {
+      transport.send({ type: 'refresh-conversation', conversationId: currentConversationId });
+    }
+    dismissActionNotice();
+    setComposerStatus('正在重新同步会话…');
+  }
+
+  function forceReleaseGeneration() {
+    // Local-only release: free the submit gate and mark stopped locally.
+    // Observations, cache and protocol are untouched; the official page may
+    // still be generating and late content syncs back if it arrives.
+    submittedStateByConversation.delete(currentConversationId ?? null);
+    setConversationWorkState(currentConversationId, 'stopped');
+    disarmGenerationWatchdog();
+    dismissActionNotice();
+    setComposerStatus('已在本地解除占用；官方页面可能仍在生成，新内容到达会自动同步');
+  }
+
+  $effect(() => {
+    // The watchdog follows the live gate: a settled turn needs no timer.
+    if (conversationWorkState !== 'running' && generationStallTimer != null) disarmGenerationWatchdog();
+  });
+
+  $effect(() => {
+    // Peer P3 take-back-after-stop: a user-initiated stop that settles via
+    // running→stopped offers the last submitted text back for rewrite.
+    // Never auto-injects: only the click restores draft + focus.
+    if (userInitiatedStop && conversationWorkState === 'stopped' && String(lastSubmittedText || '').trim()) {
+      userInitiatedStop = false;
+      const text = lastSubmittedText;
+      setActionNotice('回答已停止生成', {
+        kind: 'take-back',
+        actionLabel: '取回上条提问改写',
+        onAction: () => {
+          draft = text;
+          draftsByConversation.set(currentConversationId, text);
+          if (actionNotice?.kind === 'take-back') actionNotice = null;
+          queueMicrotask(focusComposer);
+        },
+      });
+    }
+  });
+
   function persistDraftsSoon(snapshot, key) {
     clearTimeout(draftPersistTimer);
     draftPersistTimer = setTimeout(() => writeDraftsNow(snapshot, key), 300);
@@ -1783,7 +2094,11 @@
         draftsByConversation.set(key === '\0' ? null : String(key), value);
       }
       const restored = draftsByConversation.get(currentConversationId);
-      if (typeof restored === 'string' && restored) draft = restored;
+      if (typeof restored === 'string' && restored) {
+        draft = restored;
+        // Draft transparency (Gap7): announce instead of silently reviving.
+        showRestoredDraftNotice(currentConversationId, draft);
+      }
     } catch {}
   }
 
@@ -1803,6 +2118,12 @@
     const key = currentConversationId;
     persistDraftsSoon(snapshot, key);
     if (snapshot && composerStatus && !composerError) composerStatus = '';
+    // A restored draft stops being "restored" once edited, sent or emptied:
+    // typing dismisses the abandon affordance (Gap7).
+    if (actionNotice?.kind === 'restored-draft' && snapshot !== restoredDraftNoticeText) {
+      actionNotice = null;
+      restoredDraftNoticeText = '';
+    }
   });
 
   function schedulePersist() {
@@ -1835,7 +2156,8 @@
       ]);
       applyCacheOmissions(omissions);
     } catch {
-      setComposerStatus('无法保存本地会话缓存；当前聊天不受影响', true);
+      // Non-send failure (Gap1): separate notice channel, no send-retry.
+      setActionNotice('无法保存本地会话缓存；当前聊天不受影响', { kind: 'transient' });
     } finally {
       persistInFlight = false;
       if (persistQueued) {
@@ -1913,6 +2235,22 @@
   function selectOverviewMessage(index) {
     activeTurnIndex = Math.max(0, Math.min(turns.length - 1, Number(index) || 0));
     closeMobilePanels();
+  }
+
+  // Rank9: N / M counter opens the overview drawer (desktop focuses it,
+  // compact opens the overview panel).
+  function openOverviewFromStage() {
+    if (compactLayout) {
+      if (mobilePanel !== 'overview') toggleOverview();
+      return;
+    }
+    queueMicrotask(() => {
+      const target = document.querySelector('.overview-host .overview-filter-input') ||
+        document.querySelector('.overview-host .overview-item.active') ||
+        document.querySelector('.overview-host .overview-item');
+      target?.focus?.();
+      target?.scrollIntoView?.({ block: 'nearest' });
+    });
   }
 
   function toggleSidebar() {
@@ -2114,7 +2452,8 @@
         exportError={sidebarExportError}
         {sidebarNotice}
         onRetryHistorySync={retryHistorySync}
-        onClearNotice={() => { sidebarNotice = ''; sidebarExportError = ''; }}
+        onClearNotice={() => { sidebarNotice = ''; }}
+        onClearExportError={() => { sidebarExportError = ''; }}
         {statusLabel}
         {statusState}
         {captures}
@@ -2131,7 +2470,7 @@
       />
     </div>
 
-    <main class="chat-pane">
+    <main class="chat-pane" inert={compactLayout && mobilePanel !== 'none'}>
       <header class="desktop-chat-header">
         <div class="header-title-group">
           <strong>{currentMeta?.title || (currentConversationId ? '加载中的对话' : '新对话')}</strong>
@@ -2169,6 +2508,7 @@
             streaming={conversationActivelyWorking}
             onQuote={handleQuoteText}
             onCopyTurn={copyTurnMarkdown}
+            onOpenOverview={openOverviewFromStage}
           />
         {:else if !conversationHistoryPending}
           <div class="empty-state">
@@ -2177,7 +2517,7 @@
               <h2>尚未与 ChatGPT 建立通信</h2>
               <p>请确认官方页面已登录并完成加载，然后刷新官方网页重试；连接恢复后即可在此收发消息。</p>
               <div class="empty-actions">
-                <Button outline small onClick={() => transport.openOfficial(currentConversationId)}>刷新官方网页</Button>
+                <Button outline small onClick={() => transport.openOfficial(currentConversationId)}>查看官方界面</Button>
                 <Button outline small onClick={(event) => openShortcutsModal(event.currentTarget)}>快捷键指南</Button>
               </div>
             {:else}
@@ -2243,11 +2583,18 @@
                       <strong>{banner.title}</strong>
                       <span>{banner.message}</span>
                     </div>
-                    {#if banner.level !== 'error'}
-                      <div class="banner-actions">
-                        <button type="button" class="banner-dismiss-btn" aria-label={`关闭提醒：${banner.title}`} title="关闭此提醒" onclick={() => dismissBanner(banner.id)}>✕</button>
-                      </div>
-                    {/if}
+                    <div class="banner-actions">
+                      {#each getBannerActions(banner) as action (action.key)}
+                        {#if action.key === 'open-official'}
+                          <Button small outline onClick={() => transport.openOfficial(currentConversationId)}>{action.label}</Button>
+                        {:else if action.key === 'recheck'}
+                          <Button small outline onClick={() => transport.send({ type: 'request-status' })}>{action.label}</Button>
+                        {:else if action.key === 'retry-sync'}
+                          <Button small outline disabled={!status.bridgeReady} onClick={retryHistorySync}>{action.label}</Button>
+                        {/if}
+                      {/each}
+                      <button type="button" class="banner-dismiss-btn" aria-label={`关闭提醒：${banner.title}`} title="关闭此提醒" onclick={() => dismissBanner(banner.id, { secondary: true })}>✕</button>
+                    </div>
                   </div>
                 {/each}
               {/if}
@@ -2271,6 +2618,16 @@
         </div>
       {/if}
 
+      {#if actionNotice}
+        <div class="composer-action-notice" role="status">
+          <span class="composer-action-notice-text composer-status">{actionNotice.text}</span>
+          {#each actionNotice.actions as action, index (index)}
+            <button type="button" class="composer-action-notice-btn" onclick={action.onClick}>{action.label}</button>
+          {/each}
+          <button type="button" class="composer-action-notice-dismiss" aria-label="关闭提示" onclick={dismissActionNotice}>×</button>
+        </div>
+      {/if}
+
       <Composer
         bind:this={composerRef}
         bind:value={draft}
@@ -2287,7 +2644,6 @@
         onSend={sendMessage}
         onStop={handleStopGeneration}
         onCancelSend={cancelSendWait}
-        onRetry={handleComposerRetry}
         onReturnToLatestBranch={resetToLatestBranch}
       />
     </main>
@@ -2356,6 +2712,14 @@
           <div class="shortcut-row">
             <kbd>← / →</kbd>
             <span>在问答轮次间前后翻页</span>
+          </div>
+          <div class="shortcut-row">
+            <kbd>J / K · [ / ]</kbd>
+            <span>在问答轮次间前后翻页（输入框聚焦或弹窗打开时除外）</span>
+          </div>
+          <div class="shortcut-row">
+            <kbd>Shift + 点击 ‹ / ›</kbd>
+            <span>一次跳过 5 轮问答；点击 N / M 打开消息概览</span>
           </div>
           <div class="shortcut-row">
             <kbd>↑ / ↓</kbd>

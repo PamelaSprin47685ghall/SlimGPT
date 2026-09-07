@@ -105,9 +105,20 @@ function createParser(root) {
       node.loading = 'lazy';
       node.referrerPolicy = 'no-referrer';
       node.alt = '';
+      node.tabIndex = 0;
+      node.setAttribute('role', 'button');
+      node.setAttribute('aria-label', '点击放大预览图片');
+      node.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          node.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+        }
+      });
       node.addEventListener('error', () => replaceUnavailableImage(node), { once: true });
     } else if (node.tagName === 'INPUT' && node.type === 'checkbox') {
       node.classList.add('task-checkbox');
+      node.disabled = true;
+      node.setAttribute('aria-readonly', 'true');
     }
   };
   renderer.add_text = (data, text) => {

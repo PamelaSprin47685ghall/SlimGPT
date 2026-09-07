@@ -52,7 +52,7 @@ test('extractToolKeyArg falls back to shortened callId instead of dumping raw ca
     payload: {},
   };
   const result = extractToolKeyArg(tool.payload, tool);
-  assert.equal(result, 'call_987…543210');
+  assert.equal(result, '…543210');
 });
 
 test('renderContentReferences supports withTitle flag and escapes title', () => {

@@ -111,7 +111,45 @@ export function extractSourcesList(metadata = {}) {
   return list;
 }
 
-function safeReferenceUrl(value) {
+export function getOrderedMessageSources(message) {
+  const fromMeta = extractSourcesList(message?.metadata);
+  const fromMsg = extractSourcesList(message);
+  const map = new Map();
+  for (const item of [...fromMeta, ...fromMsg]) {
+    if (item.url && !map.has(item.url)) {
+      map.set(item.url, item);
+    }
+  }
+  if (map.size === 0) return [];
+
+  let text = String(message?.text || '');
+  if (text.includes('\uE200')) {
+    text = renderContentReferences(text, message?.metadata || message || {});
+  }
+
+  const ordered = [];
+  const seen = new Set();
+  // In-text citation regex matches [来源 1](url) or [来源 1](url "title")
+  for (const match of text.matchAll(/\[来源\s*(\d+)\]\(([^\s"\)]+)/g)) {
+    const u = match[2];
+    const item = map.get(u);
+    if (item && !seen.has(item.url)) {
+      seen.add(item.url);
+      ordered.push(item);
+    }
+  }
+
+  // Fall back to metadata DFS order for unreferenced extras, appended after
+  for (const [url, item] of map.entries()) {
+    if (!seen.has(url)) {
+      seen.add(url);
+      ordered.push(item);
+    }
+  }
+  return ordered;
+}
+
+export function safeReferenceUrl(value) {
   if (typeof value !== 'string' || !value.trim()) return '';
   try {
     const url = new URL(value);
