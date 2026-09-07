@@ -115,7 +115,29 @@ submission. Existing content remains readable. Retries are driven by explicit
 user actions or subsequent protocol events, not a polling timer. Empty, valid
 histories can complete normally instead of remaining in a loading state.
 
-### Turn-session ownership across asynchronous requests
+### Protocol relation reconstruction
+
+Ownership is resolved across selected canonical items and live observations
+together, not in two isolated passes. Explicit user references accept canonical
+node/message/item ids. Exchange, worker-request, working-turn and trace ids keep
+their own namespaces. A shared lower-level request alias cannot obscure an
+explicit exchange, and a different worker request id alone does not contradict
+a known parent or the captured submission's user.
+
+Parent edges, response ids and tool call/result ids connect output components.
+An anchored child can identify preceding output ancestors; propagation never
+crosses a visible user boundary or overrides a conflicting explicit user or
+exchange. Message-less canonical routing nodes remain in the relation graph
+without becoming message bubbles. The request's `turnParentMessageId` is prior
+conversation context, not a substitute for the current item's parent.
+
+Each associated view item exposes the user id and evidence edges used. Remaining
+failures report missing user/parent anchors or conflicting identities, and offer
+a history re-sync. They are not treated as a normal "unassigned output" class.
+The local debug mirror includes bounded, text-free `protocolIssues` diagnostics;
+message payloads are preserved while their missing relationships are repaired.
+
+### Request session correlation
 
 Submission sessions are reserved at interception entry and become active only
 after request scope/identity parsing succeeds. Fetch and XHR share a monotonic
@@ -158,7 +180,9 @@ Markdown export includes reasoning, tool calls/results with their call IDs,
 and ordinary answers from the selected branch, including collapsed/offscreen
 items. Tool strings retain their original whitespace and large numeric
 literals; export fences cannot be closed by backticks inside a tool result.
-Unresolved groups are separate from the preceding user turn. Exporting partial
+Association failures are identified as parser/synchronization defects, not a
+separate message class. Their retained payloads are separated from the preceding
+user turn until the missing protocol links are repaired. Exporting partial
 history is allowed, but both the file and the UI explicitly label it incomplete.
 Pending unsent drafts are excluded. Errors while preparing or starting a
 download produce an error rather than a success message; the browser's later

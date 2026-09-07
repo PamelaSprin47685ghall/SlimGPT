@@ -61,9 +61,10 @@ test('partial history and unresolved groups are explicitly separated from the pr
     unresolved: [{ replies: [{ role: 'assistant', text: 'unbound response' }] }, { replies: [{ role: 'tool', tool: { kind: 'tool-result', payload: 'unbound tool' } }] }],
   });
   assert.match(output, /不是完整会话/);
-  assert.match(output, /## 未归属输出/);
-  assert.ok(output.indexOf('## 未归属输出') > output.indexOf('known question'));
-  assert.ok(output.indexOf('unbound response') < output.indexOf('未归属组 2'));
+  assert.match(output, /## 协议关联未还原/);
+  assert.match(output, /解析或同步缺陷/);
+  assert.ok(output.indexOf('## 协议关联未还原') > output.indexOf('known question'));
+  assert.ok(output.indexOf('unbound response') < output.indexOf('待修复的关联组 2'));
   assert.match(output, /unbound tool/);
 });
 

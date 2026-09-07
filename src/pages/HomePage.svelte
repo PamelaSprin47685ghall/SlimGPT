@@ -154,6 +154,8 @@
       canonicalSyncError: currentRecord?.canonicalSyncError || null,
       turnCount: turns.length,
       unresolvedCount: unresolvedTurns.length,
+      protocolIssues: (timeline.protocolIssues || []).slice(0, 100),
+      protocolIssueCount: timeline.protocolIssues?.length || 0,
       workState: conversationWorkState,
       lastAssistant: lastAssistant ? {
         id: lastAssistant.id,
@@ -1519,6 +1521,7 @@
           <ConversationTurnStage
             {turns}
             unresolved={unresolvedTurns}
+            onRepairProtocol={retryHistorySync}
             activeIndex={activeTurnIndex}
             conversationKey={displayConversationId || 'new'}
             onActiveChange={(index) => activeTurnIndex = index}

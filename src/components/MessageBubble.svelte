@@ -97,6 +97,7 @@
 <div
   class={`message-card role-${message?.role || 'unknown'} ${message?.tool?.kind || ''} ${isError ? 'is-error' : ''}`}
   data-message-id={message?.id}
+  data-owner-user-id={message?.ownership?.userMessageId || undefined}
   data-item-id={message?.itemId || undefined}
   data-message-phase={message?.phase || undefined}
 >

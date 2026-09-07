@@ -10,6 +10,7 @@
     conversationKey = 'default',
     onActiveChange = () => {},
     onBranch = () => {},
+    onRepairProtocol = () => {},
   } = $props();
 
   let scroller = $state(null);
@@ -288,8 +289,8 @@
         <span>{activeIndex + 1} / {turns.length}</span>
         <span>一轮问答</span>
       {:else}
-        <span>未归属输出</span>
-        <span>非问答页</span>
+        <span>对话关系同步未完成</span>
+        <span>解析待修复</span>
       {/if}
     </div>
     <div
@@ -300,7 +301,7 @@
       ontouchstart={handleTouchStart}
       ontouchend={handleTouchEnd}
       role="region"
-      aria-label={activeTurn ? `问答 ${activeIndex + 1} / ${turns.length}` : '未归属输出'}
+      aria-label={activeTurn ? `问答 ${activeIndex + 1} / ${turns.length}` : '对话关系同步未完成'}
     >
       <div
         class="single-message-content conversation-turn-content"
@@ -319,13 +320,20 @@
         {/if}
         {#if showUnresolved}
           <section class="turn-unresolved-notice" role="status">
-            <strong>未归属输出</strong>
-            <span>这些消息没有可验证的用户消息归属，因此不会创建问答页。</span>
+            <strong>对话关系同步未完成</strong>
+            <span>还有 {unresolved.reduce((count, group) => count + group.replies.length, 0)} 条消息的协议关联未还原。这是解析或同步问题，不是一类独立回答。内容仍保留在下方供核对。</span>
+            <button type="button" onclick={onRepairProtocol}>重新同步关联</button>
           </section>
           {#each unresolved as group (group.id)}
             <div class="turn-unresolved-group">
               {#each group.replies as reply (reply.observationKey || reply.itemId || reply.id || reply.nodeId)}
                 <section class={`turn-message turn-reply role-${reply?.role || 'unknown'}`}>
+                  {#if reply.ownershipFailure}
+                    <details class="protocol-relation-evidence">
+                      <summary>关联诊断：{reply.ownershipFailure.reason === 'conflicting-evidence' ? '标识冲突' : reply.ownershipFailure.reason === 'missing-user-message' ? '缺少用户消息' : reply.ownershipFailure.reason === 'missing-parent-message' ? '缺少父消息' : '关联链缺少用户锚点'}</summary>
+                      <pre>{JSON.stringify(reply.ownershipFailure, null, 2)}</pre>
+                    </details>
+                  {/if}
                   <MessageBubble message={reply} {onBranch} />
                 </section>
               {/each}

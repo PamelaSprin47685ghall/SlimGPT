@@ -1753,7 +1753,8 @@ async function runFixtureSmoke(browser, extensionId) {
   assert.ok(fullExport.includes('工具调用') && fullExport.includes('工具结果'));
   assert.ok(fullExport.includes('123456789012345678901'), 'raw tool arguments must not be numerically rounded');
   assert.ok(fullExport.includes('row-599'), 'large result arrays must be exported in full');
-  assert.ok(fullExport.indexOf('EXPORT_UNBOUND') > fullExport.indexOf('## 未归属输出'));
+  assert.ok(fullExport.includes('## 协议关联未还原'));
+  assert.ok(fullExport.indexOf('EXPORT_UNBOUND') > fullExport.indexOf('## 协议关联未还原'));
   await waitFor(async () => {
     const entries = await readExtensionStorageValue(browser, extensionId, 'observationLedger');
     const result = entries?.find((entry) => entry.id === 'second')?.observations.find((item) => item.id === 'export-result');
@@ -1878,6 +1879,44 @@ async function runFixtureSmoke(browser, extensionId) {
   const turnSessionIntegrity = { streamIdentityLearned: true, staleStopIgnored: true, anonymousStopIgnored: true,
     resumeKeptCurrentUser: true, matchingStopAccepted: true, officialParsingSuppressed: true, pendingForeignIdentityRejected: true };
 
+  // Canonical and live relations form one graph. No timestamps, neighboring
+  // question fallback, or synthetic user id is supplied to these output rows.
+  const proofId = 'ownership-proof-fixture';
+  const proofMessage = (id, role = 'assistant', extra = {}) => ({ id, author: { role },
+    content: { content_type: 'text', parts: [id] }, status: 'finished_successfully', ...extra });
+  await top.evaluate(`postMessage({channel:'slimgpt-page-v1',direction:'page-to-extension',payload:{type:'page-location',url:'https://chatgpt.com/c/${proofId}'}},location.origin)`);
+  await publishCapture({ conversationId: proofId, transport: 'fetch', phase: 'complete', requestId: 'proof-history',
+    canonicalSyncId: 'proof-history', canonicalPageIndex: 0, canonicalPageCount: 1, canonicalComplete: true,
+    data: JSON.stringify({ id: proofId, current_node: 'proof-result', page_info: { has_previous_page: false }, messages: [
+      proofMessage('proof-u1', 'user', { metadata: { turn_exchange_id: 'proof-one', request_id: 'same-request' } }),
+      proofMessage('proof-u2', 'user', { metadata: { turn_exchange_id: 'proof-two', request_id: 'same-request' } }),
+      proofMessage('proof-reasoning'),
+      proofMessage('proof-call', 'assistant', { parent_id: 'proof-reasoning', recipient: 'web.run', call_id: 'proof-call-id' }),
+      proofMessage('proof-result', 'tool', { parent_id: 'proof-call', tool_call_id: 'proof-call-id' }),
+    ] }),
+  });
+  await waitFor(async () => await ui.evaluate(`document.querySelector('.turn-unresolved-notice')?.textContent.includes('协议关联未还原')`));
+  await publishCapture({ conversationId: proofId, transport: 'fetch', phase: 'complete', requestId: 'proof-anchor', data: JSON.stringify({
+    conversation_id: proofId,
+    message: proofMessage('proof-final', 'assistant', { parent_id: 'proof-result', metadata: { turn_exchange_id: 'proof-two', request_id: 'same-request' } }),
+  }) });
+  await waitFor(async () => await ui.evaluate(`!document.querySelector('.turn-unresolved-notice') && document.querySelector('[data-message-id="proof-reasoning"]')?.dataset.ownerUserId === 'proof-u2'`));
+  const graphOwners = await ui.evaluate(`Object.fromEntries([...document.querySelectorAll('.turn-reply [data-message-id]')].map((node)=>[node.dataset.messageId,node.dataset.ownerUserId]))`);
+  assert.deepEqual(graphOwners, { 'proof-reasoning': 'proof-u2', 'proof-call': 'proof-u2', 'proof-result': 'proof-u2', 'proof-final': 'proof-u2' });
+  assert.equal(await ui.evaluate(`window.__SLIMGPT_DEBUG__.protocolIssueCount`), 0);
+  await publishCapture({ conversationId: proofId, transport: 'fetch', phase: 'complete', requestId: 'proof-envelope', data: JSON.stringify({
+    conversation_id: proofId, parent_id: 'proof-final', turn_exchange_id: 'proof-two',
+    message: proofMessage('proof-commentary', 'assistant', { metadata: { request_id: 'worker-only-request' } }),
+  }) });
+  await waitFor(async () => await ui.evaluate(`document.querySelector('[data-message-id="proof-commentary"]')?.dataset.ownerUserId === 'proof-u2'`));
+  await ui.evaluate(`document.querySelector('[data-overview-index="0"]').click()`);
+  await waitFor(async () => await ui.evaluate(`Boolean(document.querySelector('.turn-question [data-message-id="proof-u1"]'))`));
+  assert.equal(await ui.evaluate(`Boolean(document.querySelector('[data-message-id="proof-final"]'))`), false);
+  await ui.evaluate(`document.querySelector('[data-overview-index="1"]').click()`);
+  await waitFor(async () => await ui.evaluate(`Boolean(document.querySelector('[data-message-id="proof-final"]'))`));
+  const ownershipResolution = { reverseParentChain: true, canonicalLiveJoined: true, typedExchangePriority: true,
+    envelopeRelationRetained: true, noPendingAssociations: true, noLeakToEarlierUser: true };
+
   return {
     mode: 'fixture',
     chrome: await chromeVersion(),
@@ -1909,6 +1948,7 @@ async function runFixtureSmoke(browser, extensionId) {
     exportIntegrity,
     canonicalSyncIntegrity,
     turnSessionIntegrity,
+    ownershipResolution,
   };
 }
 

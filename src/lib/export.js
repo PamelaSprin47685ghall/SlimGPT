@@ -62,9 +62,9 @@ export function buildConversationMarkdown(title, messages = [], options = {}) {
   }
   const unresolved = (options.unresolved || []).filter((group) => group.replies?.some(hasExportableMessage));
   if (unresolved.length) {
-    sections.push('## 未归属输出\n\n> 以下内容尚无可验证的用户消息归属，不应视为上一问题的回答。');
+    sections.push('## 协议关联未还原\n\n> 以下消息已取得，但 SlimGPT 尚未还原其所属问答。这是解析或同步缺陷，不是一类独立回答，也不应视为上一问题的回答。');
     for (let i = 0; i < unresolved.length; i += 1) {
-      sections.push(`### 未归属组 ${i + 1}`);
+      sections.push(`### 待修复的关联组 ${i + 1}`);
       for (const message of unresolved[i].replies) {
         const section = messageSection(message, 4);
         if (section) sections.push(section);

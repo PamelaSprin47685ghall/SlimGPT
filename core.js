@@ -1,5 +1,6 @@
 import { renderContentReferences } from './src/lib/content-references.js';
 import { isTerminalMessage } from './src/lib/message-presentation.js';
+import { resolveOwnershipGraph, semanticOwnershipKeys } from './src/lib/ownership-graph.js';
 
 export function decodeCaptureBody(capture) {
   if (!capture?.base64Encoded) return String(capture?.data ?? "");
@@ -1040,6 +1041,9 @@ function mergeMessageEventContext(previous, value) {
   ) || null;
   const callIdentity = messageCallIdentity(value);
   return {
+    parentMessageId: looksLikeMessage(value) || looksLikeMessage(value?.message)
+      ? firstNonEmptyString(value.parent_id, value.parent, value.metadata?.parent_id, previous?.parentMessageId) || null
+      : previous?.parentMessageId || null,
     contentIndex: firstFiniteNumber(value?.content_index, value?.metadata?.content_index, previous?.contentIndex),
     turnUserMessageId: firstNonEmptyString(value?.turn_user_message_id, value?.turnUserMessageId, value?.metadata?.turn_user_message_id, previous?.turnUserMessageId) || null,
     sequenceNumber: sequenceNumber ?? null,
@@ -1484,10 +1488,10 @@ export function messageProtocolIdentity(message, context = {}) {
     role,
     contentType,
     eventType: firstNonEmptyString(context.eventType) || null,
-    turnExchangeId: turnIdentity.turnExchangeId,
-    workingTurnId: turnIdentity.workingTurnId,
-    requestId: turnIdentity.requestId,
-    turnTraceId: turnIdentity.turnTraceId,
+    turnExchangeId: turnIdentity.turnExchangeId || firstNonEmptyString(context.turnExchangeId) || null,
+    workingTurnId: turnIdentity.workingTurnId || firstNonEmptyString(context.workingTurnId) || null,
+    requestId: turnIdentity.requestId || firstNonEmptyString(context.turnRequestId) || null,
+    turnTraceId: turnIdentity.turnTraceId || firstNonEmptyString(context.turnTraceId) || null,
   };
 }
 
@@ -1502,10 +1506,19 @@ export function captureMessageContext(event, capture = {}) {
   const identity = messageProtocolIdentity(event?.message, event || {});
   const aliases = identity.semanticTurnAliases;
   const captureAliases = uniqueStrings([...(capture.turnAliases || []), capture.turnId]);
+  const identityHasTyped = identity.turnExchangeId || identity.workingTurnId || identity.requestId || identity.turnTraceId;
+  const captureHasTyped = capture.turnExchangeId || capture.workingTurnId || capture.turnRequestId || capture.turnTraceId;
+  const captureExchange = capture.turnExchangeId || (!captureHasTyped ? capture.turnId : null);
   const conflict = capture.transport === "dom" ||
-    (aliases.length && captureAliases.length && !aliases.some((alias) => captureAliases.includes(alias))) ||
+    (identity.turnExchangeId && captureExchange && identity.turnExchangeId !== captureExchange) ||
+    (!identityHasTyped && !captureHasTyped && aliases.length && captureAliases.length && !aliases.some((alias) => captureAliases.includes(alias))) ||
     (identity.turnUserMessageId && capture.turnUserMessageId && identity.turnUserMessageId !== capture.turnUserMessageId);
   return {
+    parentMessageId: identity.parentMessageId,
+    turnExchangeId: identity.turnExchangeId || (!conflict ? capture.turnExchangeId : null) || null,
+    workingTurnId: identity.workingTurnId || (!conflict ? capture.workingTurnId : null) || null,
+    turnRequestId: identity.requestId || (!conflict ? capture.turnRequestId : null) || null,
+    turnTraceId: identity.turnTraceId || (!conflict ? capture.turnTraceId : null) || null,
     semanticTurnId: aliases[0] || (!conflict ? capture.turnId : null) || null,
     turnAliases: uniqueStrings([...aliases, ...(!conflict ? captureAliases : [])]),
     turnUserMessageId: identity.turnUserMessageId || (!conflict ? capture.turnUserMessageId : null) || null,
@@ -1571,7 +1584,10 @@ function normalizedObservationIdentity(message, context = {}) {
 function observationIdentitiesCompatible(left, right) {
   if (!left || !right) return true;
   if (left.turnUserMessageId && right.turnUserMessageId && left.turnUserMessageId !== right.turnUserMessageId) return false;
-  if (left.semanticTurnAliases?.length && right.semanticTurnAliases?.length &&
+  if (left.turnExchangeId && right.turnExchangeId && left.turnExchangeId !== right.turnExchangeId) return false;
+  const leftTyped = left.turnExchangeId || left.workingTurnId || left.requestId || left.turnRequestId || left.turnTraceId;
+  const rightTyped = right.turnExchangeId || right.workingTurnId || right.requestId || right.turnRequestId || right.turnTraceId;
+  if (!leftTyped && !rightTyped && left.semanticTurnAliases?.length && right.semanticTurnAliases?.length &&
       !left.semanticTurnAliases.some((alias) => right.semanticTurnAliases.includes(alias))) return false;
   for (const key of ["responseId", "itemId", "outputIndex", "contentIndex", "callId", "toolCallId", "phase"]) {
     const leftValue = left[key];
@@ -2200,6 +2216,10 @@ function findCompatibleObservationIndex(messages, incomingIdentity) {
 
 function viewObservationIdentity(item) {
   return {
+    turnExchangeId: item?.turnExchangeId || null,
+    workingTurnId: item?.workingTurnId || null,
+    turnRequestId: item?.turnRequestId || null,
+    turnTraceId: item?.turnTraceId || null,
     turnUserMessageId: item?.turnUserMessageId || null,
     messageId: item?.id || null,
     itemId: item?.itemId || null,
@@ -2639,6 +2659,23 @@ export function buildConversationRecordTimeline(record, pendingUserMessage = nul
     return mergeCanonicalAndObservedView(row, observation);
   });
 
+  const provisionalSourceRows = current.canonicalComplete ? [] : currentTurnOutputSuffix(allPayloadRows);
+  const provisionalPayloadRows = provisionalSourceRows.map((row, index) => ({
+    ...row, observationOnly: true, provisionalCanonical: true,
+    observationOrdinal: Number.MAX_SAFE_INTEGER - provisionalSourceRows.length + index,
+  }));
+  const liveOnly = [
+    ...observations.filter((observation) => observation?.id && !usedObservations.has(observation)),
+    ...provisionalPayloadRows.filter((row) => !observationSubjectCandidates(observationsByMessageId, row)
+      .some((observation) => observationIdentitiesCompatible(viewObservationIdentity(row), viewObservationIdentity(observation)))),
+  ].sort(compareObservationOrder);
+  const users = [...canonicalRows, ...liveOnly].filter(isVisibleConversationUser);
+  if (pendingUserMessage && !users.some((user) => user.id === pendingUserMessage.id)) users.push(pendingUserMessage);
+  const renderedNodeIds = new Set(canonicalRows.map((row) => row.nodeId));
+  const hiddenParents = current.canonicalComplete
+    ? projection.allRows.filter((row) => projection.selectedNodes.has(row.nodeId) && !renderedNodeIds.has(row.nodeId)) : [];
+  const ownership = resolveOwnershipGraph([...canonicalRows, ...liveOnly, ...hiddenParents], users);
+
   const turns = [];
   const turnByUserId = new Map();
   const turnBySemanticId = new Map();
@@ -2659,11 +2696,23 @@ export function buildConversationRecordTimeline(record, pendingUserMessage = nul
       indexProtocolTurn(turn, row, responseTurn, callTurn);
     }
   }
+  for (const user of users) {
+    if (turnByUserId.has(user.id)) continue;
+    const turn = createTurnForUser(user, user === pendingUserMessage ? 'pending' : 'observed');
+    turns.push(turn);
+    indexTurn(turn, user, turnByUserId, turnBySemanticId, itemTurn);
+    indexProtocolTurn(turn, user, responseTurn, callTurn);
+  }
   // Hidden context nodes can bridge a proven parent chain, but never render
   // as user turns. Keep these nodes in the traversal index only.
   const canonicalByMessageId = current.canonicalComplete ? projection.parentIndex : new Map();
   const canonicalUnassigned = new Map();
   const resolveCanonicalTarget = (row) => {
+    const resolution = ownership.resolved.get(row);
+    if (resolution) return { target: turnByUserId.get(resolution.userMessageId) || null, conflicted: false };
+    // Do not fall back to untyped alias lookup after the complete graph has
+    // detected a contradiction or a missing protocol anchor.
+    if (ownership.failures.has(row)) return { target: null, conflicted: true };
     let target = row.turnUserMessageId ? turnByUserId.get(row.turnUserMessageId) : null;
     if (target) return { target, conflicted: false };
     if (row.turnUserMessageId) return { target: null, conflicted: true };
@@ -2691,7 +2740,8 @@ export function buildConversationRecordTimeline(record, pendingUserMessage = nul
         remaining.push(row);
         continue;
       }
-      appendTurnReply(target, row);
+      const proof = ownership.resolved.get(row);
+      appendTurnReply(target, { ...row, ownership: proof ? { userMessageId: proof.userMessageId, evidence: proof.evidence } : null });
       indexTurnItem(target, row, itemTurn);
       indexSemanticTurnAliases(target, row, turnBySemanticId);
       indexProtocolTurn(target, row, responseTurn, callTurn);
@@ -2708,7 +2758,7 @@ export function buildConversationRecordTimeline(record, pendingUserMessage = nul
       canonicalUnassigned.set(key, target);
       turns.push(target);
     }
-    appendTurnReply(target, row);
+    appendTurnReply(target, { ...row, ownershipFailure: ownership.failures.get(row) });
   }
 
   if (pendingUserMessage) {
@@ -2722,27 +2772,6 @@ export function buildConversationRecordTimeline(record, pendingUserMessage = nul
     }
   }
 
-  const provisionalSourceRows = current.canonicalComplete
-    ? []
-    : currentTurnOutputSuffix(allPayloadRows);
-  const provisionalPayloadRows = provisionalSourceRows
-      .map((row, index) => ({
-        ...row,
-        observationOnly: true,
-        provisionalCanonical: true,
-        observationOrdinal: Number.MAX_SAFE_INTEGER - provisionalSourceRows.length + index,
-      }));
-  const liveOnly = [
-    ...observations.filter((observation) => observation?.id && !usedObservations.has(observation)),
-    ...provisionalPayloadRows.filter((row) => !observationSubjectCandidates(
-      observationsByMessageId,
-      row,
-    ).some((observation) => (
-      observationIdentitiesCompatible(viewObservationIdentity(row), viewObservationIdentity(observation))
-    ))),
-  ]
-    .sort(compareObservationOrder);
-
   // User observations establish a turn before any output item is attached.
   for (const observation of liveOnly) {
     if (!isVisibleConversationUser(observation)) continue;
@@ -2755,12 +2784,16 @@ export function buildConversationRecordTimeline(record, pendingUserMessage = nul
 
   const observationByMessageId = uniqueObservationByMessageId(liveOnly);
   const attachObservation = (target, observation) => {
-    appendTurnReply(target, observation);
+    const proof = ownership.resolved.get(observation);
+    appendTurnReply(target, { ...observation, ownership: proof ? { userMessageId: proof.userMessageId, evidence: proof.evidence } : null, ownershipFailure: ownership.failures.get(observation) });
     indexTurnItem(target, observation, itemTurn);
     indexSemanticTurnAliases(target, observation, turnBySemanticId);
     indexProtocolTurn(target, observation, responseTurn, callTurn);
   };
   const resolveObservationTarget = (observation) => {
+    const resolution = ownership.resolved.get(observation);
+    if (resolution) return { target: turnByUserId.get(resolution.userMessageId) || null, identityConflict: false };
+    if (ownership.failures.has(observation)) return { target: null, identityConflict: true };
     let target = null;
     let identityConflict = false;
 
@@ -2819,6 +2852,10 @@ export function buildConversationRecordTimeline(record, pendingUserMessage = nul
   // can in turn unlock response/call/parent-linked items on another pass.
   const afterSemanticSessions = [];
   for (const observation of pendingOutputs) {
+    if (ownership.failures.has(observation)) {
+      afterSemanticSessions.push(observation);
+      continue;
+    }
     if (observation.turnUserMessageId && !turnByUserId.has(observation.turnUserMessageId)) {
       afterSemanticSessions.push(observation);
       continue;
@@ -2881,6 +2918,7 @@ export function buildConversationRecordTimeline(record, pendingUserMessage = nul
   return {
     turns: populated.filter((turn) => Boolean(turn.user)),
     unresolved: populated.filter((turn) => !turn.user),
+    protocolIssues: populated.filter((turn) => !turn.user).flatMap((turn) => turn.replies.map((row) => row.ownershipFailure).filter(Boolean)),
   };
 }
 
@@ -3057,9 +3095,7 @@ function createTurnForUser(user, source) {
 }
 
 function indexTurn(turn, user, turnByUserId, turnBySemanticId, itemTurn) {
-  const userId = user?.id || user?.nodeId;
-  if (userId) turnByUserId.set(userId, turn);
-  if (user?.turnUserMessageId) turnByUserId.set(user.turnUserMessageId, turn);
+  for (const userId of uniqueStrings([user?.id, user?.nodeId, user?.itemId, user?.turnUserMessageId])) indexUniqueTurn(turnByUserId, userId, turn);
   indexSemanticTurnAliases(turn, user, turnBySemanticId);
   indexTurnItem(turn, user, itemTurn);
 }
@@ -3152,14 +3188,12 @@ function itemCallIds(item) {
 
 function resolveObservationTurnFromParents(observation, observationByMessageId, itemTurn) {
   const visited = new Set();
-  let parentId = observation?.parentId || observation?.turnParentMessageId || null;
+  let parentId = observation?.parentId || null;
   while (parentId && !visited.has(parentId)) {
     visited.add(parentId);
     if (itemTurn.has(parentId)) {
       const turn = itemTurn.get(parentId);
-      const aliases = semanticTurnAliases(observation);
-      const parentAliases = semanticTurnAliases(turn?.user);
-      if (aliases.length && parentAliases.length && !aliases.some((alias) => parentAliases.includes(alias))) return null;
+      if (observation.turnExchangeId && turn?.user?.turnExchangeId && observation.turnExchangeId !== turn.user.turnExchangeId) return null;
       return turn;
     }
     const parent = observationByMessageId.get(parentId);
