@@ -522,23 +522,25 @@
     box-shadow: none !important;
   }
   :global(.thinking-segmented) {
-    border-radius: 10px !important;
-    padding: 2px !important;
+    border-radius: 999px !important;
+    padding: 3px !important;
     background: color-mix(in srgb, var(--slim-soft) 85%, var(--slim-surface)) !important;
     border: 1px solid color-mix(in srgb, var(--slim-line) 75%, transparent) !important;
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.04) !important;
   }
   :global(.thinking-segmented .button) {
     height: 26px !important;
     font-size: 11px !important;
-    border-radius: 8px !important;
+    border-radius: 999px !important;
     font-weight: 550 !important;
-    padding: 0 6px !important;
+    padding: 0 8px !important;
+    transition: all 0.15s ease !important;
   }
   :global(.thinking-segmented .button-active) {
     background: var(--slim-surface) !important;
     color: var(--f7-theme-color) !important;
     font-weight: 650 !important;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08) !important;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.1) !important;
   }
   :global(.composer-hint) {
     font-size: 11px !important;

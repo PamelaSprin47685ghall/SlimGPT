@@ -311,6 +311,10 @@
       if (!pageConversationId) return;
 
       const nodes = document.querySelectorAll('[data-message-author-role]');
+      // Collect-then-emit: every capture carries its index/total within this
+      // scan so consumers apply only the newest candidate as a preview
+      // instead of cycling the sidebar oldest-to-newest through each event.
+      const changedDomMessages = [];
       for (let i = Math.max(0, nodes.length - 15); i < nodes.length; i += 1) {
         const roleNode = nodes[i];
         const role = String(roleNode.getAttribute('data-message-author-role') || '').toLowerCase();
@@ -332,21 +336,28 @@
         // DOM scans include old messages. The active transport says nothing
         // about the ownership of those nodes; only their stable message id
         // may connect this low-fidelity fallback to a protocol item.
+        changedDomMessages.push({ conversationId, messageId, role, text });
+      }
+      changedDomMessages.forEach((changed, domMessageIndex) => {
         emit({
           type: "page-capture",
           transport: "dom",
           phase: "message",
-          requestId: `dom-${messageId}`,
+          requestId: `dom-${changed.messageId}`,
           url: location.href,
-          conversationId,
+          conversationId: changed.conversationId,
           mimeType: "application/json",
           timestamp: Date.now(),
+          // Ordered oldest-to-newest within this scan batch: the UI must
+          // preview only the latest candidate, never one per event.
+          domMessageIndex,
+          domMessageTotal: changedDomMessages.length,
           data: JSON.stringify({
-            conversation_id: conversationId,
+            conversation_id: changed.conversationId,
             message: {
-              id: messageId,
-              author: { role },
-              content: { content_type: "text", parts: [text] },
+              id: changed.messageId,
+              author: { role: changed.role },
+              content: { content_type: "text", parts: [changed.text] },
               // The DOM never knows the stream lifecycle: claiming
               // in_progress here regresses already-finished messages. The
               // UI merge preserves richer state from real stream events.
@@ -355,7 +366,7 @@
             },
           }),
         });
-      }
+      });
     };
 
     const mount = () => {
@@ -1013,7 +1024,11 @@
     // Bootstrap-only: once bootstrapped, backend traffic must never trigger
     // index syncs on its own. Refreshes go through requestConversationIndexSync
     // (cooldown-gated, first-page-only) from completion handlers instead.
-    if (!conversationIndexBootstrapped) {
+    // Even pre-bootstrap, background request bursts share one sync: force
+    // bypasses the cooldown inside requestConversationIndexSync, so gate here
+    // and never spam while a sync is already in flight (drain coalesces via
+    // conversationIndexSyncRequested and re-drains once on settle).
+    if (!conversationIndexBootstrapped && !conversationIndexSync) {
       requestConversationIndexSync({ force: true });
     }
   }
@@ -1044,7 +1059,10 @@
         conversationIndexBootstrapped = Boolean(synced);
       })
       .catch(() => {
-        conversationIndexBootstrapped = false;
+        // A failed refresh must never un-bootstrap already-loaded data: that
+        // would turn one transient error into a cascade of immediate full
+        // syncs. Keep serving the cache; the cooldown timestamps the retry.
+        if (conversationIndexBootstrapped) lastIndexSyncAttemptAt = Date.now();
       })
       .finally(() => {
         conversationIndexSync = null;
@@ -2745,7 +2763,18 @@
           timestamp: Date.now(),
         });
         if (conversationId && stateValue === 'stopped') {
-          queueCanonicalConversation(conversationId, { force: true });
+          // Turn-completion triggers coalesce: the SSE [DONE] path already
+          // requested a (cooldown-gated, first-page-only) index refresh, and
+          // queueCanonicalConversation merges concurrent signals into one
+          // in-flight fetch. Force past canonicalSyncedIds only for genuine
+          // new content — a tracked live turn ending, or a conversation never
+          // snapshotted — so repeated stop notifications never re-fetch a
+          // completed conversation on every minor event.
+          const trackedTurn = activeTurnSessions.get(conversationId);
+          const endsLiveTurn = trackedTurn
+            ? notificationMatchesTurnSession(notification, trackedTurn)
+            : !canonicalSyncedIds.has(conversationId);
+          queueCanonicalConversation(conversationId, { force: endsLiveTurn });
           requestConversationIndexSync();
         }
       }

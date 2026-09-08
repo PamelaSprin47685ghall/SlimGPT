@@ -161,17 +161,6 @@ html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; backg
   inset: -6px;
 }
 
-.conversation-search::after {
-  content: "🔍";
-  position: absolute;
-  left: 8px;
-  top: 50%;
-  transform: translateY(-50%);
-  font-size: 11px;
-  opacity: 0.55;
-  pointer-events: none;
-}
-
 .sidebar-section-title { display: flex; justify-content: space-between; padding: 8px 6px 5px; color: var(--slim-muted); font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }
 .conversation-list { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; }
 .conversation-item { display: grid; gap: 4px; width: 100%; min-height: 56px; padding: 7px 8px; border: 0; border-radius: 9px; background: transparent; color: inherit; text-align: left; cursor: pointer; box-sizing: border-box; }
@@ -258,7 +247,7 @@ html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; backg
 .single-message-scroller::-webkit-scrollbar { width: 8px; }
 .single-message-scroller::-webkit-scrollbar-track { background: transparent; }
 .single-message-scroller::-webkit-scrollbar-thumb { border: 2px solid transparent; border-radius: 999px; background: color-mix(in srgb, var(--slim-muted) 48%, transparent); background-clip: padding-box; }
-.single-message-content { width: min(800px, calc(100% - 48px)); max-width: 800px; min-height: calc(100% - 58px); margin: 0 auto; padding: 40px 0 24px; box-sizing: border-box; will-change: transform; }
+.single-message-content { width: min(768px, calc(100% - 48px)); max-width: 768px; /* max-width: 800px max reading column */ min-height: calc(100% - 58px); margin: 0 auto; padding: 40px 0 24px; box-sizing: border-box; will-change: transform; }
 .conversation-turn-content { display: grid; align-content: start; gap: 24px; }
 .turn-message { min-width: 0; }
 .turn-question { padding-bottom: 4px; }
@@ -280,14 +269,16 @@ button.turn-count-btn:hover { background: var(--slim-soft); border-color: var(--
 .turn-copy-btn.copy-failed { color: #cf6258; border-color: color-mix(in srgb, #cf6258 55%, var(--slim-line)); }
 .turn-boundary-runway.ready .turn-boundary-pill { color: var(--f7-theme-color); border-color: color-mix(in srgb, var(--f7-theme-color) 55%, var(--slim-line)); }
 .message-card { display: flex; align-items: flex-start; gap: 12px; width: 100%; }
-.message-card.role-user { flex-direction: row-reverse; }
+.message-card.role-user { flex-direction: row-reverse; justify-content: flex-end; }
+.message-card.role-assistant { justify-content: flex-start; }
 .message-card.pending { opacity: .68; }
 .message-avatar { display: grid; place-items: center; flex: none; width: 34px; height: 34px; margin-top: 24px; border-radius: 50%; background: var(--slim-avatar-assistant); color: #fff; font-size: 12px; font-weight: 760; box-shadow: 0 2px 10px rgba(0,0,0,.1); }
 .role-user .message-avatar { background: var(--slim-avatar-user); }
 .message-card.tool-call .message-avatar { background: var(--slim-avatar-tool-call); font-size: 17px; }
 .message-card.tool-result .message-avatar { background: var(--slim-avatar-tool-result); font-size: 17px; }
 .message-card-body { width: 100%; min-width: 0; }
-.role-user .message-card-body { width: auto; max-width: min(85%, 640px); }
+.role-user .message-card-body { width: auto; max-width: min(85%, 600px); margin-left: auto; display: flex; flex-direction: column; align-items: flex-end; }
+.role-assistant .message-card-body { width: 100%; max-width: 100%; }
 .message-card.tool-call .message-card-body,
 .message-card.tool-result .message-card-body { width: 100%; min-width: 0; }
 .message-meta { display: flex; align-items: center; justify-content: space-between; min-height: 22px; margin: 0 2px 5px; color: var(--slim-muted); font-size: 10.5px; }
@@ -370,9 +361,13 @@ button.turn-count-btn:hover { background: var(--slim-soft); border-color: var(--
   font-weight: 600;
 }
 .model-badge {
-  background: color-mix(in srgb, var(--f7-theme-color) 12%, var(--slim-soft));
-  color: var(--f7-theme-color);
-  border-color: color-mix(in srgb, var(--f7-theme-color) 35%, var(--slim-line));
+  background: color-mix(in srgb, var(--slim-soft) 80%, var(--slim-surface));
+  color: var(--slim-muted);
+  border-color: color-mix(in srgb, var(--slim-line) 60%, transparent);
+  font-weight: 500;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
 }
 .error-badge {
   background: color-mix(in srgb, #cf6258 15%, var(--slim-soft));
@@ -452,7 +447,7 @@ button.turn-count-btn:hover { background: var(--slim-soft); border-color: var(--
 .role-assistant .message-bubble {
   background: transparent;
   border: none;
-  padding: 4px 0 10px;
+  padding: 2px 0 8px;
   box-shadow: none;
 }
 .role-system { opacity: .75; }
@@ -589,7 +584,6 @@ button.turn-count-btn:hover { background: var(--slim-soft); border-color: var(--
 .message-markdown h3 { font-size: 1.1rem; }
 .message-markdown h4 { font-size: 1rem; }
 .message-markdown h5, .message-markdown h6 { font-size: 0.92em; }
-.message-markdown p, .message-markdown li { max-width: 76ch; }
 .message-markdown p, .message-markdown ul, .message-markdown ol, .message-markdown blockquote, .message-markdown pre { margin: 0 0 14px; }
 .message-markdown p, .message-markdown li, .message-markdown blockquote { white-space: pre-wrap; }
 .message-markdown ul, .message-markdown ol { padding-left: 25px; }
@@ -651,7 +645,7 @@ button.turn-count-btn:hover { background: var(--slim-soft); border-color: var(--
   width: 100%;
   overflow-x: auto;
   margin: 0 0 14px;
-  border: 1px solid color-mix(in srgb, var(--slim-line) 75%, transparent);
+  border: 1px solid color-mix(in srgb, var(--slim-line) 65%, transparent);
   border-radius: 10px;
   scrollbar-width: thin;
   background: var(--slim-surface);
@@ -660,8 +654,8 @@ button.turn-count-btn:hover { background: var(--slim-soft); border-color: var(--
   display: flex;
   justify-content: flex-end;
   padding: 4px 8px;
-  border-bottom: 1px solid var(--slim-line);
-  background: color-mix(in srgb, var(--slim-soft) 50%, var(--slim-surface));
+  border-bottom: 1px solid color-mix(in srgb, var(--slim-line) 60%, transparent);
+  background: color-mix(in srgb, var(--slim-soft) 40%, var(--slim-surface));
   position: sticky;
   left: 0;
   z-index: 2;
@@ -693,8 +687,8 @@ button.turn-count-btn:hover { background: var(--slim-soft); border-color: var(--
 .message-markdown th,
 .message-markdown td {
   padding: 9px 13px;
-  border-bottom: 1px solid var(--slim-line);
-  border-right: 1px solid var(--slim-line);
+  border-bottom: 1px solid color-mix(in srgb, var(--slim-line) 60%, transparent);
+  border-right: 1px solid color-mix(in srgb, var(--slim-line) 60%, transparent);
   min-width: 60px;
   white-space: normal;
   overflow-wrap: anywhere;
@@ -707,20 +701,20 @@ button.turn-count-btn:hover { background: var(--slim-soft); border-color: var(--
   border-bottom: 0;
 }
 .message-markdown th {
-  background: var(--slim-soft);
-  font-weight: 650;
+  background: color-mix(in srgb, var(--slim-soft) 70%, var(--slim-surface));
+  font-weight: 600;
   color: var(--slim-text);
 }
 .message-markdown tr:nth-child(even) td {
-  background: color-mix(in srgb, var(--slim-soft) 35%, transparent);
+  background: color-mix(in srgb, var(--slim-soft) 25%, transparent);
 }
 
 /* Code block styling */
 .message-markdown .code-block {
   margin: 0 0 14px;
-  border: 1px solid color-mix(in srgb, var(--slim-line) 70%, transparent);
+  border: 1px solid color-mix(in srgb, var(--slim-line) 60%, transparent);
   border-radius: 8px;
-  background: var(--slim-code);
+  background: color-mix(in srgb, var(--slim-code) 70%, var(--slim-surface));
   overflow: hidden;
 }
 .message-markdown .code-block pre {
@@ -1112,7 +1106,8 @@ equation-inline {
   gap: 8px;
   padding: 6px 14px;
   margin: 0 auto 6px;
-  width: min(820px, calc(100% - 32px));
+  width: min(768px, calc(100% - 32px));
+  max-width: 768px;
   border: 1px solid var(--slim-warning);
   border-radius: 8px;
   background: var(--slim-warning-bg);
@@ -1182,15 +1177,15 @@ body.slimgpt-drawer-open { overflow: hidden; }
 
 
 /* Composer styling */
-.composer-wrap { width: 100%; max-width: 800px; /* ~820px max reading column */ margin: 0 auto; box-sizing: border-box; padding: 8px calc(18px + env(safe-area-inset-right)) calc(12px + env(safe-area-inset-bottom) + var(--slim-vv-offset, 0px)) calc(18px + env(safe-area-inset-left)); border-top: 1px solid var(--slim-line); background: var(--slim-bg); }
-.composer-top-bar, .composer-shell, .composer-hint { max-width: 800px; margin-left: auto; margin-right: auto; }
-.composer-status { max-width: 800px; }
+.composer-wrap { width: 100%; max-width: 768px; /* ~820px max reading column */ margin: 0 auto; box-sizing: border-box; padding: 8px calc(18px + env(safe-area-inset-right)) calc(12px + env(safe-area-inset-bottom) + var(--slim-vv-offset, 0px)) calc(18px + env(safe-area-inset-left)); border-top: 1px solid var(--slim-line); background: var(--slim-bg); }
+.composer-top-bar, .composer-shell, .composer-hint { max-width: 768px; margin-left: auto; margin-right: auto; }
+.composer-status { max-width: 768px; margin-left: auto; margin-right: auto; }
 .composer-top-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  max-width: 800px;
+  max-width: 768px;
   margin: 0 auto 6px;
 }
 
@@ -1244,7 +1239,7 @@ body.slimgpt-drawer-open { overflow: hidden; }
   display: flex;
   align-items: center;
   gap: 8px;
-  max-width: 800px;
+  max-width: 768px;
   margin: 0 auto 6px;
   padding: 6px 12px;
   border-radius: 8px;
@@ -1274,7 +1269,7 @@ body.slimgpt-drawer-open { overflow: hidden; }
 /* Action notice above the composer: distinct channel for non-send failures,
    restored drafts, stall recovery and take-back-after-stop. The text span
    mirrors .composer-status so query harnesses keep reading notices. */
-.composer-action-notice { display: flex; align-items: center; gap: 8px; max-width: 800px; margin: 0 auto 6px; padding: 6px 12px; border: 1px solid var(--slim-line); border-radius: 8px; background: var(--slim-surface); color: var(--slim-text); font-size: 11.5px; line-height: 1.4; }
+.composer-action-notice { display: flex; align-items: center; gap: 8px; max-width: 768px; margin: 0 auto 6px; padding: 6px 12px; border: 1px solid var(--slim-line); border-radius: 8px; background: var(--slim-surface); color: var(--slim-text); font-size: 11.5px; line-height: 1.4; }
 .composer-action-notice .composer-action-notice-text { flex: 1; min-width: 0; text-align: left; white-space: normal; overflow: visible; }
 .composer-action-notice-btn { flex: none; padding: 2px 10px; border: 1px solid var(--f7-theme-color); border-radius: 6px; background: transparent; color: var(--f7-theme-color); font-size: 11px; line-height: 1.4; cursor: pointer; }
 .composer-action-notice-btn:hover { background: color-mix(in srgb, var(--f7-theme-color) 10%, transparent); }
@@ -1285,7 +1280,7 @@ body.slimgpt-drawer-open { overflow: hidden; }
 /* Disabled-look for the always-clickable send slot (aria-disabled only). */
 .composer-send-disabled { opacity: 0.45; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border-width: 0; }
-.composer-shell { display: flex; align-items: flex-end; gap: 9px; max-width: 800px; margin: 0 auto; padding: 6px 9px 6px 13px; border: 1px solid var(--slim-line); border-radius: 18px; background: var(--slim-surface); transition: border-color 0.15s ease, box-shadow 0.15s ease; }
+.composer-shell { display: flex; align-items: flex-end; gap: 9px; max-width: 768px; margin: 0 auto; padding: 6px 9px 6px 13px; border: 1px solid var(--slim-line); border-radius: 16px; background: var(--slim-surface); transition: border-color 0.15s ease, box-shadow 0.15s ease; }
 .composer-shell:focus-within { border-color: var(--f7-theme-color); box-shadow: 0 0 0 3px color-mix(in srgb, var(--f7-theme-color) 30%, transparent); }
 .composer-shell textarea:focus-visible { outline: none; }
 .composer-shell textarea {
@@ -1322,7 +1317,7 @@ body.slimgpt-drawer-open { overflow: hidden; }
 .composer-char-count { flex: none; color: var(--slim-muted); font-size: 10.5px; white-space: nowrap; }
 .composer-char-count.composer-char-warn { color: #cf6258; font-weight: 650; }
 .send-button { flex: none; width: 34px !important; height: 34px !important; min-width: 34px; padding: 0 !important; font-size: 17px; border-radius: 50% !important; }
-.composer-hint { max-width: 800px; margin: 5px auto 0; color: var(--slim-muted); text-align: center; font-size: 10.5px; }
+.composer-hint { max-width: 768px; margin: 5px auto 0; color: var(--slim-muted); text-align: center; font-size: 10.5px; }
 .mobile-navbar, .sidebar-scrim { display: none; }
 .sidebar-host[hidden], .overview-host[hidden] { display: none !important; }
 
@@ -1332,8 +1327,9 @@ body.slimgpt-drawer-open { overflow: hidden; }
 
 @media (min-width: 1920px) {
   .app-shell { grid-template-columns: clamp(350px, 18vw, 420px) minmax(0, 1fr) clamp(320px, 16vw, 380px); }
-  .single-message-content { width: min(880px, calc(100% - 48px)); }
-  .composer-wrap, .composer-top-bar, .composer-shell, .composer-status, .composer-hint { max-width: 880px; }
+  .single-message-content { width: min(960px, calc(100% - 48px)); max-width: 960px; }
+  .composer-wrap, .composer-top-bar, .composer-shell, .composer-hint { max-width: 960px; }
+  .composer-status { max-width: 960px; }
 }
 
 @media (max-width: 960px), (hover: none) and (pointer: coarse) {

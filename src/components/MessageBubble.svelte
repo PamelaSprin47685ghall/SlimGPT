@@ -400,21 +400,13 @@
   <div class="message-card-body">
     <div class="message-meta">
       <div class="message-meta-left">
-        <span class="message-author-name">
-          {#if message?.tool?.kind === 'tool-call'}
-            工具调用
-          {:else if message?.tool?.kind === 'tool-result'}
-            工具返回
-          {:else if message?.role === 'assistant'}
-            ChatGPT
-          {:else if message?.role === 'user'}
-            你
-          {:else if message?.role === 'system'}
-            系统消息
-          {:else}
-            {message?.name || message?.role || '消息'}
-          {/if}
-        </span>
+        {#if message?.tool?.kind === 'tool-call'}
+          <span class="message-author-name">工具调用</span>
+        {:else if message?.tool?.kind === 'tool-result'}
+          <span class="message-author-name">工具返回</span>
+        {:else if message?.role === 'system'}
+          <span class="message-author-name">系统消息</span>
+        {/if}
 
         {#if !isUser && !message?.tool && message?.thinkingLevel && (hasThought || message?.reasoningEffort)}
           <span class="meta-badge thinking-badge" title={message.thinkingLevel.tip}>
@@ -487,11 +479,11 @@
                   </svg>
                 {/if}
               </span>
-              <span class="thought-title">{thinkingActive ? '思考中…' : '深度思考'}</span>
+              <span class="thought-title">{thinkingActive ? (liveThinkingSeconds > 0 ? `已思考 ${liveThinkingSeconds} 秒` : 'Thinking...') : (message?.thinkingDuration ? `已思考 ${message.thinkingDuration}` : '已完成思考')}</span>
               {#if thinkingActive && liveThinkingSeconds > 0}
-                <span class="thought-duration">已思考 {liveThinkingSeconds} 秒</span>
+                <span class="thought-duration"></span>
               {:else if message?.thinkingDuration}
-                <span class="thought-duration">用时 {message.thinkingDuration}</span>
+                <span class="thought-duration"></span>
               {/if}
               <span class="thought-toggle" class:rotated={thoughtOpen}>
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
@@ -797,8 +789,9 @@
   }
   :global(.thought-content) {
     padding: 12px 14px;
-    font-size: 12.5px;
-    line-height: 1.6;
+    font-size: 12px;
+    line-height: 1.65;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     color: var(--slim-muted);
   }
   .thought-toggle-btn {
@@ -1181,9 +1174,14 @@
 
   /* Sleek avatar styling: 28px circular indicator with clean SVG */
   :global(.message-card .message-avatar) {
-    width: 28px !important;
-    height: 28px !important;
-    min-width: 28px !important;
+    display: none !important;
+  }
+  :global(.message-card.tool-call .message-avatar),
+  :global(.message-card.tool-result .message-avatar) {
+    display: grid !important;
+    width: 26px !important;
+    height: 26px !important;
+    min-width: 26px !important;
     margin-top: 4px !important;
     border-radius: 50% !important;
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08) !important;
@@ -1194,6 +1192,7 @@
     border-radius: 18px 18px 4px 18px !important;
     box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03) !important;
     border: 1px solid color-mix(in srgb, var(--f7-theme-color) 16%, var(--slim-line)) !important;
+    padding: 11px 16px !important;
     word-break: break-word;
     overflow-wrap: break-word;
   }
@@ -1206,10 +1205,12 @@
     overflow-wrap: break-word;
   }
   :global(.message-card.role-user) {
-    gap: 10px !important;
+    gap: 0 !important;
+    justify-content: flex-end !important;
   }
   :global(.message-card.role-assistant) {
-    gap: 10px !important;
+    gap: 0 !important;
+    width: 100% !important;
   }
   :global(.message-card) {
     margin-bottom: 4px;

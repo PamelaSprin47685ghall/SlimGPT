@@ -984,8 +984,11 @@
     noteGenerationChunk();
     // Batched callers (processStructured) own the single newest-message preview
     // update; synchronized/canonical captures never preview intermediate
-    // snapshots. Live single-message callers preview immediately.
-    if (!options.deferPreview && !capture?.synchronized && !capture?.canonicalSyncId) {
+    // snapshots. Historical DOM fallback nodes never preview either: a scan
+    // batch carries old messages oldest-to-newest and each would otherwise
+    // thrash the sidebar preview. Live single-message callers preview now.
+    if (!options.deferPreview && !capture?.synchronized && !capture?.canonicalSyncId &&
+        capture?.transport !== 'dom') {
       updateConversationPreviewFromMessage(id, event.message);
     }
     if (id === currentConversationId) reconcilePending(id, event.message);
@@ -1034,13 +1037,26 @@
       if (retained.length) pendingLiveEvents.set(key, retained);
       else pendingLiveEvents.delete(key);
     }
+    let newestFlushedMessage = null;
+    let newestFlushedTime = -1;
     for (const entry of queued) {
       acceptMessageEvent(id, entry.event, {
         ...entry.capture,
         conversationId: id,
         conversationIdConflict: false,
-      });
+      }, { deferPreview: true });
+      // One preview update for the whole flush, from the newest non-tool
+      // message — never one per queued event.
+      const candidate = entry.event.message;
+      if (candidate && !getToolMessageInfo(candidate)) {
+        const candidateTime = Number(candidate?.create_time ?? candidate?.createTime ?? candidate?.metadata?.timestamp) || 0;
+        if (!newestFlushedMessage || candidateTime >= newestFlushedTime) {
+          newestFlushedMessage = candidate;
+          newestFlushedTime = candidateTime;
+        }
+      }
     }
+    if (newestFlushedMessage) updateConversationPreviewFromMessage(id, newestFlushedMessage);
   }
 
   function clearPendingLiveEvents() {

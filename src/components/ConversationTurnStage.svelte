@@ -1033,8 +1033,14 @@
 
 <style>
   :global(.single-message-content) {
-    width: min(800px, calc(100% - 48px));
-    max-width: 800px;
+    width: min(768px, calc(100% - 48px));
+    max-width: 768px;
+  }
+  @media (min-width: 1920px) {
+    :global(.single-message-content) {
+      width: min(960px, calc(100% - 48px));
+      max-width: 960px;
+    }
   }
   .single-message-scroller {
     scrollbar-gutter: stable;
