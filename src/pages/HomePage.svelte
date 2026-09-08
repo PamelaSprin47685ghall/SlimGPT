@@ -1218,7 +1218,8 @@
     }
     const next = new Map(conversationMap);
     const previous = next.get(id) || {};
-    const details = conversationDetailsFromPayload(mergedPayload, previous);
+    const shouldUpdatePreview = !capture.canonicalSyncId || capture.canonicalComplete === true;
+    const details = shouldUpdatePreview ? conversationDetailsFromPayload(mergedPayload, previous) : null;
     const pagePath = (() => {
       try { return new URL(status.pageUrl || 'https://chatgpt.com/').pathname; } catch { return ''; }
     })();
@@ -1232,8 +1233,8 @@
         (pageConversationId === id && pagePath.startsWith('/uc/'))
         ? 'uc'
         : (previous.route || 'c'),
-      last: details.last,
-      model: details.model,
+      last: details ? details.last : (previous.last || ''),
+      model: details ? details.model : (previous.model || ''),
     }, previous));
     conversationMap = next;
     if (record.canonicalComplete && loadingConversationId === id) finishConversationLoading();
@@ -1409,6 +1410,7 @@
       setConversationWorkState(id, newChatWorkState);
       newChatWorkState = 'unknown';
     }
+    locallyPromotedConversationIds.add(id);
     updateConversationPreview(id, pendingText, '');
     flushPendingLiveEvents(id);
   }
@@ -2200,6 +2202,10 @@
     if (getToolMessageInfo(rawMessage)) return;
     const metadata = rawMessage.metadata || {};
     const updateTime = Number(rawMessage.create_time ?? rawMessage.createTime ?? metadata.timestamp) || null;
+    const existing = conversationMap.get(id) || null;
+    if (existing && updateTime != null && existing.update_time != null && updateTime < existing.update_time) {
+      return;
+    }
     updateConversationPreview(
       id,
       contentToText(rawMessage.content, metadata),
@@ -2217,6 +2223,14 @@
     });
     const preview = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 160);
     if (existing && !preview && !model && !updateTime) return;
+    const targetLast = preview || previous.last;
+    const targetModel = model || previous.model;
+    const targetUpdateTime = updateTime || previous.update_time;
+    if (existing &&
+        existing.last === targetLast &&
+        existing.model === targetModel &&
+        existing.update_time === targetUpdateTime &&
+        [...conversationMap.keys()][0] === id) return;
     const updated = normalizeConversationMeta({
       ...previous,
       last: preview || previous.last,

@@ -74,6 +74,7 @@
   const pendingCanonicalIds = new Set();
   const canonicalQueueGenerations = new Map();
   const canonicalAttemptedGenerations = new Map();
+  const canonicalSyncedIds = new Set();
   const canonicalBackoffUntil = new Map();
   const canonicalFailureCounts = new Map();
   const activeTurnSessions = new Map();
@@ -1010,23 +1011,31 @@
     }
     drainCanonicalFetches();
     if (!conversationIndexBootstrapped) {
-      conversationIndexBootstrapped = true;
-      requestConversationIndexSync();
+      requestConversationIndexSync({ force: true });
     } else {
       drainConversationIndexSync();
     }
   }
 
-  function requestConversationIndexSync() {
+  let lastIndexSyncAttemptAt = 0;
+  const INDEX_SYNC_COOLDOWN_MS = 8_000;
+  function requestConversationIndexSync(options = {}) {
+    const force = options === true || Boolean(options?.force);
+    const now = Date.now();
+    if (!force && conversationIndexBootstrapped && now - lastIndexSyncAttemptAt < INDEX_SYNC_COOLDOWN_MS) {
+      return;
+    }
+    lastIndexSyncAttemptAt = now;
     conversationIndexSyncRequested = true;
-    drainConversationIndexSync();
+    drainConversationIndexSync(options);
   }
 
-  function drainConversationIndexSync() {
-    const sourceHeaders = backendHeaders || backendSessionHeaders;
+  function drainConversationIndexSync(options = {}) {
+    const sourceHeaders = backendHeaders || backendSessionHeaders || new Headers();
     if (!conversationIndexSyncRequested || conversationIndexSync || !backendFetch || !sourceHeaders) return;
     conversationIndexSyncRequested = false;
-    conversationIndexSync = syncConversationIndex(new Headers(sourceHeaders))
+    const fullSync = !conversationIndexBootstrapped || options === true || Boolean(options?.force);
+    conversationIndexSync = syncConversationIndex(new Headers(sourceHeaders), fullSync)
       .then((synced) => {
         conversationIndexBootstrapped = Boolean(synced);
       })
@@ -1039,7 +1048,7 @@
       });
   }
 
-  async function syncConversationIndex(sourceHeaders) {
+  async function syncConversationIndex(sourceHeaders, fullSync = true) {
     const headers = new Headers(sourceHeaders);
     headers.delete("content-length");
     headers.delete("content-type");
@@ -1061,8 +1070,9 @@
 
     let offset = 0;
     const seenPages = new Set();
-    while (offset < MAX_SYNCED_CONVERSATIONS) {
-      const limit = Math.min(CONVERSATION_INDEX_PAGE_SIZE, MAX_SYNCED_CONVERSATIONS - offset);
+    const maxSyncItems = fullSync ? MAX_SYNCED_CONVERSATIONS : CONVERSATION_INDEX_PAGE_SIZE;
+    while (offset < maxSyncItems) {
+      const limit = Math.min(CONVERSATION_INDEX_PAGE_SIZE, maxSyncItems - offset);
       const url = new URL("/backend-api/conversations", location.origin);
       url.searchParams.set("offset", String(offset));
       url.searchParams.set("limit", String(limit));
@@ -1844,7 +1854,7 @@
       cancelSignal?.removeEventListener("abort", cancelReader);
       reader.releaseLock();
       if (sawDone && isExecutionStreamUrl(captureMeta.url)) {
-        requestConversationIndexSync();
+        requestConversationIndexSync({ force: true });
       }
       try {
         onClose?.({
@@ -2168,8 +2178,10 @@
     }, { once: true });
   }
 
-  function queueCanonicalConversation(conversationId) {
+  function queueCanonicalConversation(conversationId, options = {}) {
     if (!conversationId || isProvisionalConversationId(conversationId)) return;
+    const force = options === true || Boolean(options?.force);
+    if (!force && typeof canonicalSyncedIds !== 'undefined' && canonicalSyncedIds.has(conversationId)) return;
     const retryAfterMs = (canonicalBackoffUntil.get(conversationId) || 0) - Date.now();
     if (retryAfterMs > 0) {
       emit({ type: 'canonical-sync-status', conversationId, state: 'error', code: 'backoff', retryAfterMs });
@@ -2217,6 +2229,7 @@
       if (!pages.length) throw new Error('empty canonical conversation');
       canonicalFailureCounts.delete(conversationId);
       canonicalBackoffUntil.delete(conversationId);
+      if (typeof canonicalSyncedIds !== 'undefined') canonicalSyncedIds.add(conversationId);
       const latestGeneration = canonicalQueueGenerations.get(conversationId) || 0;
       if (latestGeneration <= generation) {
         pendingCanonicalIds.delete(conversationId);
@@ -2711,7 +2724,7 @@
           timestamp: Date.now(),
         });
         if (conversationId && stateValue === 'stopped') {
-          queueCanonicalConversation(conversationId);
+          queueCanonicalConversation(conversationId, { force: true });
           requestConversationIndexSync();
         }
       }
@@ -2974,9 +2987,10 @@
       resetResumeSession();
     }
     const conversationId = conversationIdFromUrl(href);
-    if ((changed || force === true) && conversationId) {
+    const syncedIds = typeof canonicalSyncedIds !== 'undefined' ? canonicalSyncedIds : null;
+    if ((changed || force === true) && conversationId && (force === true || !syncedIds || !syncedIds.has(conversationId))) {
       bindPendingTurnSession(conversationId);
-      queueCanonicalConversation(conversationId);
+      queueCanonicalConversation(conversationId, { force: force === true });
     }
     emit({ type: "page-location", url: href });
     scheduleExecutionStateScan(0);
@@ -3081,7 +3095,7 @@
       }
       case "refresh-conversation": {
         const id = typeof payload.conversationId === 'string' ? payload.conversationId.trim() : '';
-        if (id && !isProvisionalConversationId(id)) queueCanonicalConversation(id);
+        if (id && !isProvisionalConversationId(id)) queueCanonicalConversation(id, { force: true });
         return;
       }
       case "adopt-conversation-id": {
@@ -3095,6 +3109,7 @@
           const target = new URL(`/${route}/${encodeURIComponent(conversationId)}`, location.origin);
           history.replaceState(history.state, '', target.href);
         }
+        queueCanonicalConversation(conversationId, { force: true });
         return;
       }
       case "new-chat": {

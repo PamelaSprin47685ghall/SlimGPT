@@ -196,26 +196,34 @@
   </header>
 
   <div class="overview-filter-box">
-    <input
-      type="search"
-      class="overview-filter-input"
-      bind:value={filterQuery}
-      placeholder="过滤轮次内容… (Esc 清除)"
-      aria-label="过滤问答轮次"
-      onkeydown={handleFilterKeydown}
-    />
-    {#if filterQuery}
-      <button
-        type="button"
-        class="overview-filter-clear"
-        onclick={() => filterQuery = ''}
-        aria-label="清空过滤"
-        title="一键清空过滤"
-      >一键清空</button>
-    {/if}
+    <div class="overview-search-wrapper">
+      <span class="overview-search-icon" aria-hidden="true">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="8"></circle>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+        </svg>
+      </span>
+      <input
+        type="search"
+        class="overview-filter-input"
+        bind:value={filterQuery}
+        placeholder="搜索问答内容… (Esc 清除)"
+        aria-label="过滤问答轮次"
+        onkeydown={handleFilterKeydown}
+      />
+      {#if filterQuery}
+        <button
+          type="button"
+          class="overview-filter-clear"
+          onclick={() => filterQuery = ''}
+          aria-label="清空过滤"
+          title="一键清空过滤"
+        >×</button>
+      {/if}
+    </div>
   </div>
 
-  <div class="overview-list" bind:this={listEl} onkeydown={handleListKeydown} role="region" aria-label="问答轮次列表">
+  <div class="overview-list" bind:this={listEl} onkeydown={handleListKeydown} role="region" aria-label="问答轮次列表" tabindex="-1">
     {#if turns.length === 0}
       <div class="overview-empty">
         {unresolvedCount ? '对话关系未同步完整，请重新同步关联' : '当前对话暂无问答'}
@@ -268,7 +276,10 @@
     scrollbar-gutter: stable;
   }
   .overview-item {
-    transition: background-color 0.12s ease;
+    transition: background-color 0.12s ease, transform 0.12s ease;
+  }
+  .overview-item:active {
+    transform: scale(0.99);
   }
   .overview-branch {
     display: inline-flex;
@@ -284,6 +295,11 @@
   @media (prefers-reduced-motion: reduce) {
     :global(.overview-live-dot) {
       animation: none !important;
+    }
+    .overview-item,
+    .overview-item:active {
+      transform: none !important;
+      transition: none !important;
     }
   }
 </style>

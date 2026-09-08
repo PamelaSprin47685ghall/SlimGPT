@@ -97,7 +97,7 @@
   let boundaryClosingTimer = null;
   let quoteSelection = $state(null);
   let previousStreaming = false;
-  let previousActiveIndex = activeIndex;
+  let previousActiveIndex = null;
 
   const activeTurn = $derived(turns[activeIndex] || null);
   const turnCount = $derived(turns.length);
@@ -1034,6 +1034,7 @@
 <style>
   .single-message-scroller {
     scrollbar-gutter: stable;
+    overflow-x: hidden;
     content-visibility: auto;
   }
   .turn-stage-header-badges {
@@ -1132,6 +1133,7 @@
     font-size: 14px;
     line-height: 1;
     cursor: pointer;
+    transition: background-color 0.12s ease, color 0.12s ease, border-color 0.12s ease;
   }
   .turn-step:hover:not(:disabled) {
     background: var(--slim-soft);
@@ -1165,18 +1167,27 @@
   .turn-jump-chips {
     position: absolute;
     top: 44px;
-    right: 16px;
+    right: max(16px, env(safe-area-inset-right));
     z-index: 2;
     display: inline-flex;
     gap: 4px;
+    max-width: calc(100% - 32px);
+    overflow-x: auto;
     padding: 3px;
     border: 1px solid var(--slim-line);
     border-radius: 999px;
-    background: color-mix(in srgb, var(--slim-bg) 92%, transparent);
-    backdrop-filter: blur(8px);
+    background: color-mix(in srgb, var(--slim-bg) 85%, transparent);
+    -webkit-backdrop-filter: blur(12px);
+    backdrop-filter: blur(12px);
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
     pointer-events: auto;
+    scrollbar-width: none;
+  }
+  .turn-jump-chips::-webkit-scrollbar {
+    display: none;
   }
   .turn-jump-chips button {
+    flex: none;
     padding: 2px 9px;
     border: 0;
     border-radius: 999px;
@@ -1185,10 +1196,12 @@
     font-size: 10px;
     line-height: 1.6;
     cursor: pointer;
+    transition: background-color 0.12s ease, color 0.12s ease, transform 0.12s ease;
   }
   .turn-jump-chips button:hover {
     background: var(--slim-soft);
     color: var(--f7-theme-color);
+    transform: translateY(-1px);
   }
   .tail-follow-pill.settled {
     background: var(--slim-surface);
@@ -1222,6 +1235,11 @@
     }
     .turn-boundary-pill,
     .turn-boundary-pill.pill-ready {
+      transform: none;
+      transition: none;
+    }
+    .turn-jump-chips button,
+    .turn-jump-chips button:hover {
       transform: none;
       transition: none;
     }

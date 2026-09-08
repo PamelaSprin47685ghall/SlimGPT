@@ -379,11 +379,19 @@
     {:else if message?.tool?.kind === 'tool-result'}
       ↙
     {:else if message?.role === 'assistant'}
-      S
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+        <path d="M22.28 9.87a5.98 5.98 0 0 0-.52-4.92 6.05 6.05 0 0 0-4.39-2.9 6 6 0 0 0-5.18 1.48 6.06 6.06 0 0 0-4.22.42 6.02 6.02 0 0 0-3.03 4.14 6.03 6.03 0 0 0 .74 5.34 6 6 0 0 0 .52 4.92 6.05 6.05 0 0 0 4.39 2.9 6 6 0 0 0 5.18-1.48 6.06 6.06 0 0 0 4.22-.42 6.02 6.02 0 0 0 3.03-4.14 6.03 6.03 0 0 0-.74-5.34zm-8.8 10.74a4.5 4.5 0 0 1-2.9-.11 4.54 4.54 0 0 1-.36-.18l3.18-1.84a.75.75 0 0 0 .38-.65v-4.48l1.35.78v4.46a4.53 4.53 0 0 1-1.65 2.02zm-7.7-3.23a4.5 4.5 0 0 1-.32-2.88c.15-.55.4-1.06.75-1.5l3.19 1.84a.75.75 0 0 0 .75 0l3.88-2.24v1.56l-3.87 2.23a4.53 4.53 0 0 1-4.38.99zm-1.44-8.03c.27-.49.63-.92 1.07-1.25l3.18 1.84a.75.75 0 0 0 .75 0l3.88-2.24-1.35-.78-3.87 2.23a4.52 4.52 0 0 1-3.66.2zm14.33 3.32l-3.88 2.24v-1.56l3.87-2.24a4.52 4.52 0 0 1 3.66-.2c.49.27.92.63 1.25 1.07a4.5 4.5 0 0 1 .32 2.88 4.55 4.55 0 0 1-.75 1.5l-3.19-1.84a.75.75 0 0 0-.75 0zm2.25-3.03a4.52 4.52 0 0 1-1.25-1.07l-3.18 1.84a.75.75 0 0 0-.38.65v4.48l-1.35-.78v-4.46a4.53 4.53 0 0 1 1.65-2.02 4.5 4.5 0 0 1 2.9.11c.56.2 1.06.53 1.48.97l-.02.04zm-9.35.34l1.73 1-1.73 1-1.73-1 1.73-1z"/>
+      </svg>
     {:else if message?.role === 'user'}
-      你
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+        <circle cx="12" cy="7" r="4"></circle>
+      </svg>
     {:else if message?.role === 'system'}
-      ⚙
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="3"></circle>
+        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+      </svg>
     {:else}
       ·
     {/if}
@@ -468,12 +476,28 @@
               onclick={toggleThought}
               aria-expanded={thoughtOpen}
             >
-              <span class="thought-icon">💭</span>
-              <span class="thought-title">思考过程</span>
-              {#if message?.thinkingDuration}
+              <span class="thought-pulse-indicator" class:pulsing={thinkingActive}>
+                {#if thinkingActive}
+                  <span class="thought-pulse-ring"></span>
+                  <span class="thought-pulse-core"></span>
+                {:else}
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M12 2a7 7 0 0 1 7 7c0 2.38-1.19 4.47-3 5.74V17a2 2 0 0 1-2 2h-4a2 2 0 0 1-2-2v-2.26C6.19 13.47 5 11.38 5 9a7 7 0 0 1 7-7z"></path>
+                    <line x1="9" y1="21" x2="15" y2="21"></line>
+                  </svg>
+                {/if}
+              </span>
+              <span class="thought-title">{thinkingActive ? '思考中…' : '深度思考'}</span>
+              {#if thinkingActive && liveThinkingSeconds > 0}
+                <span class="thought-duration">（已思考 {liveThinkingSeconds} 秒）</span>
+              {:else if message?.thinkingDuration}
                 <span class="thought-duration">（用时 {message.thinkingDuration}）</span>
               {/if}
-              <span class="thought-toggle">{thoughtOpen ? '收起 ▲' : '展开 ▼'}</span>
+              <span class="thought-toggle" class:rotated={thoughtOpen}>
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                  <polyline points="6 9 12 15 18 9"></polyline>
+                </svg>
+              </span>
             </button>
             <button
               type="button"
@@ -694,6 +718,88 @@
     align-items: center;
     justify-content: space-between;
     width: 100%;
+    padding: 8px 12px;
+    background: color-mix(in srgb, var(--slim-soft) 85%, var(--slim-surface));
+    border-radius: 12px;
+    transition: background 0.15s ease;
+  }
+  .thought-block.open .thought-header {
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+  }
+  .thought-block {
+    margin: 0 0 12px;
+    border: 1px solid color-mix(in srgb, var(--slim-line) 85%, transparent);
+    border-radius: 12px;
+    background: color-mix(in srgb, var(--slim-soft) 55%, var(--slim-surface));
+    overflow: hidden;
+    transition: border-color 0.15s ease;
+  }
+  .thought-block:hover {
+    border-color: color-mix(in srgb, var(--f7-theme-color) 35%, var(--slim-line));
+  }
+  .thought-pulse-indicator {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    margin-right: 8px;
+    color: var(--f7-theme-color);
+    flex: none;
+  }
+  .thought-pulse-ring {
+    position: absolute;
+    inset: 1px;
+    border-radius: 50%;
+    border: 1.5px solid var(--f7-theme-color);
+    animation: thought-ping 1.4s cubic-bezier(0, 0, 0.2, 1) infinite;
+    opacity: 0.75;
+  }
+  .thought-pulse-core {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--f7-theme-color);
+  }
+  @keyframes thought-ping {
+    75%, 100% {
+      transform: scale(1.6);
+      opacity: 0;
+    }
+  }
+  .thought-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--slim-text);
+    letter-spacing: -0.01em;
+  }
+  .thought-duration {
+    font-size: 11px;
+    color: var(--slim-muted);
+    margin-left: 6px;
+    font-variant-numeric: tabular-nums;
+  }
+  .thought-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin-left: 8px;
+    color: var(--slim-muted);
+    transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .thought-toggle.rotated {
+    transform: rotate(180deg);
+  }
+  .thought-content-wrapper {
+    border-top: 1px solid color-mix(in srgb, var(--slim-line) 60%, transparent);
+  }
+  :global(.thought-content) {
+    padding: 12px 14px;
+    font-size: 12.5px;
+    line-height: 1.6;
+    color: var(--slim-muted);
   }
   .thought-toggle-btn {
     display: inline-flex;
@@ -710,24 +816,27 @@
   .thought-copy-btn {
     display: inline-flex;
     align-items: center;
-    gap: 3px;
-    margin-right: 8px;
-    padding: 1px 6px;
+    gap: 4px;
+    margin-right: 4px;
+    padding: 3px 8px;
     border: 1px solid var(--slim-line);
-    border-radius: 4px;
-    background: color-mix(in srgb, var(--slim-surface) 80%, transparent);
+    border-radius: 6px;
+    background: var(--slim-surface);
     color: var(--slim-muted);
-    font: 500 9.5px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font: 500 10.5px/1 inherit;
     cursor: pointer;
-    transition: color 0.15s ease, border-color 0.15s ease;
+    transition: all 0.15s ease;
   }
   .thought-copy-btn:hover {
     color: var(--f7-theme-color);
     border-color: var(--f7-theme-color);
+    background: color-mix(in srgb, var(--f7-theme-color) 8%, var(--slim-surface));
   }
   .thought-copy-btn.copied {
     color: var(--f7-theme-color);
     border-color: var(--f7-theme-color);
+    background: color-mix(in srgb, var(--f7-theme-color) 12%, var(--slim-surface));
+    font-weight: 600;
   }
   .role-user .message-meta {
     flex-direction: row-reverse;
@@ -1021,5 +1130,86 @@
   }
   .error-banner-summary:hover {
     color: var(--slim-text);
+  }
+
+  /* Discreet floating action buttons on hover / focus */
+  .message-bottom-toolbar {
+    opacity: 0;
+    transform: translateY(2px);
+    transition: opacity 0.15s ease, transform 0.15s ease;
+  }
+  :global(.message-card:hover) .message-bottom-toolbar,
+  :global(.message-card:focus-within) .message-bottom-toolbar,
+  .message-bottom-toolbar:focus-within {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  @media (pointer: coarse) {
+    .message-bottom-toolbar {
+      opacity: 1;
+      transform: none;
+    }
+  }
+
+  /* Sleek modern bubble action buttons */
+  .bubble-action-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 26px;
+    padding: 0 9px;
+    border: 1px solid var(--slim-line);
+    border-radius: 7px;
+    background: var(--slim-surface);
+    color: var(--slim-muted);
+    font-size: 11px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.12s ease;
+  }
+  .bubble-action-btn:hover {
+    color: var(--slim-text);
+    border-color: color-mix(in srgb, var(--f7-theme-color) 40%, var(--slim-line));
+    background: var(--slim-soft);
+  }
+  .bubble-action-btn.copied {
+    color: var(--f7-theme-color) !important;
+    border-color: var(--f7-theme-color) !important;
+    background: color-mix(in srgb, var(--f7-theme-color) 12%, var(--slim-surface)) !important;
+    font-weight: 600;
+  }
+
+  /* Sleek avatar styling: 28px circular indicator with clean SVG */
+  :global(.message-card .message-avatar) {
+    width: 28px !important;
+    height: 28px !important;
+    min-width: 28px !important;
+    margin-top: 4px !important;
+    border-radius: 50% !important;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08) !important;
+  }
+
+  /* Bubble shape and wrapping improvements */
+  :global(.message-card.role-user .message-bubble) {
+    border-radius: 16px 16px 4px 16px !important;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04) !important;
+    border: 1px solid color-mix(in srgb, var(--f7-theme-color) 20%, var(--slim-line)) !important;
+    word-break: break-word;
+    overflow-wrap: break-word;
+  }
+  :global(.message-card.role-assistant .message-bubble) {
+    border-radius: 16px 16px 16px 4px !important;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04) !important;
+    word-break: break-word;
+    overflow-wrap: break-word;
+  }
+  :global(.message-card.role-user) {
+    gap: 10px !important;
+  }
+  :global(.message-card.role-assistant) {
+    gap: 10px !important;
+  }
+  :global(.message-card) {
+    margin-bottom: 4px;
   }
 </style>

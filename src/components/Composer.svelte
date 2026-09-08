@@ -439,7 +439,7 @@
             ? '只读查看分支中…'
             : (generating
               ? 'ChatGPT 正在思考与生成回答…'
-              : (busy ? '正在提交上一条消息…' : '发消息…'))))}
+              : (busy ? '正在提交上一条消息…' : '问点什么…（Enter 发送，Shift + Enter 换行）'))))}
       aria-label="消息"
     ></textarea>
     {#if readonlyBranch}
@@ -461,5 +461,101 @@
       title={generating ? '停止回答' : sendTitle}
     >{generating ? '■' : '↑'}</Button>
   </div>
-  <div class="composer-hint">Enter 发送 · Shift+Enter 换行 · 失败不会自动重发</div>
+  <div class="composer-hint">Enter 发送，Shift + Enter 换行 · 失败不会自动重发</div>
 </div>
+
+<style>
+  /* Floating modern card aesthetic */
+  :global(.composer-wrap) {
+    background: transparent !important;
+    border-top: none !important;
+    padding-top: 10px !important;
+  }
+  :global(.composer-shell) {
+    border-radius: 16px !important;
+    border: 1px solid color-mix(in srgb, var(--slim-line) 85%, transparent) !important;
+    background: var(--slim-surface) !important;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.05), 0 1px 3px rgba(0, 0, 0, 0.02) !important;
+    padding: 8px 10px 8px 16px !important;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease !important;
+  }
+  :global(.composer-shell:focus-within) {
+    border-color: var(--f7-theme-color) !important;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.08), 0 0 0 2px color-mix(in srgb, var(--f7-theme-color) 25%, transparent) !important;
+  }
+  :global(.composer-shell textarea) {
+    font-size: 14px;
+    line-height: 20px !important;
+  }
+  :global(.composer-shell textarea::placeholder) {
+    color: var(--slim-muted) !important;
+    opacity: 0.7 !important;
+  }
+  :global(.send-button) {
+    width: 32px !important;
+    height: 32px !important;
+    min-width: 32px !important;
+    border-radius: 50% !important;
+    background: var(--f7-theme-color) !important;
+    color: #ffffff !important;
+    box-shadow: 0 2px 6px color-mix(in srgb, var(--f7-theme-color) 35%, transparent) !important;
+    transition: all 0.15s ease !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+  }
+  :global(.send-button:not(.composer-send-disabled):hover) {
+    transform: scale(1.05);
+    box-shadow: 0 3px 8px color-mix(in srgb, var(--f7-theme-color) 50%, transparent) !important;
+  }
+  :global(.send-button.stop-mode) {
+    background: #cf6258 !important;
+    box-shadow: 0 2px 6px rgba(207, 98, 88, 0.35) !important;
+  }
+  :global(.send-button.stop-mode:hover) {
+    transform: scale(1.05);
+    box-shadow: 0 3px 8px rgba(207, 98, 88, 0.5) !important;
+  }
+  :global(.composer-send-disabled) {
+    opacity: 0.35 !important;
+    cursor: not-allowed !important;
+    box-shadow: none !important;
+  }
+  :global(.thinking-segmented) {
+    border-radius: 10px !important;
+    padding: 2px !important;
+    background: color-mix(in srgb, var(--slim-soft) 85%, var(--slim-surface)) !important;
+    border: 1px solid color-mix(in srgb, var(--slim-line) 75%, transparent) !important;
+  }
+  :global(.thinking-segmented .button) {
+    height: 26px !important;
+    font-size: 11px !important;
+    border-radius: 8px !important;
+    font-weight: 550 !important;
+    padding: 0 6px !important;
+  }
+  :global(.thinking-segmented .button-active) {
+    background: var(--slim-surface) !important;
+    color: var(--f7-theme-color) !important;
+    font-weight: 650 !important;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08) !important;
+  }
+  :global(.composer-hint) {
+    font-size: 11px !important;
+    color: var(--slim-muted) !important;
+    opacity: 0.75 !important;
+    margin-top: 6px !important;
+  }
+  :global(.thinking-control-label) {
+    font-size: 11px !important;
+    font-weight: 600 !important;
+  }
+  :global(.thinking-control-copy strong) {
+    font-size: 11.5px !important;
+    font-weight: 700 !important;
+  }
+  :global(.thinking-control-tip) {
+    font-size: 11px !important;
+    opacity: 0.8 !important;
+  }
+</style>
