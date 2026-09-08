@@ -1032,6 +1032,10 @@
 </div>
 
 <style>
+  :global(.single-message-content) {
+    width: min(800px, calc(100% - 48px));
+    max-width: 800px;
+  }
   .single-message-scroller {
     scrollbar-gutter: stable;
     overflow-x: hidden;

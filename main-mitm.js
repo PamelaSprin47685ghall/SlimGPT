@@ -1010,15 +1010,19 @@
       backendHeaders = new Headers(request.headers);
     }
     drainCanonicalFetches();
+    // Bootstrap-only: once bootstrapped, backend traffic must never trigger
+    // index syncs on its own. Refreshes go through requestConversationIndexSync
+    // (cooldown-gated, first-page-only) from completion handlers instead.
     if (!conversationIndexBootstrapped) {
       requestConversationIndexSync({ force: true });
-    } else {
-      drainConversationIndexSync();
     }
   }
 
   let lastIndexSyncAttemptAt = 0;
-  const INDEX_SYNC_COOLDOWN_MS = 8_000;
+  // Lower bound for index refreshes: stream completions, focus/online events
+  // and turn-stop notifications all funnel through requestConversationIndexSync,
+  // so rapid-fire triggers coalesce instead of storming /conversations.
+  const INDEX_SYNC_COOLDOWN_MS = 10_000;
   function requestConversationIndexSync(options = {}) {
     const force = options === true || Boolean(options?.force);
     const now = Date.now();
@@ -1853,8 +1857,12 @@
       });
       cancelSignal?.removeEventListener("abort", cancelReader);
       reader.releaseLock();
+      // Post-stream refresh is a single first-page touch-up, never a full
+      // multi-page sync: full history (up to 500 conversations) is reserved
+      // for initial bootstrap and explicit manual refresh. The default path
+      // is cooldown-gated and single-page once bootstrapped.
       if (sawDone && isExecutionStreamUrl(captureMeta.url)) {
-        requestConversationIndexSync({ force: true });
+        requestConversationIndexSync();
       }
       try {
         onClose?.({
@@ -2182,6 +2190,16 @@
     if (!conversationId || isProvisionalConversationId(conversationId)) return;
     const force = options === true || Boolean(options?.force);
     if (!force && typeof canonicalSyncedIds !== 'undefined' && canonicalSyncedIds.has(conversationId)) return;
+    if (canonicalFetches.has(conversationId)) {
+      // A snapshot for this conversation is already in flight (e.g. navigation
+      // and a turn-stop notification arriving together). Keep it queued without
+      // bumping the generation so concurrent signals coalesce into the single
+      // in-flight fetch instead of serializing into back-to-back full-history
+      // reads. Genuine new-content signals use force and still schedule a
+      // follow-up pass via the generation bump below.
+      pendingCanonicalIds.add(conversationId);
+      if (!force) return;
+    }
     const retryAfterMs = (canonicalBackoffUntil.get(conversationId) || 0) - Date.now();
     if (retryAfterMs > 0) {
       emit({ type: 'canonical-sync-status', conversationId, state: 'error', code: 'backoff', retryAfterMs });
@@ -2366,6 +2384,9 @@
       totalBytes += bytes;
       if (totalBytes > maxTotalBytes) throw canonicalProtocolFailure('canonical total size limit exceeded');
       const { pageInfo } = validateCanonicalPage(text, conversationId);
+      if (pages.length && pages[pages.length - 1].text === text) {
+        throw canonicalProtocolFailure('canonical page did not advance');
+      }
       pages.push({
         text,
         url: response.url || url.href,

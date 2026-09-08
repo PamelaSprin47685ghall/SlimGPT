@@ -911,24 +911,25 @@
   /* Sleek modern conversation item overrides */
   :global(.conversation-item) {
     position: relative;
-    padding: 9px 10px !important;
+    padding: 10px 12px !important;
     border-radius: 10px !important;
     border: 1px solid transparent !important;
     transition: background 0.12s ease, border-color 0.12s ease !important;
   }
   :global(.conversation-item:hover) {
-    background: color-mix(in srgb, var(--slim-soft) 80%, transparent) !important;
+    background: var(--slim-soft) !important;
   }
   :global(.conversation-item.active) {
     background: var(--slim-surface) !important;
-    border-color: color-mix(in srgb, var(--slim-line) 80%, transparent) !important;
+    border-color: color-mix(in srgb, var(--f7-theme-color) 25%, var(--slim-line)) !important;
+    border-left: 3px solid var(--f7-theme-color) !important;
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04) !important;
   }
   :global(.conversation-item-topline) {
     gap: 8px !important;
   }
   :global(.conversation-title) {
-    font-size: 13px !important;
+    font-size: 13.5px !important;
     font-weight: 500 !important;
     letter-spacing: -0.01em !important;
     color: var(--slim-text) !important;
@@ -937,7 +938,7 @@
     font-weight: 600 !important;
   }
   :global(.conversation-time) {
-    font-size: 10px !important;
+    font-size: 10.5px !important;
     opacity: 0.7 !important;
     font-variant-numeric: tabular-nums !important;
   }

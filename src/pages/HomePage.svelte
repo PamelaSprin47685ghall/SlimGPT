@@ -648,7 +648,15 @@
       const id = String(item.id);
       const previous = existing.get(id) || {};
       incomingIds.add(id);
-      incoming.push([id, normalizeConversationMeta({ ...previous, ...item }, previous)]);
+      const merged = normalizeConversationMeta({ ...previous, ...item }, previous);
+      // A stale index page must never regress a fresher live preview: keep the
+      // newer snippet/model/timestamp while still accepting server title/route.
+      if (previous.update_time != null && merged.update_time != null && merged.update_time < previous.update_time) {
+        merged.last = previous.last;
+        merged.model = previous.model;
+        merged.update_time = previous.update_time;
+      }
+      incoming.push([id, merged]);
       existing.delete(id);
     }
     if (!incoming.length) return;
@@ -913,6 +921,15 @@
     // Both ordinary message events and decoded v1 deltas contain snapshots.
     // Appending them heuristically corrupts replacements, truncations and
     // repeated text in reasoning/tool arguments.
+    // Preview updates are deliberately NOT done per message here: a single
+    // payload can carry a whole backlog of historical messages, and updating
+    // the sidebar snippet for each one makes the preview visibly cycle from
+    // the oldest message to the newest. Ingest every message, then refresh the
+    // preview once from the newest non-tool message per conversation.
+    // Synchronized/canonical captures suppress intermediate previews entirely
+    // (the canonical-complete payload path owns the final preview).
+    const suppressBatchPreview = Boolean(capture.synchronized || capture.canonicalSyncId);
+    const previewCandidates = new Map();
     for (const event of findMessageEvents(value, { textMode: 'snapshot' })) {
       const scope = resolveCapturedConversation(
         capture,
@@ -924,11 +941,21 @@
         queuePendingLiveEvent(event, capture);
         continue;
       }
-      acceptMessageEvent(scope.conversationId, event, capture);
+      acceptMessageEvent(scope.conversationId, event, capture, { deferPreview: true });
+      if (!suppressBatchPreview && !getToolMessageInfo(event.message)) {
+        const candidateTime = Number(event.message?.create_time ?? event.message?.createTime ?? event.message?.metadata?.timestamp) || 0;
+        const current = previewCandidates.get(scope.conversationId);
+        if (!current || candidateTime >= current.time) {
+          previewCandidates.set(scope.conversationId, { message: event.message, time: candidateTime });
+        }
+      }
+    }
+    for (const [id, { message }] of previewCandidates) {
+      updateConversationPreviewFromMessage(id, message);
     }
   }
 
-  function acceptMessageEvent(id, event, capture) {
+  function acceptMessageEvent(id, event, capture, options = {}) {
     maybeActivateCapturedConversation(id, capture);
     bindPendingTurnIdentity(id, capture);
     const turnContext = captureMessageContext(event, capture);
@@ -955,7 +982,12 @@
     // Generation watchdog (Gap8, COMPOSER): every accepted live chunk
     // restarts the one-shot stall timer.
     noteGenerationChunk();
-    updateConversationPreviewFromMessage(id, event.message);
+    // Batched callers (processStructured) own the single newest-message preview
+    // update; synchronized/canonical captures never preview intermediate
+    // snapshots. Live single-message callers preview immediately.
+    if (!options.deferPreview && !capture?.synchronized && !capture?.canonicalSyncId) {
+      updateConversationPreviewFromMessage(id, event.message);
+    }
     if (id === currentConversationId) reconcilePending(id, event.message);
   }
 
@@ -2201,18 +2233,18 @@
     if (!rawMessage) return;
     if (getToolMessageInfo(rawMessage)) return;
     const metadata = rawMessage.metadata || {};
+    const snippet = contentToText(rawMessage.content, metadata);
+    const model = metadata.model_slug || metadata.default_model_slug || metadata.model || '';
+    // Blank snippets (reasoning/thought chunks, tool payloads, placeholders)
+      // must never erase or churn an existing preview.
+    if (!snippet.trim() && !model && conversationMap.get(id)) return;
     const updateTime = Number(rawMessage.create_time ?? rawMessage.createTime ?? metadata.timestamp) || null;
     const existing = conversationMap.get(id) || null;
     if (existing && updateTime != null && existing.update_time != null && updateTime < existing.update_time) {
       return;
     }
-    updateConversationPreview(
-      id,
-      contentToText(rawMessage.content, metadata),
-      metadata.model_slug || metadata.default_model_slug || metadata.model || '',
-      updateTime,
-    );
-  }
+    updateConversationPreview(id, snippet, model, updateTime);
+    }
 
   function updateConversationPreview(id, text, model = '', updateTime = null) {
     const existing = conversationMap.get(id) || null;
@@ -2222,10 +2254,14 @@
       route: 'c',
     });
     const preview = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 160);
-    if (existing && !preview && !model && !updateTime) return;
+    // Empty/placeholder text must never erase an existing preview, and older
+    // timestamps must never overwrite a newer one.
+    if (existing && !preview && !model) return;
+    const incomingTime = Number(updateTime) || null;
+    const targetUpdateTime = incomingTime ?? previous.update_time;
+    if (existing?.update_time != null && targetUpdateTime != null && targetUpdateTime < existing.update_time) return;
     const targetLast = preview || previous.last;
     const targetModel = model || previous.model;
-    const targetUpdateTime = updateTime || previous.update_time;
     if (existing &&
         existing.last === targetLast &&
         existing.model === targetModel &&
@@ -2235,7 +2271,7 @@
       ...previous,
       last: preview || previous.last,
       model: model || previous.model,
-      update_time: updateTime || previous.update_time,
+      update_time: targetUpdateTime,
     }, previous);
     locallyPromotedConversationIds.add(id);
     const next = new Map([[id, updated]]);

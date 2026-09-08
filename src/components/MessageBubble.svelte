@@ -489,9 +489,9 @@
               </span>
               <span class="thought-title">{thinkingActive ? '思考中…' : '深度思考'}</span>
               {#if thinkingActive && liveThinkingSeconds > 0}
-                <span class="thought-duration">（已思考 {liveThinkingSeconds} 秒）</span>
+                <span class="thought-duration">已思考 {liveThinkingSeconds} 秒</span>
               {:else if message?.thinkingDuration}
-                <span class="thought-duration">（用时 {message.thinkingDuration}）</span>
+                <span class="thought-duration">用时 {message.thinkingDuration}</span>
               {/if}
               <span class="thought-toggle" class:rotated={thoughtOpen}>
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
@@ -1191,15 +1191,17 @@
 
   /* Bubble shape and wrapping improvements */
   :global(.message-card.role-user .message-bubble) {
-    border-radius: 16px 16px 4px 16px !important;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04) !important;
-    border: 1px solid color-mix(in srgb, var(--f7-theme-color) 20%, var(--slim-line)) !important;
+    border-radius: 18px 18px 4px 18px !important;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03) !important;
+    border: 1px solid color-mix(in srgb, var(--f7-theme-color) 16%, var(--slim-line)) !important;
     word-break: break-word;
     overflow-wrap: break-word;
   }
   :global(.message-card.role-assistant .message-bubble) {
-    border-radius: 16px 16px 16px 4px !important;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04) !important;
+    border: none !important;
+    box-shadow: none !important;
+    background: transparent !important;
+    padding: 2px 0 8px !important;
     word-break: break-word;
     overflow-wrap: break-word;
   }
