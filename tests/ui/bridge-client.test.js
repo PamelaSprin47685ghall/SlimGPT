@@ -20,7 +20,10 @@ test('posts v2 envelopes to the parent with the exact chatgpt.com origin', () =>
   const client = createBridgeClient({ window: win, onMessage() {} });
   assert.equal(client.connected, true);
   client.send('open', { conversationId: 'c1' });
-  assert.deepEqual(win.parent.posted, [{ origin: PAGE_ORIGIN, data: { conversationId: 'c1', channel: UI_CHANNEL, v: 2, type: 'open' } }]);
+  assert.deepEqual(win.parent.posted, [
+    { origin: PAGE_ORIGIN, data: { channel: UI_CHANNEL, v: 2, type: 'ui-ready' } },
+    { origin: PAGE_ORIGIN, data: { conversationId: 'c1', channel: UI_CHANNEL, v: 2, type: 'open' } },
+  ], 'ui-ready is announced once on mount, before anything else');
   client.destroy();
 });
 

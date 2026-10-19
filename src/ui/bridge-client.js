@@ -34,6 +34,11 @@ export function createBridgeClient({ window: win = globalThis.window, origin = P
 
   win?.addEventListener?.('message', listener);
 
+  // Tell the page we are listening (it then sends hello/location/takeover and
+  // flushes anything queued). The frame load event does the same; this covers
+  // late hook installs (Orion) and frame reloads.
+  if (parent) parent.postMessage(bridgeMessage('ui-to-page', 'ui-ready'), origin);
+
   /** @returns {boolean} false when there is no parent page to talk to. */
   function send(type, fields = {}) {
     if (!parent) return false;
