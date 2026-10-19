@@ -1,0 +1,31 @@
+{
+ "_about": "Expected final state after decoding v1-reasoning-then-answer.sse at EVERY chunk split point (1..len) and with CRLF/CR line endings. Repeated characters and bare newlines must survive (regression for core.js mergeProgressiveText).",
+ "conversationId": "c-1",
+ "title": "Greeting",
+ "endsWith": {
+  "type": "done"
+ },
+ "finalMessages": {
+  "t1": {
+   "status": "done",
+   "blocks": [
+    {
+     "kind": "reasoning",
+     "summary": "Plan",
+     "markdown": "think"
+    }
+   ]
+  },
+  "a1": {
+   "parentId": "t1",
+   "status": "done",
+   "blocks": [
+    {
+     "kind": "text",
+     "markdown": "aaa\n\n!",
+     "citations": []
+    }
+   ]
+  }
+ }
+}

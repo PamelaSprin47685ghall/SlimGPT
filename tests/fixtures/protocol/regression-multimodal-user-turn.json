@@ -1,0 +1,89 @@
+{
+ "_about": "Regression for main@11cbb34 core.js:1597-1605 + main-mitm.js:318-368: a DOM-scraped copy of a multimodal user message was treated as a different item and detached the assistant reply into a 'canonical-unassigned' bucket. In v2 there is no DOM source, but the invariant stays: a later live snapshot for an id that canonical history already holds must never create a second item or move replies; canonical content wins.",
+ "canonical": {
+  "id": "c-1",
+  "current_node": "a1",
+  "mapping": {
+   "root": {
+    "id": "root",
+    "parent": null,
+    "children": [
+     "u1"
+    ],
+    "message": null
+   },
+   "u1": {
+    "id": "u1",
+    "parent": "root",
+    "children": [
+     "a1"
+    ],
+    "message": {
+     "id": "u1",
+     "author": {
+      "role": "user"
+     },
+     "content": {
+      "content_type": "multimodal_text",
+      "parts": [
+       {
+        "content_type": "image_asset_pointer",
+        "asset_pointer": "file-service://f",
+        "width": 1,
+        "height": 1
+       },
+       "what?"
+      ]
+     },
+     "status": "finished_successfully"
+    }
+   },
+   "a1": {
+    "id": "a1",
+    "parent": "u1",
+    "children": [],
+    "message": {
+     "id": "a1",
+     "author": {
+      "role": "assistant"
+     },
+     "content": {
+      "content_type": "text",
+      "parts": [
+       "A cat."
+      ]
+     },
+     "status": "finished_successfully",
+     "end_turn": true
+    }
+   }
+  }
+ },
+ "live": {
+  "id": "u1",
+  "author": {
+   "role": "user"
+  },
+  "content": {
+   "content_type": "text",
+   "parts": [
+    "what?"
+   ]
+  },
+  "status": null
+ },
+ "expect": {
+  "turns": [
+   {
+    "user": "u1",
+    "replies": [
+     "a1"
+    ]
+   }
+  ],
+  "userBlocksKinds": [
+   "image",
+   "text"
+  ]
+ }
+}

@@ -1,0 +1,38 @@
+event: delta_encoding
+data: "v1"
+
+data: {"type": "input_message", "input_message": {"id": "u1", "author": {"role": "user"}, "content": {"content_type": "text", "parts": ["hi"]}, "status": "finished_successfully", "metadata": {}}, "conversation_id": "c-1"}
+
+event: delta
+data: {"p": "", "o": "add", "v": {"message": {"id": "t1", "author": {"role": "assistant"}, "content": {"content_type": "thoughts", "thoughts": [{"summary": "Plan", "content": ""}]}, "status": "in_progress", "metadata": {"parent_id": "u1"}}, "conversation_id": "c-1"}, "c": 0}
+
+event: delta
+data: {"p": "/message/content/thoughts/0/content", "o": "append", "v": "think"}
+
+event: delta
+data: {"p": "", "o": "patch", "v": [{"p": "/message/status", "o": "replace", "v": "finished_successfully"}]}
+
+event: delta
+data: {"p": "", "o": "add", "v": {"message": {"id": "a1", "author": {"role": "assistant"}, "content": {"content_type": "text", "parts": [""]}, "status": "in_progress", "metadata": {"parent_id": "t1"}}, "conversation_id": "c-1"}, "c": 1}
+
+event: delta
+data: {"p": "/message/content/parts/0", "o": "append", "v": "aa"}
+
+event: delta
+data: {"v": "a"}
+
+event: delta
+data: {"v": "\n"}
+
+event: delta
+data: {"v": "\n"}
+
+event: delta
+data: {"p": "", "o": "patch", "v": [{"p": "/message/content/parts/0", "o": "append", "v": "!"}, {"p": "/message/status", "o": "replace", "v": "finished_successfully"}, {"p": "/message/end_turn", "o": "replace", "v": true}]}
+
+data: {"type": "title_generation", "title": "Greeting", "conversation_id": "c-1"}
+
+data: {"type": "message_stream_complete", "conversation_id": "c-1"}
+
+data: [DONE]
+

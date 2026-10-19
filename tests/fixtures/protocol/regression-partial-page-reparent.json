@@ -1,0 +1,154 @@
+{
+ "_about": "Regression for main@11cbb34 core.js:54-89 + 620-636: merging a partial/linear page (e.g. web-mobile HTML or a short history page) that omits tool nodes re-parented the answer onto the user message, dropped the tool call/result from the visible path, and produced a fake 2-version branch. mergeConversation must keep known parents and must not create siblings.",
+ "full": {
+  "id": "c-1",
+  "current_node": "a1",
+  "mapping": {
+   "root": {
+    "id": "root",
+    "parent": null,
+    "children": [
+     "u1"
+    ],
+    "message": null
+   },
+   "u1": {
+    "id": "u1",
+    "parent": "root",
+    "children": [
+     "c1"
+    ],
+    "message": {
+     "id": "u1",
+     "author": {
+      "role": "user"
+     },
+     "content": {
+      "content_type": "text",
+      "parts": [
+       "q"
+      ]
+     },
+     "status": "finished_successfully"
+    }
+   },
+   "c1": {
+    "id": "c1",
+    "parent": "u1",
+    "children": [
+     "t1"
+    ],
+    "message": {
+     "id": "c1",
+     "author": {
+      "role": "assistant"
+     },
+     "recipient": "web.run",
+     "content": {
+      "content_type": "code",
+      "text": "{}"
+     },
+     "status": "finished_successfully"
+    }
+   },
+   "t1": {
+    "id": "t1",
+    "parent": "c1",
+    "children": [
+     "a1"
+    ],
+    "message": {
+     "id": "t1",
+     "author": {
+      "role": "tool",
+      "name": "web.run"
+     },
+     "content": {
+      "content_type": "text",
+      "parts": [
+       "r"
+      ]
+     },
+     "status": "finished_successfully"
+    }
+   },
+   "a1": {
+    "id": "a1",
+    "parent": "t1",
+    "children": [],
+    "message": {
+     "id": "a1",
+     "author": {
+      "role": "assistant"
+     },
+     "content": {
+      "content_type": "text",
+      "parts": [
+       "Answer"
+      ]
+     },
+     "status": "finished_successfully",
+     "end_turn": true
+    }
+   }
+  }
+ },
+ "partial": {
+  "id": "c-1",
+  "current_node": "a1",
+  "mapping": {
+   "u1": {
+    "id": "u1",
+    "parent": null,
+    "children": [
+     "a1"
+    ],
+    "message": {
+     "id": "u1",
+     "author": {
+      "role": "user"
+     },
+     "content": {
+      "content_type": "text",
+      "parts": [
+       "q"
+      ]
+     },
+     "status": "finished_successfully"
+    }
+   },
+   "a1": {
+    "id": "a1",
+    "parent": "u1",
+    "children": [],
+    "message": {
+     "id": "a1",
+     "author": {
+      "role": "assistant"
+     },
+     "content": {
+      "content_type": "text",
+      "parts": [
+       "Answer"
+      ]
+     },
+     "status": "finished_successfully",
+     "end_turn": true
+    }
+   }
+  }
+ },
+ "expect": {
+  "turns": [
+   {
+    "user": "u1",
+    "replies": [
+     "c1",
+     "t1",
+     "a1"
+    ],
+    "replyBranchCount": 1
+   }
+  ]
+ }
+}

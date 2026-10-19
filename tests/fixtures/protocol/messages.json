@@ -1,0 +1,585 @@
+{
+ "_about": "Synthetic raw ChatGPT message shapes (one per known content type) with the normalized output required by src/protocol/types.js. Inputs mirror shapes seen in core.js/tests on main; `expect` lists only the fields each case pins down. Workstream A owns this file and may add cases; do not weaken existing expectations without a plan update.",
+ "cases": [
+  {
+   "name": "plain assistant text",
+   "raw": {
+    "id": "a1",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "text",
+     "parts": [
+      "Hello **world**"
+     ]
+    },
+    "status": "finished_successfully",
+    "end_turn": true
+   },
+   "expect": {
+    "role": "assistant",
+    "status": "done",
+    "blocks": [
+     {
+      "kind": "text",
+      "markdown": "Hello **world**",
+      "citations": []
+     }
+    ]
+   }
+  },
+  {
+   "name": "streaming assistant",
+   "raw": {
+    "id": "a3",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "text",
+     "parts": [
+      "Hel"
+     ]
+    },
+    "status": "in_progress"
+   },
+   "expect": {
+    "status": "streaming"
+   }
+  },
+  {
+   "name": "thoughts with summary",
+   "raw": {
+    "id": "t1",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "thoughts",
+     "thoughts": [
+      {
+       "summary": "Plan",
+       "content": "Think about X"
+      }
+     ]
+    },
+    "metadata": {
+     "finished_duration_sec": 5
+    }
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "reasoning",
+      "summary": "Plan",
+      "markdown": "Think about X",
+      "durationSec": 5
+     }
+    ]
+   }
+  },
+  {
+   "name": "reasoning recap is reasoning, not prose with emoji",
+   "raw": {
+    "id": "r1",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "reasoning_recap",
+     "content": "Thought for 5s"
+    }
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "reasoning",
+      "summary": "Thought for 5s",
+      "markdown": ""
+     }
+    ]
+   }
+  },
+  {
+   "name": "analysis channel is reasoning",
+   "raw": {
+    "id": "ac",
+    "author": {
+     "role": "assistant"
+    },
+    "channel": "analysis",
+    "content": {
+     "content_type": "text",
+     "parts": [
+      "secret thinking"
+     ]
+    }
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "reasoning",
+      "markdown": "secret thinking"
+     }
+    ]
+   }
+  },
+  {
+   "name": "python tool call",
+   "raw": {
+    "id": "c1",
+    "author": {
+     "role": "assistant"
+    },
+    "recipient": "python",
+    "content": {
+     "content_type": "code",
+     "language": "python",
+     "text": "print(1)"
+    }
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "tool_call",
+      "tool": "python",
+      "input": "print(1)",
+      "language": "python"
+     }
+    ]
+   }
+  },
+  {
+   "name": "python execution output",
+   "raw": {
+    "id": "e1",
+    "author": {
+     "role": "tool",
+     "name": "python"
+    },
+    "content": {
+     "content_type": "execution_output",
+     "text": "1\n"
+    }
+   },
+   "expect": {
+    "role": "tool",
+    "blocks": [
+     {
+      "kind": "tool_result",
+      "tool": "python",
+      "output": "1\n",
+      "isError": false
+     }
+    ]
+   }
+  },
+  {
+   "name": "web search call",
+   "raw": {
+    "id": "w1",
+    "author": {
+     "role": "assistant"
+    },
+    "recipient": "web.run",
+    "content": {
+     "content_type": "code",
+     "text": "{\"search_query\":[{\"q\":\"x\"}]}"
+    }
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "tool_call",
+      "tool": "web.run",
+      "input": "{\"search_query\":[{\"q\":\"x\"}]}"
+     }
+    ]
+   }
+  },
+  {
+   "name": "web search result carried in metadata",
+   "raw": {
+    "id": "w2",
+    "author": {
+     "role": "tool",
+     "name": "web.run"
+    },
+    "content": {
+     "content_type": "text",
+     "parts": [
+      ""
+     ]
+    },
+    "metadata": {
+     "search_result_groups": [
+      {
+       "domain": "a.com",
+       "entries": [
+        {
+         "url": "https://a.com",
+         "title": "A"
+        }
+       ]
+      }
+     ]
+    }
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "tool_result",
+      "tool": "web.run"
+     }
+    ]
+   }
+  },
+  {
+   "name": "user image + text (multimodal)",
+   "raw": {
+    "id": "u1",
+    "author": {
+     "role": "user"
+    },
+    "content": {
+     "content_type": "multimodal_text",
+     "parts": [
+      {
+       "content_type": "image_asset_pointer",
+       "asset_pointer": "file-service://file-abc",
+       "width": 10,
+       "height": 10
+      },
+      "what is this?"
+     ]
+    }
+   },
+   "expect": {
+    "role": "user",
+    "blocks": [
+     {
+      "kind": "image",
+      "assetPointer": "file-service://file-abc",
+      "width": 10,
+      "height": 10
+     },
+     {
+      "kind": "text",
+      "markdown": "what is this?",
+      "citations": []
+     }
+    ]
+   }
+  },
+  {
+   "name": "user attachment metadata",
+   "raw": {
+    "id": "u2",
+    "author": {
+     "role": "user"
+    },
+    "content": {
+     "content_type": "text",
+     "parts": [
+      "see file"
+     ]
+    },
+    "metadata": {
+     "attachments": [
+      {
+       "name": "a.pdf",
+       "size": 2048,
+       "mime_type": "application/pdf"
+      }
+     ]
+    }
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "text",
+      "markdown": "see file",
+      "citations": []
+     },
+     {
+      "kind": "file",
+      "name": "a.pdf",
+      "size": 2048,
+      "mime": "application/pdf"
+     }
+    ]
+   }
+  },
+  {
+   "name": "user text is literal (no citation processing)",
+   "raw": {
+    "id": "u3",
+    "author": {
+     "role": "user"
+    },
+    "content": {
+     "content_type": "text",
+     "parts": [
+      "use <div> and **not bold**"
+     ]
+    }
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "text",
+      "markdown": "use <div> and **not bold**",
+      "citations": []
+     }
+    ]
+   }
+  },
+  {
+   "name": "image generation result",
+   "raw": {
+    "id": "g1",
+    "author": {
+     "role": "tool",
+     "name": "t2uay3k.sj1i4kz"
+    },
+    "content": {
+     "content_type": "multimodal_text",
+     "parts": [
+      {
+       "content_type": "image_asset_pointer",
+       "asset_pointer": "sediment://file_x",
+       "width": 1024,
+       "height": 1024
+      }
+     ]
+    }
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "image",
+      "assetPointer": "sediment://file_x"
+     }
+    ]
+   }
+  },
+  {
+   "name": "audio transcription keeps transcript, hides pointer",
+   "raw": {
+    "id": "au",
+    "author": {
+     "role": "user"
+    },
+    "content": {
+     "content_type": "multimodal_text",
+     "parts": [
+      {
+       "content_type": "audio_transcription",
+       "text": "spoken words",
+       "direction": "in"
+      },
+      {
+       "content_type": "audio_asset_pointer",
+       "asset_pointer": "sediment://a"
+      }
+     ]
+    }
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "text",
+      "markdown": "spoken words",
+      "citations": []
+     }
+    ]
+   }
+  },
+  {
+   "name": "resolved citation becomes structured span, not markdown",
+   "raw": {
+    "id": "ct",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "text",
+     "parts": [
+      "Paris is the capital citeturn0search0."
+     ]
+    },
+    "metadata": {
+     "content_references": [
+      {
+       "matched_text": "citeturn0search0",
+       "type": "grouped_webpages",
+       "items": [
+        {
+         "title": "Wiki",
+         "url": "https://en.wikipedia.org/wiki/Paris"
+        }
+       ]
+      }
+     ]
+    }
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "text",
+      "markdown": "Paris is the capital .",
+      "citations": [
+       {
+        "start": 21,
+        "end": 21,
+        "sources": [
+         {
+          "url": "https://en.wikipedia.org/wiki/Paris",
+          "title": "Wiki"
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "unresolved and truncated citation markers never leak private-use characters",
+   "raw": {
+    "id": "ct3",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "text",
+     "parts": [
+      "A citeturn0search0 B citeturn0"
+     ]
+    },
+    "status": "in_progress"
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "text",
+      "markdown": "A  B ",
+      "citations": []
+     }
+    ]
+   }
+  },
+  {
+   "name": "system error is an error",
+   "raw": {
+    "id": "se",
+    "author": {
+     "role": "system"
+    },
+    "content": {
+     "content_type": "system_error",
+     "name": "X",
+     "text": "boom"
+    }
+   },
+   "expect": {
+    "status": "error",
+    "blocks": [
+     {
+      "kind": "error",
+      "message": "boom"
+     }
+    ]
+   }
+  },
+  {
+   "name": "hidden system message",
+   "raw": {
+    "id": "s1",
+    "author": {
+     "role": "system"
+    },
+    "content": {
+     "content_type": "text",
+     "parts": [
+      ""
+     ]
+    },
+    "metadata": {
+     "is_visually_hidden_from_conversation": true
+    }
+   },
+   "expect": {
+    "hidden": true
+   }
+  },
+  {
+   "name": "user editable context is hidden",
+   "raw": {
+    "id": "x1",
+    "author": {
+     "role": "user"
+    },
+    "content": {
+     "content_type": "user_editable_context",
+     "user_profile": "p",
+     "user_instructions": "i"
+    },
+    "metadata": {
+     "is_visually_hidden_from_conversation": true
+    }
+   },
+   "expect": {
+    "hidden": true
+   }
+  },
+  {
+   "name": "unknown content type is explicit",
+   "raw": {
+    "id": "zz",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "brand_new_widget",
+     "payload": {
+      "a": 1
+     }
+    }
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "unknown",
+      "contentType": "brand_new_widget"
+     }
+    ]
+   }
+  },
+  {
+   "name": "interrupted by max tokens",
+   "raw": {
+    "id": "mt",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "text",
+     "parts": [
+      "partial"
+     ]
+    },
+    "status": "finished_partial_completion",
+    "metadata": {
+     "finish_details": {
+      "type": "max_tokens"
+     }
+    }
+   },
+   "expect": {
+    "status": "interrupted"
+   }
+  }
+ ]
+}
