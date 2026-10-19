@@ -33,7 +33,7 @@ test('reducers never mutate their input state', () => {
 test('hello sets bridge status and re-applies a supported saved effort', () => {
   const h = harness({ ...L.initialState(), settings: { effort: 'heavy' } });
   h.page('hello', { ready: true, loggedIn: true, efforts: ['light', 'heavy'] });
-  assert.deepEqual(h.state.bridge, { connected: true, ready: true, loggedIn: true, timedOut: false });
+  assert.deepEqual(h.state.bridge, { connected: true, ready: true, loggedIn: true, auth: 'unknown', timedOut: false });
   assert.deepEqual(h.posts('set-effort').map((e) => e.fields), [{ effort: 'heavy' }]);
   const h2 = harness({ ...L.initialState(), settings: { effort: 'heavy' } });
   h2.page('hello', { ready: true, loggedIn: true });

@@ -31,6 +31,14 @@ import {
 } from './conversation.js';
 import { selectTurns as selectTurnsImpl, switchBranch as switchBranchImpl } from './turns.js';
 import { createStreamDecoder as createStreamDecoderImpl } from './stream.js';
+import { createConversationSourceDecoder as createConversationSourceDecoderImpl, sourceRawMessage } from './conversation-source.js';
+import {
+  capLocalRecords as capLocalRecordsImpl,
+  conversationFromLocalRecord as conversationFromLocalRecordImpl,
+  localRecordFromConversation as localRecordFromConversationImpl,
+} from './local.js';
+
+export { LOCAL_LIMITS } from './local.js';
 import { parseConversationList as parseConversationListImpl } from './conversation-list.js';
 import {
   conversationToMarkdown as conversationToMarkdownImpl,
@@ -137,6 +145,62 @@ export function switchBranch(conversation, nodeId, delta) {
  */
 export function createStreamDecoder(options = {}) {
   return createStreamDecoderImpl(options);
+}
+
+/**
+ * Incremental decoder for one logged-out (free mode) response body
+ * (`application/vnd.openai.conversation-source+ndjson`). Emits the same
+ * StreamEvents as createStreamDecoder. `content` lines are applied only when
+ * their revision chain is intact (replace: newer revision; append:
+ * baseRevision === current revision); a broken chain re-emits the last good
+ * snapshot as interrupted and fails with `revision-gap` (needs recovery).
+ * A body without its `end` line fails with `truncated`.
+ * @param {{ maxLineChars?: number, maxMessageChars?: number }} [options]
+ * @returns {{ push(chunk: string): StreamEvent[], end(): StreamEvent[] }}
+ */
+export function createConversationSourceDecoder(options = {}) {
+  return createConversationSourceDecoderImpl(options);
+}
+
+/**
+ * Raw (canonical-shaped) user message for a prompt submitted in free mode, so
+ * the UI can show the user's turn before/without server history.
+ * @param {{ id: string, text: string, parentId?: string|null }} input
+ * @returns {object|null} null when id/text are unusable.
+ */
+export function userMessageFromPrompt(input) {
+  if (!input || typeof input !== 'object' || typeof input.id !== 'string' || !input.id || typeof input.text !== 'string') return null;
+  return sourceRawMessage({ id: input.id, role: 'user', text: input.text, parentId: typeof input.parentId === 'string' ? input.parentId : null });
+}
+
+/**
+ * Compact device-only record of a (logged-out) conversation: user/assistant
+ * text plus parent chain. null when there is nothing to keep.
+ * @param {Conversation} conversation
+ * @param {{ title?: string, updatedAt?: number|null }} [meta]
+ * @returns {object|null}
+ */
+export function localRecordFromConversation(conversation, meta = {}) {
+  return localRecordFromConversationImpl(conversation, meta);
+}
+
+/**
+ * Rebuild a Conversation from a local record through the canonical parser.
+ * @param {unknown} record
+ * @returns {Conversation|null}
+ */
+export function conversationFromLocalRecord(record) {
+  return conversationFromLocalRecordImpl(record);
+}
+
+/**
+ * Validate local records and keep the newest within the count/size caps.
+ * @param {unknown} records
+ * @param {{ maxCount?: number, maxChars?: number }} [limits]
+ * @returns {object[]}
+ */
+export function capLocalRecords(records, limits = {}) {
+  return capLocalRecordsImpl(records, limits);
 }
 
 /**

@@ -3,7 +3,13 @@
 // Observes the official full-history fetch and SSE stream (never rewrites
 // them), loads canonical history / the conversation list on request, and
 // drives the official composer for explicit UI commands. No DOM message
-// scraping, no web-mobile HTML, no WebSocket/XHR hooks, no auto-continue.
+// scraping, no HTML template parsing, no WebSocket/XHR hooks, no auto-continue.
+//
+// Auth mode: 'user' once an official request carries Authorization (sticky);
+// 'anon' (logged-out free mode) on URL-only evidence of the logged-out app:
+// a same-origin /unauth-mweb/ or /backend-anon/ request or resource, or a
+// /uc/<id> route. Free mode has no server history: nothing is loaded from the
+// server, the UI keeps conversations on the device.
 
 import { PAGE_ORIGIN, EFFORT_VALUES } from '../shared/bridge-protocol.js';
 import { createFetchTee, installFetchTee } from './fetch-tee.js';
@@ -12,7 +18,7 @@ import { createComposerDriver } from './composer.js';
 import { createDomAdapter } from './dom.js';
 import { createTakeover } from './takeover.js';
 import { createPageLink } from './link.js';
-import { conversationIdFromRoute, isConversationId } from './endpoints.js';
+import { conversationIdFromRoute, isConversationId, isFreeModeRoute, isFreeModeUrl } from './endpoints.js';
 import { HOOK_MARK } from './hook-mark.js';
 
 const LOCATION_LOAD_DELAY_MS = 1_200;
@@ -29,6 +35,9 @@ export function installHook(win) {
   const nativeReplaceState = win.history.replaceState;
   const activeStreams = new Set();
   let loggedIn = null;
+  /** @type {'user'|'anon'|'unknown'} */
+  let auth = 'unknown';
+  let resourceObserver = null;
   let lastHref = null;
   let lastConversationId = null;
 
@@ -63,9 +72,11 @@ export function installHook(win) {
       onBackendHeaders(headers) {
         const first = !history.hasHeaders();
         history.setHeaders(headers);
+        setAuth('user');
         setLoggedIn(true);
         if (first) history.loadList();
       },
+      onFreeModeRequest: () => noteFreeMode(),
       onSubmission: (result) => composer.noteSubmission(result),
       onStreamStart(start) {
         activeStreams.add(start.streamId);
@@ -91,9 +102,44 @@ export function installHook(win) {
     sendHello();
   }
 
+  function setAuth(value) {
+    if (auth === value) return;
+    auth = value;
+    if (resourceObserver) {
+      try { resourceObserver.disconnect(); } catch { /* ignore */ }
+      resourceObserver = null;
+    }
+    sendHello();
+  }
+
+  /** Evidence of the logged-out app. A signed-in session ('user') always wins. */
+  function noteFreeMode() {
+    if (auth === 'unknown') setAuth('anon');
+  }
+
+  /** URL-only scan of loaded resources (the logged-out app's own scripts). */
+  function watchResources() {
+    const scan = (entries) => {
+      if (auth !== 'unknown') return;
+      for (const entry of entries) {
+        if (typeof entry?.name === 'string' && isFreeModeUrl(entry.name, origin)) { noteFreeMode(); return; }
+      }
+    };
+    try { scan(win.performance?.getEntriesByType?.('resource') || []); } catch { /* ignore */ }
+    if (auth !== 'unknown' || typeof win.PerformanceObserver !== 'function') return;
+    try {
+      resourceObserver = new win.PerformanceObserver((list) => scan(list.getEntries()));
+      resourceObserver.observe({ type: 'resource', buffered: true });
+    } catch {
+      resourceObserver = null;
+    }
+  }
+
   function sendHello() {
     // Effort control is unverified against the live UI: advertise none until it is.
-    post('hello', { ready: history.hasHeaders(), loggedIn, url: win.location.href, efforts: [] });
+    const ready = auth === 'anon' ? true : history.hasHeaders();
+    const reportedLogin = auth === 'anon' ? false : loggedIn;
+    post('hello', { ready, loggedIn: reportedLogin, auth, url: win.location.href, efforts: [] });
   }
 
   function announce() {
@@ -109,11 +155,21 @@ export function installHook(win) {
     const conversationId = conversationIdFromRoute(href, origin);
     const changed = conversationId !== lastConversationId;
     lastConversationId = conversationId;
+    if (isFreeModeRoute(href, origin)) noteFreeMode();
     post('location', { url: href, conversationId });
-    if (changed && conversationId) history.schedule(conversationId, LOCATION_LOAD_DELAY_MS);
+    if (changed && conversationId && auth !== 'anon') history.schedule(conversationId, LOCATION_LOAD_DELAY_MS);
   }
 
   function navigate(conversationId) {
+    if (auth === 'anon') {
+      // The logged-out app renders each conversation server-side (with its
+      // continuation state in the composer form): a real navigation is the
+      // only way to make the official composer target this conversation.
+      const path = conversationId ? `/uc/${encodeURIComponent(conversationId)}` : '/';
+      if (win.location.pathname === path) return false;
+      win.location.assign(new URL(path, origin).href);
+      return true;
+    }
     const target = new URL(conversationId ? `/c/${encodeURIComponent(conversationId)}` : '/', origin);
     if (target.pathname === win.location.pathname) return false;
     const doc = win.document;
@@ -139,21 +195,22 @@ export function installHook(win) {
         const id = message.conversationId;
         if (id !== null && !isConversationId(id)) return;
         const moved = navigate(id);
-        if (id) {
+        if (id && auth !== 'anon') {
           if (moved) history.schedule(id, LOCATION_LOAD_DELAY_MS);
           else history.load(id, { force: true });
         }
         return;
       }
       case 'refresh':
-        if (isConversationId(message.conversationId)) history.load(message.conversationId, { force: true });
+        // Free mode has no server history endpoint.
+        if (auth !== 'anon' && isConversationId(message.conversationId)) history.load(message.conversationId, { force: true });
         return;
       case 'refresh-list':
-        history.loadList();
+        if (auth !== 'anon') history.loadList();
         return;
       case 'send': {
         const commandId = String(message.commandId || '');
-        const result = loggedIn === false ? { ok: false, error: 'not-logged-in' } : await composer.send(message.text);
+        const result = loggedIn === false && auth !== 'anon' ? { ok: false, error: 'not-logged-in' } : await composer.send(message.text);
         post('send-result', { commandId, ok: result.ok, error: result.error });
         return;
       }
@@ -211,6 +268,7 @@ export function installHook(win) {
   link.install();
   takeover.install();
   checkLocation();
+  watchResources();
 
   const markInstalled = () => {
     if (win.document.documentElement) win.document.documentElement.dataset[HOOK_MARK] = '2';

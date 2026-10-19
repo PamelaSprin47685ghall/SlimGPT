@@ -8,7 +8,7 @@ const ID = '6713a1f0-1234-4abc-8def-0123456789ab';
 const UI = (type, fields = {}) => ({ ...fields, channel: 'slimgpt-ui-v2', v: 2, type });
 const settle = () => new Promise((resolve) => setTimeout(resolve, 15));
 
-function fakeWindow(nativeFetch) {
+function fakeWindow(nativeFetch, { url = 'https://chatgpt.com/', performance, PerformanceObserver } = {}) {
   const listeners = {};
   const posted = [];
   const frameListeners = {};
@@ -19,12 +19,15 @@ function fakeWindow(nativeFetch) {
     contentWindow: { postMessage: (message, origin) => posted.push({ message, origin }) },
     addEventListener: (type, fn) => { frameListeners[type] = fn; },
   };
-  const location = new URL('https://chatgpt.com/');
+  const location = new URL(url);
+  const assigned = [];
   const documentElement = { dataset: {}, appendChild() {}, setAttribute() {}, removeAttribute() {} };
   const win = {
     location: {
       get origin() { return location.origin; }, get href() { return location.href; }, get pathname() { return location.pathname; },
+      assign: (target) => assigned.push(target),
     },
+    performance, PerformanceObserver,
     history: {
       state: null,
       pushState(_s, _t, url) { location.href = new URL(url, location).href; },
@@ -50,7 +53,7 @@ function fakeWindow(nativeFetch) {
     dispatchEvent(event) { for (const fn of listeners[event.type] || []) fn(event); },
   };
   return {
-    win, frame, posted, frameListeners,
+    win, frame, posted, frameListeners, assigned,
     fromFrame: (data, origin = EXT) => {
       for (const fn of listeners.message || []) fn({ source: frame.contentWindow, origin, data });
     },
@@ -125,4 +128,96 @@ test('runtime: commands from a foreign origin are ignored; refresh/open/continue
   await settle();
   const send = env.posted.at(-1).message;
   assert.deepEqual([send.type, send.commandId, send.ok, send.error], ['send-result', 'c1', false, 'empty-text']);
+});
+
+// ------------------------------------------------------------ free mode (logged out)
+
+const FREE_ID = '00000000-0000-4000-8000-000000000002';
+const NDJSON = 'application/vnd.openai.conversation-source+ndjson';
+const hellos = (env) => env.posted.filter((p) => p.message.type === 'hello').map((p) => p.message);
+
+test('runtime free mode: a free-mode request makes hello ready without Authorization', async () => {
+  const fetched = [];
+  const env = fakeWindow(async (url) => {
+    fetched.push(new URL(url, 'https://chatgpt.com').pathname);
+    return new Response('{}', { headers: { 'content-type': 'application/json' } });
+  });
+  installHook(env.win);
+  env.frameListeners.load();
+  assert.deepEqual({ ...hellos(env)[0], channel: 0, v: 0 }, { channel: 0, v: 0, type: 'hello', ready: false, loggedIn: null, auth: 'unknown', url: 'https://chatgpt.com/', efforts: [] });
+  await env.win.fetch('/backend-anon/beacons/home');
+  const last = hellos(env).at(-1);
+  assert.equal(last.auth, 'anon');
+  assert.equal(last.ready, true);
+  assert.equal(last.loggedIn, false);
+
+  // Free mode never asks the server for history or the list.
+  env.fromFrame(UI('refresh', { conversationId: FREE_ID }));
+  env.fromFrame(UI('refresh-list'));
+  await settle();
+  assert.ok(!fetched.some((path) => path.startsWith('/backend-api/')), fetched.join());
+
+  // Opening a free conversation is a real navigation to /uc/<id>.
+  env.fromFrame(UI('open', { conversationId: FREE_ID }));
+  env.fromFrame(UI('open', { conversationId: null }));
+  assert.deepEqual(env.assigned, [`https://chatgpt.com/uc/${FREE_ID}`]);
+
+  // A signed-in session always wins.
+  await env.win.fetch('/backend-api/me', { headers: { authorization: 'Bearer t' } });
+  assert.equal(hellos(env).at(-1).auth, 'user');
+  await env.win.fetch('/backend-anon/beacons/home');
+  assert.equal(hellos(env).at(-1).auth, 'user');
+});
+
+test('runtime free mode: /uc/ route and loaded free-mode scripts are evidence; no history load is scheduled', async () => {
+  const fetched = [];
+  const env = fakeWindow(async (url) => {
+    fetched.push(String(url));
+    return new Response('{}', { headers: { 'content-type': 'application/json' } });
+  }, { url: `https://chatgpt.com/uc/${FREE_ID}` });
+  installHook(env.win);
+  env.frameListeners.load();
+  const hello = hellos(env).at(-1);
+  assert.equal(hello.auth, 'anon');
+  assert.equal(hello.ready, true);
+  const location = env.posted.find((p) => p.message.type === 'location').message;
+  assert.equal(location.conversationId, FREE_ID);
+  await new Promise((resolve) => setTimeout(resolve, 1400));
+  assert.deepEqual(fetched, []);
+
+  let observerCallback = null;
+  const scripts = fakeWindow(async () => new Response('{}'), {
+    performance: { getEntriesByType: () => [] },
+    PerformanceObserver: class {
+      constructor(callback) { observerCallback = callback; }
+      observe() {}
+      disconnect() { observerCallback = null; }
+    },
+  });
+  installHook(scripts.win);
+  scripts.frameListeners.load();
+  assert.equal(hellos(scripts).at(-1).auth, 'unknown');
+  observerCallback({ getEntries: () => [{ name: 'https://cdn.example/unauth-mweb/x.js' }] });
+  assert.equal(hellos(scripts).at(-1).auth, 'unknown');
+  observerCallback({ getEntries: () => [{ name: 'https://chatgpt.com/unauth-mweb/assets/app.startup.js' }] });
+  assert.equal(hellos(scripts).at(-1).auth, 'anon');
+  assert.equal(observerCallback, null, 'observer disconnected once decided');
+});
+
+test('runtime free mode: the NDJSON stream reaches the UI as a conversation-source stream', async () => {
+  const body = '{"version":1,"type":"end"}\n';
+  const env = fakeWindow(async () => new Response(body, { headers: { 'content-type': NDJSON } }));
+  installHook(env.win);
+  env.frameListeners.load();
+  const form = new URLSearchParams({ prompt: 'hi', userMessageId: FREE_ID, turnstileToken: 'SECRET', conversationState: '{}' });
+  const response = await env.win.fetch('/unauth-mweb/conversation/updates?operationId=x', { method: 'POST', body: form });
+  assert.equal(await response.text(), body);
+  await settle();
+  const start = env.posted.find((p) => p.message.type === 'stream-start').message;
+  assert.equal(start.format, 'conversation-source');
+  assert.equal(start.userText, 'hi');
+  assert.equal(hellos(env).at(-1).auth, 'anon');
+  assert.ok(!JSON.stringify(env.posted).includes('SECRET'));
+  assert.equal(env.posted.filter((p) => p.message.type === 'stream-chunk').map((p) => p.message.chunk).join(''), body);
+  assert.ok(env.posted.some((p) => p.message.type === 'stream-end' && p.message.ok === true));
 });

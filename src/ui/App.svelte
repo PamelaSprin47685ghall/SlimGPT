@@ -38,7 +38,8 @@
   const title = $derived(L.currentTitle(s));
   const status = $derived(view.failed ? { tone: 'error', text: '消息解析失败', action: { label: '重试同步', type: 'retry-sync' } } : L.statusLine(s));
   const sendError = $derived(s.sendError && (s.sendError.conversationId ?? null) === (s.currentId ?? null) ? L.sendErrorText(s.sendError.code) : '');
-  const emptyText = $derived(!s.currentId ? '开始新的对话' : s.sync[s.currentId]?.state === 'loading' ? '正在加载对话…' : conv ? '对话暂无消息' : '对话暂未加载');
+  const feature = $derived(L.features(s));
+  const emptyText = $derived(!s.currentId ? '开始新的对话' : s.sync[s.currentId]?.state === 'loading' ? '正在加载对话…' : conv ? '对话暂无消息' : L.isFreeMode(s) ? '这个免费模式对话没有保存在本机' : '对话暂未加载');
 
   onMount(() => store.start());
 
@@ -58,7 +59,7 @@
 
 <F7App {...f7params}>
   <Panel left cover visibleBreakpoint={960}>
-    <Sidebar list={s.list} currentId={s.currentId} running={L.runningIds(s)} onopen={open} />
+    <Sidebar list={L.visibleList(s)} currentId={s.currentId} running={L.runningIds(s)} freeMode={L.isFreeMode(s)} onopen={open} />
   </Panel>
   <View main>
     <Page pageContent={false} withSubnavbar={!!status} class="chat">
@@ -72,7 +73,8 @@
         turns={view.turns}
         conversationKey={s.currentId ?? ''}
         {running}
-        canContinue={!running && !offBranch && check.reason !== 'bridge' && check.reason !== 'pending'}
+        canContinue={feature.continueGeneration && !running && !offBranch && check.reason !== 'bridge' && check.reason !== 'pending'}
+        branches={feature.branches}
         empty={emptyText}
       />
       <Composer

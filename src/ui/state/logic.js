@@ -6,7 +6,12 @@
 // mutated, except the opaque stream decoder objects, which are stateful by
 // design) and `effects` is a list of side effects for the store to perform:
 //   { type: 'post', message: string, fields: object }   UI → page message
-//   { type: 'save', key: 'settings'|'drafts'|'conversationIndex' }
+//   { type: 'save', key: 'settings'|'drafts'|'conversationIndex'|'localConversations' }
+//
+// Logged-out free mode (bridge.auth === 'anon') has no server history: its
+// conversations are kept on this device only ('localConversations', capped)
+// and their list items carry `device: true`. Signed-in mode stays server-truth
+// only: nothing of it is stored as conversation content.
 // `P` is the protocol module (src/protocol/index.js); tests inject a fake.
 
 export const NEW_CHAT_KEY = '';
@@ -17,7 +22,7 @@ const MAX_INDEX = 200;
 /** @returns {UiState} */
 export function initialState() {
   return {
-    bridge: { connected: false, ready: false, loggedIn: null, timedOut: false },
+    bridge: { connected: false, ready: false, loggedIn: null, auth: 'unknown', timedOut: false },
     online: true,
     officialVisible: false,
     efforts: [],
@@ -60,8 +65,12 @@ function upsertListItem(list, item, { front = false } = {}) {
   return next;
 }
 
-/** Restore persisted values (from storage-get) into a state. */
-export function hydrate(state, stored = {}) {
+const AUTH_MODES = ['user', 'anon', 'unknown'];
+const FREE_FORMAT = 'conversation-source';
+const TITLE_CHARS = 60;
+
+/** Restore persisted values (from storage-get) into a state. `P` rebuilds device-only conversations. */
+export function hydrate(state, stored = {}, P = null) {
   const next = { ...state };
   if (stored.settings && typeof stored.settings === 'object') {
     next.settings = { ...state.settings, ...pickSettings(stored.settings) };
@@ -76,6 +85,23 @@ export function hydrate(state, stored = {}) {
       .filter((item) => item && typeof item.id === 'string')
       .map((item) => ({ id: item.id, title: String(item.title || ''), updatedAt: Number.isFinite(item.updatedAt) ? item.updatedAt : null }));
   }
+  if (P && stored.localConversations !== undefined) {
+    let records = [];
+    try { records = P.capLocalRecords(stored.localConversations); } catch { records = []; }
+    let convs = next.convs;
+    let list = next.list;
+    for (const record of records.slice().reverse()) {
+      let conv = null;
+      try { conv = P.conversationFromLocalRecord(record); } catch { conv = null; }
+      if (!conv) continue;
+      // A conversation that is live right now wins over its stored copy.
+      if (!convs[record.id]) convs = withEntry(convs, record.id, conv);
+      const known = list.find((item) => item.id === record.id);
+      list = upsertListItem(list, { id: record.id, title: known?.title || record.title, updatedAt: known?.updatedAt ?? record.updatedAt, device: true }, { front: !known });
+    }
+    next.convs = convs;
+    next.list = list;
+  }
   return next;
 }
 
@@ -83,14 +109,25 @@ function pickSettings(settings) {
   return { effort: typeof settings.effort === 'string' ? settings.effort : '' };
 }
 
-/** Values to persist for one storage key. */
-export function persistable(state, key) {
+/** Values to persist for one storage key. `P` is needed for 'localConversations'. */
+export function persistable(state, key, P = null) {
   if (key === 'settings') return state.settings;
+  if (key === 'localConversations') {
+    if (!P) return undefined;
+    const records = [];
+    for (const item of state.list) {
+      if (!item.device || !state.convs[item.id]) continue;
+      let record = null;
+      try { record = P.localRecordFromConversation(state.convs[item.id], { title: item.title, updatedAt: item.updatedAt }); } catch { record = null; }
+      if (record) records.push(record);
+    }
+    try { return P.capLocalRecords(records); } catch { return []; }
+  }
   if (key === 'drafts') {
     const entries = Object.entries(state.drafts).filter(([, value]) => value && value.trim());
     return Object.fromEntries(entries.slice(-MAX_DRAFTS));
   }
-  if (key === 'conversationIndex') return state.list.slice(0, MAX_INDEX);
+  if (key === 'conversationIndex') return state.list.filter((item) => !item.device).slice(0, MAX_INDEX);
   return undefined;
 }
 
@@ -114,9 +151,10 @@ export function reducePage(state, message, P) {
 
 function onHello(state, message) {
   const efforts = Array.isArray(message.efforts) ? message.efforts.filter((item) => typeof item === 'string' && item) : [];
+  const auth = AUTH_MODES.includes(message.auth) ? message.auth : 'unknown';
   const next = {
     ...state,
-    bridge: { connected: true, ready: !!message.ready, loggedIn: typeof message.loggedIn === 'boolean' ? message.loggedIn : null, timedOut: false },
+    bridge: { connected: true, ready: !!message.ready, loggedIn: typeof message.loggedIn === 'boolean' ? message.loggedIn : null, auth, timedOut: false },
     efforts,
   };
   const effects = [];
@@ -131,7 +169,8 @@ function onLocation(state, message, P) {
   let next = { ...state, opening: undefined };
   const effects = [];
   if (id !== state.currentId) next = { ...next, currentId: id, sendError: null };
-  if (id && !next.convs[id] && !next.sync[id]) {
+  // Free mode has no server history to ask for.
+  if (id && !isFreeMode(next) && !next.convs[id] && !next.sync[id]) {
     next = { ...next, sync: withEntry(next.sync, id, { state: 'loading' }) };
     effects.push(post('refresh', { conversationId: id }));
   }
@@ -143,9 +182,10 @@ function onList(state, message, P) {
   if (!Array.isArray(items)) return { state, effects: [] };
   let list;
   if (!message.offset) {
-    // Keep locally known conversations the server list does not have yet (fresh chats).
+    // Keep locally known conversations the server list does not have yet
+    // (fresh chats) and device-only free-mode conversations.
     const ids = new Set(items.map((item) => item.id));
-    const local = state.list.filter((item) => !ids.has(item.id) && item.local);
+    const local = state.list.filter((item) => !ids.has(item.id) && (item.local || item.device));
     list = [...local, ...items];
   } else {
     list = state.list;
@@ -190,23 +230,53 @@ function onStreamStart(state, message, P) {
   const streamId = message.streamId;
   if (typeof streamId !== 'string' || !streamId) return { state, effects: [] };
   const conversationId = typeof message.conversationId === 'string' && message.conversationId ? message.conversationId : null;
+  const device = message.format === FREE_FORMAT;
+  const userMessageId = message.userMessageId || null;
+  const parentMessageId = message.parentMessageId || null;
+  // Free mode: the submitted prompt (forwarded by the page) becomes the user
+  // message; the server never sends it back.
+  const userRaw = device && userMessageId && typeof message.userText === 'string'
+    ? P.userMessageFromPrompt({ id: userMessageId, text: message.userText, parentId: parentMessageId })
+    : null;
   const stream = {
     conversationId,
     startedNew: conversationId === null,
-    userMessageId: message.userMessageId || null,
-    parentMessageId: message.parentMessageId || null,
+    userMessageId,
+    parentMessageId,
     resume: !!message.resume,
-    decoder: P.createStreamDecoder(),
+    device,
+    title: userRaw ? titleFrom(message.userText) : '',
+    decoder: device ? P.createConversationSourceDecoder() : P.createStreamDecoder(),
     failed: false,
-    buffered: [],
+    buffered: userRaw && !conversationId ? [userRaw] : [],
   };
   let next = { ...state, streams: withEntry(state.streams, streamId, stream), streamError: null };
+  const effects = [];
   if (conversationId) {
     if (!next.convs[conversationId]) next.convs = withEntry(next.convs, conversationId, P.createConversation(conversationId));
     // Follow the newest leaf of a conversation that starts generating.
     next.leaf = withEntry(next.leaf, conversationId, undefined);
+    if (userRaw) {
+      next.convs = withEntry(next.convs, conversationId, P.applyLiveMessage(next.convs[conversationId], userRaw, { fallbackParentId: parentMessageId }));
+    }
+    if (device) {
+      next = noteDeviceConversation(next, conversationId, stream.title);
+      effects.push(save('localConversations'));
+    }
   }
-  return { state: next, effects: [] };
+  return { state: next, effects };
+}
+
+function titleFrom(text) {
+  const line = String(text || '').trim().replace(/\s+/g, ' ');
+  return line.length > TITLE_CHARS ? `${line.slice(0, TITLE_CHARS - 1)}…` : line;
+}
+
+/** Mark a free-mode conversation as device-only in the list (newest first). */
+function noteDeviceConversation(state, id, title) {
+  const known = state.list.find((item) => item.id === id);
+  const item = { id, title: known?.title || title || '', updatedAt: Math.floor(Date.now() / 1000), device: true };
+  return { ...state, list: upsertListItem(state.list.filter((entry) => entry.id !== id), { ...known, ...item }, { front: true }) };
 }
 
 function onStreamChunk(state, message, P) {
@@ -224,6 +294,14 @@ function onStreamEnd(state, message, P) {
   const next = { ...result.state, streams: withEntry(result.state.streams, message.streamId, undefined) };
   const effects = [...result.effects];
   const id = finalStream.conversationId;
+  if (finalStream.device) {
+    // Free mode: no server history exists; keep what we saw on this device.
+    if (id) {
+      const updated = noteDeviceConversation(next, id, finalStream.title);
+      return { state: updated, effects: [...effects, save('localConversations')] };
+    }
+    return { state: next, effects };
+  }
   // Canonical history is re-fetched after EVERY stream end; it is also the
   // recovery path after a stream error (which already asked once at failure).
   if (id && !effects.some((effect) => effect.message === 'refresh' && effect.fields.conversationId === id)) {
@@ -254,7 +332,10 @@ export function applyStreamEvents(state, streamId, events, P) {
       next = { ...next, currentId: conversationId, opening: undefined };
       if (next.pending && next.pending.conversationId === null) next.pending = { ...next.pending, conversationId };
     }
-    if (!next.list.some((item) => item.id === conversationId)) {
+    if (stream.device) {
+      next = noteDeviceConversation(next, conversationId, stream.title);
+      effects.push(save('localConversations'));
+    } else if (!next.list.some((item) => item.id === conversationId)) {
       next = { ...next, list: upsertListItem(next.list, { id: conversationId, title: '', updatedAt: Math.floor(Date.now() / 1000), local: true }, { front: true }) };
     }
     const buffered = stream.buffered;
@@ -279,8 +360,11 @@ export function applyStreamEvents(state, streamId, events, P) {
       }
     } else if (event.type === 'error') {
       stream = { ...stream, failed: true };
-      next = { ...next, streamError: { conversationId: stream.conversationId, code: event.code || 'invalid-json' } };
-      if (stream.conversationId) effects.push(post('refresh', { conversationId: stream.conversationId }));
+      next = { ...next, streamError: { conversationId: stream.conversationId, code: event.code || 'invalid-json', device: !!stream.device } };
+      if (stream.device) {
+        // No server copy to recover from: keep the last good (interrupted) text.
+        if (stream.conversationId) effects.push(save('localConversations'));
+      } else if (stream.conversationId) effects.push(post('refresh', { conversationId: stream.conversationId }));
     }
   }
   commit();
@@ -324,10 +408,11 @@ export function reduceAction(state, action, P) {
     }
     case 'stop': return { state, effects: [post('stop')] };
     case 'continue':
+      if (!features(state).continueGeneration) return { state, effects: [] };
       return { state, effects: [post('continue', { conversationId: state.currentId, messageId: action.messageId ?? null })] };
     case 'retry-sync': {
       const id = action.conversationId ?? state.currentId;
-      if (!id) return { state, effects: [] };
+      if (!id || isFreeMode(state)) return { state, effects: [] };
       return {
         state: { ...state, sync: withEntry(state.sync, id, { state: 'loading' }), streamError: null },
         effects: [post('refresh', { conversationId: id })],
@@ -365,6 +450,26 @@ export function reduceAction(state, action, P) {
 }
 
 // ---------------------------------------------------------------- selectors
+
+/** Logged-out free mode (no server history, conversations kept on this device). */
+export function isFreeMode(state) {
+  return state.bridge.auth === 'anon';
+}
+
+/** Official features available in the current auth mode. */
+export function features(state) {
+  const free = isFreeMode(state);
+  return { branches: !free, continueGeneration: !free };
+}
+
+/**
+ * Sidebar items for the current mode: device-only (free-mode) conversations
+ * are listed only in free mode, server conversations only outside it.
+ */
+export function visibleList(state) {
+  if (isFreeMode(state)) return state.list.filter((item) => item.device);
+  return state.list.filter((item) => !item.device);
+}
 
 export function currentConversation(state) {
   return state.currentId ? state.convs[state.currentId] || null : null;
@@ -409,7 +514,7 @@ export function currentTitle(state) {
 /** Whether a message can be sent now, and why not. */
 export function canSend(state) {
   if (!state.bridge.connected || !state.bridge.ready) return { ok: false, reason: 'bridge' };
-  if (state.bridge.loggedIn === false) return { ok: false, reason: 'login' };
+  if (state.bridge.loggedIn === false && !isFreeMode(state)) return { ok: false, reason: 'login' };
   if (state.pending) return { ok: false, reason: 'pending' };
   if (isRunning(state)) return { ok: false, reason: 'running' };
   if (isOffBranch(state)) return { ok: false, reason: 'branch' };
@@ -438,7 +543,7 @@ const SYNC_ERRORS = {
 export function statusLine(state) {
   if (!state.online) return { tone: 'warn', text: '网络离线' };
   if (!state.bridge.connected) return state.bridge.timedOut ? { tone: 'warn', text: 'ChatGPT 页面桥尚未就绪' } : { tone: 'info', text: '连接中…' };
-  if (state.bridge.loggedIn === false) return { tone: 'warn', text: '未登录 ChatGPT，请先在官方界面登录', action: { label: '显示官方界面', type: 'show-official' } };
+  if (state.bridge.loggedIn === false && !isFreeMode(state)) return { tone: 'warn', text: '未登录 ChatGPT，请先在官方界面登录', action: { label: '显示官方界面', type: 'show-official' } };
   if (!state.bridge.ready) return { tone: 'info', text: 'ChatGPT 页面加载中…' };
   const id = state.currentId;
   const sync = id ? state.sync[id] : null;
@@ -446,14 +551,20 @@ export function statusLine(state) {
     const wait = sync.retryAfterSec ? `，约 ${sync.retryAfterSec} 秒后可重试` : '';
     return { tone: 'error', text: `${SYNC_ERRORS[sync.code] || '对话同步失败'}${wait}`, action: { label: '重试同步', type: 'retry-sync' } };
   }
+  if (state.streamError && state.streamError.conversationId === id && state.streamError.device) {
+    return { tone: 'warn', text: '回复流中断，已保留收到的部分；免费模式无法从服务器恢复' };
+  }
   if (state.streamError && state.streamError.conversationId === id) {
     return { tone: 'warn', text: '回复流无法解析，正在同步完整会话', action: { label: '重试同步', type: 'retry-sync' } };
   }
   if (sync?.state === 'loading') {
     return { tone: 'info', text: sync.pages > 1 ? `正在同步对话（${sync.page}/${sync.pages}）…` : '正在同步对话…' };
   }
+  if (isFreeMode(state)) return { tone: 'note', text: FREE_MODE_NOTE };
   return null;
 }
+
+export const FREE_MODE_NOTE = '未登录：使用免费模式，对话仅保存在本机';
 
 const SEND_ERRORS = {
   'composer-not-found': '找不到官方输入框；内容仍保留，未发送',

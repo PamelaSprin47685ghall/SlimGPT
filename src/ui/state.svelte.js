@@ -26,7 +26,7 @@ export function createStore({ protocol = P, bridgeFactory = createBridgeClient, 
     clearTimeout(saveTimers.get(key));
     saveTimers.set(key, setTimeout(() => {
       saveTimers.delete(key);
-      void bridge.storageSet({ [key]: L.persistable(state, key) });
+      void bridge.storageSet({ [key]: L.persistable(state, key, protocol) });
     }, SAVE_DELAY_MS));
   }
 
@@ -55,7 +55,7 @@ export function createStore({ protocol = P, bridgeFactory = createBridgeClient, 
     win?.addEventListener?.('offline', offline);
     if (win?.navigator && win.navigator.onLine === false) offline();
     const grace = setTimeout(() => dispatch({ type: 'bridge-timeout' }), BRIDGE_GRACE_MS);
-    void bridge.storageGet(['settings', 'drafts', 'conversationIndex']).then((stored) => { state = L.hydrate(state, stored); });
+    void bridge.storageGet(['settings', 'drafts', 'conversationIndex', 'localConversations']).then((stored) => { state = L.hydrate(state, stored, protocol); });
     return () => {
       clearTimeout(grace);
       win?.removeEventListener?.('online', online);

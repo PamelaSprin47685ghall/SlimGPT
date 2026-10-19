@@ -89,3 +89,35 @@ test('request body ids: envelope + last user message id only', () => {
   }
   assert.equal(readStreamRequestIds(JSON.stringify({ parent_message_id: 'has space' })).parentMessageId, null);
 });
+
+test('free mode endpoints, routes and request fields', async () => {
+  const E = await import('../../src/page/endpoints.js');
+  const O = 'https://chatgpt.com';
+  const id = '00000000-0000-4000-8000-000000000002';
+  assert.deepEqual(E.classifyEndpoint('POST', `${O}/unauth-mweb/conversation/updates?lightweight_authenticated=0`, O), { kind: 'free-submit' });
+  assert.equal(E.classifyEndpoint('POST', `${O}/unauth-mweb/conversation/prepare`, O), null);
+  assert.equal(E.classifyEndpoint('POST', `${O}/unauth-mweb/conversation/updatesx`, O), null);
+  assert.equal(E.classifyEndpoint('POST', 'https://chat.openai.com/unauth-mweb/conversation/updates', O), null);
+  assert.equal(E.isFreeModeUrl('/backend-anon/beacons/home', O), true);
+  assert.equal(E.isFreeModeUrl(`${O}/unauth-mweb/assets/a.js`, O), true);
+  assert.equal(E.isFreeModeUrl(`${O}/backend-api/me`, O), false);
+  assert.equal(E.isFreeModeUrl('https://cdn.example/unauth-mweb/a.js', O), false);
+  assert.equal(E.isFreeModeRoute(`${O}/uc/${id}`, O), true);
+  assert.equal(E.isFreeModeRoute(`${O}/c/${id}`, O), false);
+  assert.equal(E.conversationIdFromRoute(`${O}/uc/${id}`, O), id);
+
+  const form = new URLSearchParams({
+    prompt: 'hi', userMessageId: id, proofToken: 'secret',
+    conversationState: JSON.stringify({ backendConversationId: id, parentMessageId: 'client-created-root' }),
+  });
+  assert.deepEqual(E.readFreeModeRequest(form), { conversationId: id, userMessageId: id, parentMessageId: null, userText: 'hi' });
+  assert.deepEqual(E.readFreeModeRequest(form.toString()), E.readFreeModeRequest(form));
+  const empty = { conversationId: null, userMessageId: null, parentMessageId: null, userText: null };
+  for (const bad of [null, '', 5, {}, 'conversationState=%7Bbroken']) {
+    const result = E.readFreeModeRequest(bad);
+    assert.equal(result.conversationId, null);
+    assert.equal(result.userMessageId, null);
+  }
+  assert.deepEqual(E.readFreeModeRequest(new URLSearchParams({ userMessageId: 'not a uuid', prompt: 'x'.repeat(E.MAX_PROMPT_CHARS + 1) })), empty);
+  assert.deepEqual(E.FREE_MODE_FIELDS, ['prompt', 'userMessageId', 'conversationState']);
+});

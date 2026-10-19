@@ -25,6 +25,8 @@
 .status[data-tone="error"] .status-text { color: var(--err-fg); }
 .sidebar .new-chat-block { margin: 12px 0; }
 .sidebar-empty { color: var(--muted); }
+.status[data-tone="note"] .status-text { color: var(--muted); }
+.sidebar-note { color: var(--muted); font-size: 12px; }
 
 /* messages */
 .turn { padding: 4px 0 12px; }

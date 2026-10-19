@@ -224,3 +224,34 @@ test('blocker detection: inert root, :modal or visible dialogs', () => {
   dom.inert = true;
   assert.equal(driver.findBlocker(), true);
 });
+
+test('free mode composer: the shared submit button sends, and stops only while it is the stop button', async () => {
+  const dom = fakeDom();
+  const form = dom.el({ name: 'form', button: false });
+  dom.on('#mobile-composer-prompt', dom.el({ name: 'composer', button: false, closest: { form } }));
+  let driver;
+  const submit = dom.el({ name: 'submit', label: 'Send message', attrs: {}, onClick: () => driver.noteSubmission({ ok: true, status: 200 }) });
+  dom.on('[data-composer-submit]', submit);
+  driver = createComposerDriver({ dom, officialUi: officialUi(), timeouts: T });
+  assert.equal(driver.hasComposer(), true);
+  assert.deepEqual(await driver.send('hello'), { ok: true, error: null });
+  assert.deepEqual(dom.log, [['insert', 'hello'], ['click', 'submit']]);
+
+  // While streaming the same button turns into "Stop generating": never clicked as send.
+  submit.attrs['data-stop-generating'] = '';
+  submit.label = 'Stop generating';
+  dom.on('button[data-composer-submit][data-stop-generating]', submit);
+  const idle = createComposerDriver({ dom, officialUi: officialUi(), timeouts: T });
+  assert.equal((await idle.send('again')).error, 'send-control-not-ready');
+  dom.log.length = 0;
+  assert.deepEqual(await idle.stop(), { ok: true, error: null });
+  assert.deepEqual(dom.log, [['click', 'submit']]);
+});
+
+test('a gated free-mode page (login wall) blocks sending', async () => {
+  const dom = fakeDom();
+  composerSetup(dom);
+  dom.on('html[data-conversation-gated]', dom.el({ name: 'html', button: false }));
+  const driver = createComposerDriver({ dom, officialUi: officialUi(), timeouts: T });
+  assert.equal((await driver.send('x')).error, 'blocked-by-official-ui');
+});

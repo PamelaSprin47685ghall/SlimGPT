@@ -29,8 +29,16 @@ export const SEND_SELECTORS = Object.freeze([
   '[data-testid="composer-send-button"]',
 ]);
 
+// The logged-out (free mode) composer reuses one submit button for send and
+// stop: while a reply streams it carries data-stop-generating and the stop label.
+export const STOP_SELECTORS = Object.freeze([
+  '[data-testid="stop-button"]',
+  'button[data-composer-submit][data-stop-generating]',
+]);
+
 export const BLOCKER_SELECTORS = Object.freeze([
   ':modal',
+  'html[data-conversation-gated]',
   'dialog[open]',
   '[role="alertdialog"]',
   '[role="dialog"][aria-modal="true"]',
@@ -110,20 +118,26 @@ export function createComposerDriver({ dom, officialUi, isStreaming = () => fals
       selector === ':modal' || dom.isVisible(element)));
   }
 
+  function isSendCandidate(candidate) {
+    return dom.isEnabledButton(candidate) && dom.isVisible(candidate) &&
+      dom.attr(candidate, 'data-stop-generating') === null && !isStopLabel(dom.label(candidate));
+  }
+
   function findSendButton(composer) {
     for (const selector of SEND_SELECTORS) {
-      const button = dom.queryAll(selector).find((candidate) => dom.isEnabledButton(candidate) && dom.isVisible(candidate));
+      const button = dom.queryAll(selector).find(isSendCandidate);
       if (button) return button;
     }
     const form = dom.closest(composer, 'form');
     if (!form) return null;
-    return dom.queryWithin(form, 'button[type="submit"]')
-      .find((candidate) => dom.isEnabledButton(candidate) && dom.isVisible(candidate)) || null;
+    return dom.queryWithin(form, 'button[type="submit"]').find(isSendCandidate) || null;
   }
 
   function findStopControl() {
-    const direct = dom.queryAll('[data-testid="stop-button"]').find((button) => dom.isEnabledButton(button));
-    if (direct) return direct;
+    for (const selector of STOP_SELECTORS) {
+      const direct = dom.queryAll(selector).find((button) => dom.isEnabledButton(button));
+      if (direct) return direct;
+    }
     const composer = findComposer();
     const form = composer ? dom.closest(composer, 'form') : null;
     if (!form) return null;

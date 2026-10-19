@@ -50,7 +50,7 @@ test('SSE: official app gets the identical Response, untouched; the tee forwards
   assert.deepEqual(events[0], ['headers', 'Bearer t']);
   assert.deepEqual(events[1], ['submission', { ok: true, status: 200 }]);
   const start = events.find((event) => event[0] === 'start')[1];
-  assert.deepEqual({ ...start, streamId: 'x' }, { streamId: 'x', conversationId: ID, userMessageId: 'u1', parentMessageId: 'p1', resume: false });
+  assert.deepEqual({ ...start, streamId: 'x' }, { streamId: 'x', conversationId: ID, userMessageId: 'u1', parentMessageId: 'p1', resume: false, format: 'sse' });
   const chunks = events.filter((event) => event[0] === 'chunk');
   assert.equal(chunks.map((event) => event[2]).join(''), parts.join(''));
   assert.ok(chunks.every((event) => event[1] === start.streamId));
@@ -168,4 +168,110 @@ test('installFetchTee re-wraps a later window.fetch assignment exactly once', as
   win.fetch = win.fetch; // assigning the wrapper back must not double-wrap
   assert.equal(await (await win.fetch('/x')).text(), 'b');
   assert.deepEqual(calls, ['replacement', 'replacement']);
+});
+
+// ------------------------------------------------------------ free mode (logged out)
+
+const CONV = '00000000-0000-4000-8000-000000000002';
+const USER_ID = '00000000-0000-4000-8000-000000000004';
+const PARENT_ID = '00000000-0000-4000-8000-000000000003';
+const SECRET = 'eyJSECRET.TOKEN.VALUE';
+const NDJSON = 'application/vnd.openai.conversation-source+ndjson';
+const FREE_URL = `${O}/unauth-mweb/conversation/updates?lightweight_authenticated=0&operationId=00000000-0000-4000-8000-000000000001`;
+
+function freeForm() {
+  const form = new URLSearchParams();
+  form.set('conversationState', JSON.stringify({ backendConversationId: CONV, messages: [], parentMessageId: PARENT_ID }));
+  form.set('oai-session-id', 'session-secret');
+  form.set('prompt', 'hello, free mode');
+  form.set('assistantMessageId', 'pending-x');
+  form.set('userMessageId', USER_ID);
+  for (const name of ['chatRequirementsToken', 'proofToken', 'turnstileToken']) form.set(name, SECRET);
+  return form;
+}
+
+function freeEvents(events) {
+  const start = events.find((event) => event[0] === 'start')?.[1];
+  return { start, text: JSON.stringify(events) };
+}
+
+test('free mode: NDJSON stream is teed with prompt + ids only, official Response untouched', async () => {
+  const lines = ['{"version":1,"type":"control","detail":{"kind":"started"}}\n', '{"version":1,"type":"end"}\n'];
+  const original = streamResponse(lines, { type: NDJSON });
+  const { events, handlers } = recorder();
+  const fetch = createFetchTee({ pageOrigin: O, handlers }).wrap(async () => original);
+  const response = await fetch(FREE_URL, { method: 'POST', body: freeForm().toString(), headers: { 'content-type': 'application/x-www-form-urlencoded' } });
+  assert.equal(response, original);
+  assert.equal(await response.text(), lines.join(''));
+  await settle();
+  const { start, text } = freeEvents(events);
+  assert.deepEqual(events[0], ['submission', { ok: true, status: 200 }]);
+  assert.deepEqual({ ...start, streamId: 'x' }, {
+    streamId: 'x', conversationId: CONV, userMessageId: USER_ID, parentMessageId: PARENT_ID,
+    userText: 'hello, free mode', resume: false, format: 'conversation-source',
+  });
+  assert.ok(!text.includes(SECRET) && !text.includes('session-secret'), 'tokens are never forwarded');
+  assert.equal(events.filter((event) => event[0] === 'chunk').map((event) => event[2]).join(''), lines.join(''));
+  assert.deepEqual(events.at(-1), ['end', start.streamId, true]);
+});
+
+test('free mode: URLSearchParams, FormData and Request bodies are read without consuming them', async () => {
+  for (const make of [
+    () => [FREE_URL, { method: 'POST', body: freeForm() }],
+    () => { const data = new FormData(); for (const [k, v] of freeForm()) data.set(k, v); return [FREE_URL, { method: 'POST', body: data }]; },
+    () => [new Request(FREE_URL, { method: 'POST', body: freeForm() })],
+  ]) {
+    const { events, handlers } = recorder();
+    let upstreamSaw = null;
+    const fetch = createFetchTee({ pageOrigin: O, handlers }).wrap(async (input, init) => {
+      upstreamSaw = input instanceof Request ? await input.text() : init.body;
+      return streamResponse(['{"version":1,"type":"end"}\n'], { type: NDJSON });
+    });
+    await fetch(...make());
+    await settle();
+    const { start, text } = freeEvents(events);
+    assert.ok(upstreamSaw, 'official request body intact');
+    assert.equal(start.userText, 'hello, free mode');
+    assert.equal(start.userMessageId, USER_ID);
+    assert.equal(start.conversationId, CONV);
+    assert.ok(!text.includes(SECRET));
+  }
+});
+
+test('free mode: first message has no conversation id; non-NDJSON answers are not teed', async () => {
+  const form = freeForm();
+  form.set('conversationState', JSON.stringify({ messages: [], parentMessageId: 'client-created-root' }));
+  const { events, handlers } = recorder();
+  const fetch = createFetchTee({ pageOrigin: O, handlers }).wrap(async () => streamResponse(['{"version":1,"type":"end"}\n'], { type: NDJSON }));
+  await fetch(FREE_URL, { method: 'POST', body: form });
+  await settle();
+  const { start } = freeEvents(events);
+  assert.equal(start.conversationId, null);
+  assert.equal(start.parentMessageId, null);
+
+  const other = recorder();
+  const jsonFetch = createFetchTee({ pageOrigin: O, handlers: other.handlers }).wrap(async () => new Response('{"error":1}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  await jsonFetch(FREE_URL, { method: 'POST', body: freeForm() });
+  await settle();
+  assert.deepEqual(other.events, [['submission', { ok: true, status: 200 }]]);
+
+  const failed = recorder();
+  const rejectFetch = createFetchTee({ pageOrigin: O, handlers: failed.handlers }).wrap(async () => new Response('', { status: 429 }));
+  await rejectFetch(FREE_URL, { method: 'POST', body: freeForm() });
+  assert.deepEqual(failed.events, [['submission', { ok: false, status: 429 }]]);
+});
+
+test('free mode: only the exact updates path is captured; free-mode URLs are signalled', async () => {
+  const { events, handlers } = recorder();
+  let signals = 0;
+  handlers.onFreeModeRequest = () => { signals += 1; };
+  const fetch = createFetchTee({ pageOrigin: O, handlers }).wrap(async () => streamResponse(['{"version":1,"type":"end"}\n'], { type: NDJSON }));
+  await fetch(`${O}/unauth-mweb/conversation/updates/extra`, { method: 'POST', body: freeForm() });
+  await fetch(`${O}/unauth-mweb/conversation/prepare`, { method: 'POST', body: '{}' });
+  await fetch(`${O}/backend-anon/beacons/home`);
+  await fetch(`https://evil.example/unauth-mweb/conversation/updates`, { method: 'POST', body: freeForm() });
+  await fetch(`${O}/unauth-mweb/conversation/updates`, { method: 'GET' });
+  await settle();
+  assert.deepEqual(events, []);
+  assert.equal(signals, 4);
 });

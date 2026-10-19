@@ -9,8 +9,8 @@
   import ListItem from 'framework7-svelte/components/list-item.svelte';
   import { filterList } from '../state/logic.js';
 
-  /** @type {{ list: {id:string,title:string}[], currentId: string|null, running: Set<string>, onopen: (id: string|null) => void }} */
-  let { list, currentId, running, onopen } = $props();
+  /** @type {{ list: {id:string,title:string,device?:boolean}[], currentId: string|null, running: Set<string>, freeMode?: boolean, onopen: (id: string|null) => void }} */
+  let { list, currentId, running, freeMode = false, onopen } = $props();
   let query = $state('');
   const items = $derived(filterList(list, query));
 </script>
@@ -39,12 +39,15 @@
           class="conv"
           title={item.title || '未命名对话'}
           selected={item.id === currentId}
-          after={running.has(item.id) ? '生成中' : undefined}
+          after={running.has(item.id) ? '生成中' : item.device ? '本机' : undefined}
           onClick={() => onopen(item.id)}
         />
       {/each}
     </List>
   {:else}
-    <Block class="sidebar-empty">{query ? '没有匹配的对话' : '暂无对话'}</Block>
+    <Block class="sidebar-empty">{query ? '没有匹配的对话' : freeMode ? '暂无保存在本机的对话' : '暂无对话'}</Block>
+  {/if}
+  {#if freeMode}
+    <Block class="sidebar-note">免费模式：对话仅保存在本机，清除扩展数据后无法找回。</Block>
   {/if}
 </Page>

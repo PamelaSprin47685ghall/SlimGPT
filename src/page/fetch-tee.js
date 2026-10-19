@@ -5,15 +5,18 @@
 // Nothing here rewrites requests or responses, patches Response.prototype,
 // or touches XHR/WebSocket.
 
-import { classifyEndpoint, isBackendRequest, readStreamRequestIds, MAX_REQUEST_BODY_CHARS } from './endpoints.js';
+import {
+  classifyEndpoint, isBackendRequest, isFreeModeUrl, readFreeModeRequest, readStreamRequestIds, MAX_REQUEST_BODY_CHARS,
+} from './endpoints.js';
 
 export const MAX_JSON_BODY_BYTES = 20 * 1024 * 1024;
 
 /**
  * @typedef {object} TeeHandlers
  * @property {(headers: Headers) => void} [onBackendHeaders]   same-origin /backend-api/ request headers (with authorization)
+ * @property {() => void} [onFreeModeRequest]   a same-origin logged-out app request was seen (URL only)
  * @property {(result: { ok: boolean, status: number }) => void} [onSubmission]   official submit request settled
- * @property {(start: { streamId: string, conversationId: string|null, userMessageId: string|null, parentMessageId: string|null, resume: boolean }) => void} [onStreamStart]
+ * @property {(start: { streamId: string, conversationId: string|null, userMessageId: string|null, parentMessageId: string|null, resume: boolean, format: 'sse'|'conversation-source', userText?: string|null }) => void} [onStreamStart]
  * @property {(streamId: string, chunk: string) => void} [onStreamChunk]
  * @property {(streamId: string, ok: boolean) => void} [onStreamEnd]
  * @property {(conversationId: string, body: string) => void} [onHistory]
@@ -40,10 +43,13 @@ export function createFetchTee({ pageOrigin, handlers, maxJsonBytes = MAX_JSON_B
           const headers = requestHeaders(input, init);
           if (headers?.has('authorization')) safeCall(handlers.onBackendHeaders, headers);
         }
+        if (url && isFreeModeUrl(url, pageOrigin)) safeCall(handlers.onFreeModeRequest);
         endpoint = url ? classifyEndpoint(method, url, pageOrigin) : null;
         if (endpoint && (endpoint.kind === 'submit' || endpoint.kind === 'resume')) {
           // Must be taken before upstream consumes a Request body.
           bodyText = readRequestBody(input, init);
+        } else if (endpoint?.kind === 'free-submit') {
+          bodyText = readFreeModeBody(input, init);
         }
       } catch {
         endpoint = null;
@@ -53,7 +59,7 @@ export function createFetchTee({ pageOrigin, handlers, maxJsonBytes = MAX_JSON_B
       try {
         response = await Reflect.apply(upstream, this, arguments);
       } catch (error) {
-        if (endpoint?.kind === 'submit') safeCall(handlers.onSubmission, { ok: false, status: 0 });
+        if (endpoint?.kind === 'submit' || endpoint?.kind === 'free-submit') safeCall(handlers.onSubmission, { ok: false, status: 0 });
         throw error;
       }
       if (endpoint) {
@@ -70,14 +76,23 @@ export function createFetchTee({ pageOrigin, handlers, maxJsonBytes = MAX_JSON_B
   }
 
   function observe(endpoint, response, bodyText) {
-    if (endpoint.kind === 'submit') safeCall(handlers.onSubmission, { ok: response.ok, status: response.status });
+    if (endpoint.kind === 'submit' || endpoint.kind === 'free-submit') safeCall(handlers.onSubmission, { ok: response.ok, status: response.status });
     if (!response.ok || !response.body) return;
     const mime = String(response.headers.get('content-type') || '').toLowerCase();
     if (endpoint.kind === 'submit' || endpoint.kind === 'resume') {
       if (!mime.includes('text/event-stream')) return;
       const copy = response.clone();
       const streamId = `s${Date.now().toString(36)}-${(++streamCounter).toString(36)}`;
-      void pumpStream(copy, streamId, bodyText, endpoint.kind === 'resume');
+      const ids = Promise.resolve(bodyText).catch(() => null).then(readStreamRequestIds);
+      void pumpStream(copy, streamId, ids, { resume: endpoint.kind === 'resume', format: 'sse' });
+      return;
+    }
+    if (endpoint.kind === 'free-submit') {
+      if (!mime.includes('conversation-source') && !mime.includes('ndjson')) return;
+      const copy = response.clone();
+      const streamId = `s${Date.now().toString(36)}-${(++streamCounter).toString(36)}`;
+      const fields = Promise.resolve(bodyText).catch(() => null).then(readFreeModeRequest);
+      void pumpStream(copy, streamId, fields, { resume: false, format: 'conversation-source' });
       return;
     }
     if (!mime.includes('json')) return;
@@ -91,9 +106,9 @@ export function createFetchTee({ pageOrigin, handlers, maxJsonBytes = MAX_JSON_B
     });
   }
 
-  async function pumpStream(copy, streamId, bodyText, resume) {
-    const ids = readStreamRequestIds(await Promise.resolve(bodyText).catch(() => null));
-    safeCall(handlers.onStreamStart, { streamId, ...ids, resume });
+  async function pumpStream(copy, streamId, idsPromise, { resume, format }) {
+    const ids = await idsPromise.catch(() => ({ conversationId: null, userMessageId: null, parentMessageId: null }));
+    safeCall(handlers.onStreamStart, { streamId, ...ids, resume, format });
     let ok = false;
     let reader;
     try {
@@ -199,6 +214,34 @@ function readRequestBody(input, init) {
   if (typeof Request !== 'undefined' && input instanceof Request && input.body) {
     try {
       return input.clone().text().then((text) => (text.length <= MAX_REQUEST_BODY_CHARS ? text : null), () => null);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Form fields of a free-mode submit, without disturbing the request:
+ * URLSearchParams/FormData are read in place (`get` does not consume them),
+ * an urlencoded string is parsed, a Request input is cloned. Only the fields
+ * named in FREE_MODE_FIELDS are ever read (see readFreeModeRequest).
+ * @returns {{ get(name: string): unknown }|string|Promise<{ get(name: string): unknown }|string|null>|null}
+ */
+function readFreeModeBody(input, init) {
+  const body = init && init.body !== undefined && init.body !== null ? init.body : null;
+  if (body !== null) {
+    if (typeof body === 'string') return body.length <= MAX_REQUEST_BODY_CHARS ? body : null;
+    if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) return body;
+    if (typeof FormData !== 'undefined' && body instanceof FormData) return body;
+    return null;
+  }
+  if (typeof Request !== 'undefined' && input instanceof Request && input.body) {
+    try {
+      const type = String(input.headers.get('content-type') || '').toLowerCase();
+      const copy = input.clone();
+      if (type.includes('multipart/form-data')) return copy.formData().catch(() => null);
+      return copy.text().then((text) => (text.length <= MAX_REQUEST_BODY_CHARS ? text : null), () => null);
     } catch {
       return null;
     }

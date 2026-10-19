@@ -14,12 +14,20 @@
 // `event.source === frame.contentWindow && event.origin === <extension origin>`.
 //
 // Page → UI
-//   hello            { ready: boolean, loggedIn: boolean|null, url: string, efforts: EffortValue[] }   (efforts additive, C: [] = selector hidden)
+//   hello            { ready: boolean, loggedIn: boolean|null, auth: AuthMode, url: string, efforts: EffortValue[] }   (efforts additive, C: [] = selector hidden)
+//                    auth 'user' = signed in (server history); 'anon' = logged-out free mode
+//                    (no server history: the UI keeps conversations on this device);
+//                    'unknown' = not determined yet. ready: user → official headers seen;
+//                    anon → free-mode page detected.
 //   location         { url: string, conversationId: string|null }
 //   conversation-list{ body: string, offset: number, complete: boolean }
 //   conversation     { conversationId: string, body: string, page: number, pages: number }
 //   conversation-error { conversationId: string, code: ConversationErrorCode, retryAfterSec: number|null }
-//   stream-start     { streamId: string, conversationId: string|null, userMessageId: string|null, parentMessageId: string|null, resume: boolean }
+//   stream-start     { streamId: string, conversationId: string|null, userMessageId: string|null, parentMessageId: string|null, resume: boolean,
+//                      format: 'sse'|'conversation-source', userText?: string }
+//                    format 'conversation-source' = free-mode NDJSON (decode with
+//                    createConversationSourceDecoder); userText = the submitted prompt
+//                    (free mode only, the one request field forwarded besides ids).
 //   stream-chunk     { streamId: string, chunk: string }
 //   stream-end       { streamId: string, ok: boolean }
 //   send-result      { commandId: string, ok: boolean, error: SendErrorCode|null }
@@ -88,7 +96,14 @@ export const CONVERSATION_ERROR_CODES = Object.freeze(['auth', 'rate-limit', 'ne
  */
 export const EFFORT_VALUES = Object.freeze(['lowest', 'low', 'medium', 'high', 'highest']);
 
-export const STORAGE_KEYS = Object.freeze(['settings', 'drafts', 'conversationIndex', 'conversationCache']);
+/** @typedef {'user'|'anon'|'unknown'} AuthMode */
+export const AUTH_MODES = Object.freeze(['user', 'anon', 'unknown']);
+
+/** @typedef {'sse'|'conversation-source'} StreamFormat */
+export const STREAM_FORMATS = Object.freeze(['sse', 'conversation-source']);
+
+// localConversations: device-only records of logged-out conversations (capped, see src/protocol/local.js).
+export const STORAGE_KEYS = Object.freeze(['settings', 'drafts', 'conversationIndex', 'conversationCache', 'localConversations']);
 
 /**
  * Shape check for an incoming bridge message. Returns the message when it is

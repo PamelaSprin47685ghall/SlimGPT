@@ -152,7 +152,7 @@
  */
 
 /**
- * @typedef {'invalid-json' | 'invalid-delta' | 'unsupported-encoding' | 'buffer-limit' | 'truncated'} StreamErrorCode
+ * @typedef {'invalid-json' | 'invalid-delta' | 'unsupported-encoding' | 'buffer-limit' | 'truncated' | 'revision-gap'} StreamErrorCode
  */
 
 export const ROLES = Object.freeze(['user', 'assistant', 'tool', 'system']);
@@ -161,5 +161,5 @@ export const BLOCK_KINDS = Object.freeze([
   'text', 'reasoning', 'tool_call', 'tool_result', 'image', 'file', 'error', 'unknown',
 ]);
 export const STREAM_ERROR_CODES = Object.freeze([
-  'invalid-json', 'invalid-delta', 'unsupported-encoding', 'buffer-limit', 'truncated',
+  'invalid-json', 'invalid-delta', 'unsupported-encoding', 'buffer-limit', 'truncated', 'revision-gap',
 ]);
