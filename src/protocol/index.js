@@ -22,9 +22,20 @@
 
 export * from './types.js';
 
-const notImplemented = (name) => {
-  throw new Error(`protocol.${name} is not implemented yet (workstream A)`);
-};
+import { normalizeMessage as normalizeMessageImpl } from './message.js';
+import {
+  applyLiveMessage as applyLiveMessageImpl,
+  createConversation as createConversationImpl,
+  mergeConversation as mergeConversationImpl,
+  parseConversation as parseConversationImpl,
+} from './conversation.js';
+import { selectTurns as selectTurnsImpl, switchBranch as switchBranchImpl } from './turns.js';
+import { createStreamDecoder as createStreamDecoderImpl } from './stream.js';
+import { parseConversationList as parseConversationListImpl } from './conversation-list.js';
+import {
+  conversationToMarkdown as conversationToMarkdownImpl,
+  messageToPlainText as messageToPlainTextImpl,
+} from './text.js';
 
 /**
  * Normalize one raw ChatGPT message object (as found in `mapping[id].message`,
@@ -34,18 +45,23 @@ const notImplemented = (name) => {
  * @returns {Message|null} null only when `raw` has no string id.
  */
 export function normalizeMessage(raw, context = {}) {
-  return notImplemented('normalizeMessage');
+  return normalizeMessageImpl(raw, context);
 }
 
 /**
  * Parse a complete canonical conversation response body (JSON text or object).
  * Accepts `{ mapping, current_node }` and the paged `{ messages, current_node, page_info }`
- * format. Returns null when the body is not a conversation.
+ * format. Returns null when the body is not a conversation. A page's
+ * `currentNodeId` keeps the server-declared id even when that node lives on
+ * another page (selectTurns then falls back to the newest root path).
+ * Parents are derived from `metadata.parent_id`/`parent_id`; a page that
+ * states no parents at all is treated as an ordered path (inferred parents
+ * that later server-stated parents may correct).
  * @param {string|object} body
  * @returns {Conversation|null}
  */
 export function parseConversation(body) {
-  return notImplemented('parseConversation');
+  return parseConversationImpl(body);
 }
 
 /**
@@ -57,21 +73,23 @@ export function parseConversation(body) {
  * @returns {Conversation}
  */
 export function mergeConversation(previous, incoming) {
-  return notImplemented('mergeConversation');
+  return mergeConversationImpl(previous, incoming);
 }
 
 /**
  * Apply one live raw message snapshot. Parent resolution order:
  * raw.metadata.parent_id → raw.parent_id → fallbackParentId (the submitted
  * user message id known from the request) → existing node's parent.
- * Ignored for ids whose canonical message is 'done' (see precedence rule).
+ * Ignored for ids whose canonical message is 'done'/'error' (see precedence rule);
+ * a canonical node's known parent is never rewritten by a live snapshot.
+ * The new/updated message becomes `currentNodeId` when it is a leaf.
  * @param {Conversation} conversation
  * @param {object} raw
  * @param {{ fallbackParentId?: string|null }} [context]
  * @returns {Conversation}
  */
 export function applyLiveMessage(conversation, raw, context = {}) {
-  return notImplemented('applyLiveMessage');
+  return applyLiveMessageImpl(conversation, raw, context);
 }
 
 /**
@@ -80,7 +98,7 @@ export function applyLiveMessage(conversation, raw, context = {}) {
  * @returns {Conversation}
  */
 export function createConversation(id) {
-  return notImplemented('createConversation');
+  return createConversationImpl(id);
 }
 
 /**
@@ -92,19 +110,21 @@ export function createConversation(id) {
  * @returns {Turn[]}
  */
 export function selectTurns(conversation, leafId = null) {
-  return notImplemented('selectTurns');
+  return selectTurnsImpl(conversation, leafId);
 }
 
 /**
  * Leaf reached by switching the branch at `nodeId` by `delta` (−1/+1) and
- * then following the newest child down.
+ * then following the newest child down. If the target sibling contains the
+ * conversation's current leaf, that leaf is returned. Returns null when there
+ * is no sibling in that direction or the node is unknown.
  * @param {Conversation} conversation
  * @param {string} nodeId
  * @param {number} delta
  * @returns {string|null}
  */
 export function switchBranch(conversation, nodeId, delta) {
-  return notImplemented('switchBranch');
+  return switchBranchImpl(conversation, nodeId, delta);
 }
 
 /**
@@ -116,7 +136,7 @@ export function switchBranch(conversation, nodeId, delta) {
  * @returns {{ push(chunk: string): StreamEvent[], end(): StreamEvent[] }}
  */
 export function createStreamDecoder(options = {}) {
-  return notImplemented('createStreamDecoder');
+  return createStreamDecoderImpl(options);
 }
 
 /**
@@ -125,7 +145,7 @@ export function createStreamDecoder(options = {}) {
  * @returns {{ id: string, title: string, updatedAt: number|null }[] | null}
  */
 export function parseConversationList(body) {
-  return notImplemented('parseConversationList');
+  return parseConversationListImpl(body);
 }
 
 /**
@@ -134,7 +154,7 @@ export function parseConversationList(body) {
  * @returns {string}
  */
 export function messageToPlainText(message) {
-  return notImplemented('messageToPlainText');
+  return messageToPlainTextImpl(message);
 }
 
 /**
@@ -144,5 +164,5 @@ export function messageToPlainText(message) {
  * @returns {string}
  */
 export function conversationToMarkdown(conversation, options = {}) {
-  return notImplemented('conversationToMarkdown');
+  return conversationToMarkdownImpl(conversation, options);
 }

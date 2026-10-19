@@ -1,0 +1,49 @@
+{
+ "conversationId": "c-5",
+ "title": "计算",
+ "turns": [
+  {
+   "user": "u5",
+   "replies": [
+    "k1",
+    "k2",
+    "k3"
+   ]
+  }
+ ],
+ "finalMessages": {
+  "k1": {
+   "status": "done",
+   "blocks": [
+    {
+     "kind": "tool_call",
+     "tool": "python",
+     "input": "print(1+1)",
+     "language": "python"
+    }
+   ]
+  },
+  "k2": {
+   "parentId": "k1",
+   "blocks": [
+    {
+     "kind": "tool_result",
+     "tool": "python",
+     "output": "2\n",
+     "isError": false
+    }
+   ]
+  },
+  "k3": {
+   "parentId": "k2",
+   "status": "done",
+   "blocks": [
+    {
+     "kind": "text",
+     "markdown": "答案是 **2** 😀",
+     "citations": []
+    }
+   ]
+  }
+ }
+}

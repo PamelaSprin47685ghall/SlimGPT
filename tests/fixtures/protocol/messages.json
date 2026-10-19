@@ -580,6 +580,720 @@
    "expect": {
     "status": "interrupted"
    }
+  },
+  {
+   "name": "legacy 【4:0†source】 citation resolved from metadata.citations",
+   "raw": {
+    "id": "lc",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "text",
+     "parts": [
+      "Paris【4:0†source】 is."
+     ]
+    },
+    "metadata": {
+     "citations": [
+      {
+       "start_ix": 5,
+       "end_ix": 17,
+       "metadata": {
+        "title": "S",
+        "url": "https://s.com"
+       }
+      }
+     ]
+    }
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "text",
+      "markdown": "Paris is.",
+      "citations": [
+       {
+        "start": 5,
+        "end": 5,
+        "sources": [
+         {
+          "url": "https://s.com",
+          "title": "S"
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "legacy citation without metadata is removed, no placeholder",
+   "raw": {
+    "id": "lc2",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "text",
+     "parts": [
+      "A【12†file.pdf】B"
+     ]
+    }
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "text",
+      "markdown": "AB",
+      "citations": []
+     }
+    ]
+   }
+  },
+  {
+   "name": "Chinese 【bracket】 prose is not a citation",
+   "raw": {
+    "id": "zh",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "text",
+     "parts": [
+      "【注意】这是正文"
+     ]
+    }
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "text",
+      "markdown": "【注意】这是正文",
+      "citations": []
+     }
+    ]
+   }
+  },
+  {
+   "name": "streaming half-received private-use marker is hidden",
+   "raw": {
+    "id": "hp",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "text",
+     "parts": [
+      "Answer citeturn0sea"
+     ]
+    },
+    "status": "in_progress"
+   },
+   "expect": {
+    "status": "streaming",
+    "blocks": [
+     {
+      "kind": "text",
+      "markdown": "Answer ",
+      "citations": []
+     }
+    ]
+   }
+  },
+  {
+   "name": "streaming half-received legacy marker is hidden",
+   "raw": {
+    "id": "hl",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "text",
+     "parts": [
+      "Answer【4:0†sou"
+     ]
+    },
+    "status": "in_progress"
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "text",
+      "markdown": "Answer",
+      "citations": []
+     }
+    ]
+   }
+  },
+  {
+   "name": "entity marker keeps its display name",
+   "raw": {
+    "id": "en",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "text",
+     "parts": [
+      "Visit entity[\"city\",\"Paris\",{}] now"
+     ]
+    }
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "text",
+      "markdown": "Visit Paris now",
+      "citations": []
+     }
+    ]
+   }
+  },
+  {
+   "name": "citation sources keep only http(s) URLs",
+   "raw": {
+    "id": "js",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "text",
+     "parts": [
+      "X citeturn0search1"
+     ]
+    },
+    "metadata": {
+     "content_references": [
+      {
+       "matched_text": "citeturn0search1",
+       "items": [
+        {
+         "url": "javascript:alert(1)",
+         "title": "bad"
+        },
+        {
+         "url": "https://ok.example/a",
+         "title": "ok"
+        }
+       ]
+      }
+     ]
+    }
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "text",
+      "markdown": "X ",
+      "citations": [
+       {
+        "start": 2,
+        "end": 2,
+        "sources": [
+         {
+          "url": "https://ok.example/a",
+          "title": "ok"
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "card markers (navlist, image_group) are removed without placeholder prose",
+   "raw": {
+    "id": "nv",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "text",
+     "parts": [
+      "See navlistNewsturn0news1 and iturn0image0."
+     ]
+    }
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "text",
+      "markdown": "See  and .",
+      "citations": []
+     }
+    ]
+   }
+  },
+  {
+   "name": "multiple thoughts become one reasoning block each, duration on the last",
+   "raw": {
+    "id": "mt2",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "thoughts",
+     "thoughts": [
+      {
+       "summary": "A",
+       "content": "a"
+      },
+      {
+       "summary": "B",
+       "content": "b"
+      }
+     ]
+    },
+    "metadata": {
+     "finished_duration_sec": 9
+    }
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "reasoning",
+      "summary": "A",
+      "markdown": "a",
+      "durationSec": null
+     },
+     {
+      "kind": "reasoning",
+      "summary": "B",
+      "markdown": "b",
+      "durationSec": 9
+     }
+    ]
+   }
+  },
+  {
+   "name": "commentary channel is visible text",
+   "raw": {
+    "id": "cm",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "text",
+     "parts": [
+      "Working on it"
+     ]
+    },
+    "channel": "commentary"
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "text",
+      "markdown": "Working on it"
+     }
+    ]
+   }
+  },
+  {
+   "name": "canvas tool call keeps raw JSON input",
+   "raw": {
+    "id": "cv",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "code",
+     "text": "{\"name\":\"doc\",\"content\":\"# T\"}"
+    },
+    "recipient": "canmore.create_textdoc"
+   },
+   "expect": {
+    "hidden": false,
+    "blocks": [
+     {
+      "kind": "tool_call",
+      "tool": "canmore.create_textdoc",
+      "input": "{\"name\":\"doc\",\"content\":\"# T\"}",
+      "language": "json"
+     }
+    ]
+   }
+  },
+  {
+   "name": "memory write (bio) is hidden",
+   "raw": {
+    "id": "bio",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "text",
+     "parts": [
+      "User likes tea"
+     ]
+    },
+    "recipient": "bio"
+   },
+   "expect": {
+    "hidden": true
+   }
+  },
+  {
+   "name": "function-style tool_calls with call ids",
+   "raw": {
+    "id": "fc",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "text",
+     "parts": [
+      ""
+     ]
+    },
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "function": {
+       "name": "lookup",
+       "arguments": "{\"q\":1}"
+      }
+     }
+    ]
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "tool_call",
+      "tool": "lookup",
+      "callId": "call_1",
+      "input": "{\"q\":1}",
+      "language": "json"
+     }
+    ]
+   }
+  },
+  {
+   "name": "tool result carries call id",
+   "raw": {
+    "id": "fr",
+    "author": {
+     "role": "tool",
+     "name": "lookup"
+    },
+    "content": {
+     "content_type": "text",
+     "parts": [
+      "42"
+     ]
+    },
+    "metadata": {
+     "tool_call_id": "call_1"
+    }
+   },
+   "expect": {
+    "role": "tool",
+    "blocks": [
+     {
+      "kind": "tool_result",
+      "tool": "lookup",
+      "callId": "call_1",
+      "output": "42",
+      "isError": false
+     }
+    ]
+   }
+  },
+  {
+   "name": "failed python execution is an error result",
+   "raw": {
+    "id": "pe",
+    "author": {
+     "role": "tool",
+     "name": "python"
+    },
+    "content": {
+     "content_type": "execution_output",
+     "text": "Traceback"
+    },
+    "metadata": {
+     "aggregate_result": {
+      "status": "failed"
+     }
+    }
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "tool_result",
+      "tool": "python",
+      "output": "Traceback",
+      "isError": true
+     }
+    ]
+   }
+  },
+  {
+   "name": "tether quote result",
+   "raw": {
+    "id": "tq",
+    "author": {
+     "role": "tool",
+     "name": "myfiles_browser"
+    },
+    "content": {
+     "content_type": "tether_quote",
+     "url": "file-1",
+     "domain": "a.pdf",
+     "text": "quoted",
+     "title": "a.pdf"
+    }
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "tool_result",
+      "tool": "myfiles_browser",
+      "output": "a.pdf\nfile-1\nquoted"
+     }
+    ]
+   }
+  },
+  {
+   "name": "uploaded image is not duplicated as a file attachment",
+   "raw": {
+    "id": "ui",
+    "author": {
+     "role": "user"
+    },
+    "content": {
+     "content_type": "multimodal_text",
+     "parts": [
+      {
+       "content_type": "image_asset_pointer",
+       "asset_pointer": "file-service://file-xyz",
+       "width": 5,
+       "height": 6
+      },
+      "look"
+     ]
+    },
+    "metadata": {
+     "attachments": [
+      {
+       "id": "file-xyz",
+       "name": "x.png",
+       "mime_type": "image/png"
+      },
+      {
+       "id": "file-2",
+       "name": "b.csv",
+       "size": 10,
+       "mime_type": "text/csv"
+      }
+     ]
+    }
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "image",
+      "assetPointer": "file-service://file-xyz",
+      "width": 5,
+      "height": 6
+     },
+     {
+      "kind": "text",
+      "markdown": "look"
+     },
+     {
+      "kind": "file",
+      "name": "b.csv",
+      "size": 10,
+      "mime": "text/csv"
+     }
+    ]
+   }
+  },
+  {
+   "name": "audio without transcript is a neutral file block, pointer not leaked",
+   "raw": {
+    "id": "ao",
+    "author": {
+     "role": "user"
+    },
+    "content": {
+     "content_type": "multimodal_text",
+     "parts": [
+      {
+       "content_type": "audio_asset_pointer",
+       "asset_pointer": "sediment://secret",
+       "format": "wav"
+      }
+     ]
+    }
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "file",
+      "name": "audio",
+      "mime": "audio/wav"
+     }
+    ]
+   }
+  },
+  {
+   "name": "is_error metadata is an error",
+   "raw": {
+    "id": "ie",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "text",
+     "parts": [
+      "partial"
+     ]
+    },
+    "metadata": {
+     "is_error": true
+    }
+   },
+   "expect": {
+    "status": "error",
+    "blocks": [
+     {
+      "kind": "text",
+      "markdown": "partial"
+     },
+     {
+      "kind": "error"
+     }
+    ]
+   }
+  },
+  {
+   "name": "user-stopped generation is interrupted",
+   "raw": {
+    "id": "us",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "text",
+     "parts": [
+      "half"
+     ]
+    },
+    "status": "finished_successfully",
+    "metadata": {
+     "finish_details": {
+      "type": "interrupted"
+     }
+    }
+   },
+   "expect": {
+    "status": "interrupted"
+   }
+  },
+  {
+   "name": "model and createdAt are carried",
+   "raw": {
+    "id": "mc",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "text",
+     "parts": [
+      "x"
+     ]
+    },
+    "create_time": 1700000000.5,
+    "metadata": {
+     "model_slug": "gpt-x"
+    }
+   },
+   "expect": {
+    "model": "gpt-x",
+    "createdAt": 1700000000.5,
+    "source": "canonical"
+   }
+  },
+  {
+   "name": "empty finished assistant message is hidden",
+   "raw": {
+    "id": "em",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "text",
+     "parts": [
+      ""
+     ]
+    },
+    "status": "finished_successfully"
+   },
+   "expect": {
+    "hidden": true,
+    "blocks": []
+   }
+  },
+  {
+   "name": "streaming empty placeholder stays visible",
+   "raw": {
+    "id": "sp",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "text",
+     "parts": [
+      ""
+     ]
+    },
+    "status": "in_progress"
+   },
+   "expect": {
+    "hidden": false,
+    "status": "streaming",
+    "blocks": []
+   }
+  },
+  {
+   "name": "unknown part inside multimodal is explicit",
+   "raw": {
+    "id": "up",
+    "author": {
+     "role": "assistant"
+    },
+    "content": {
+     "content_type": "multimodal_text",
+     "parts": [
+      "a",
+      {
+       "content_type": "fancy_part",
+       "x": 1
+      }
+     ]
+    }
+   },
+   "expect": {
+    "blocks": [
+     {
+      "kind": "text",
+      "markdown": "a"
+     },
+     {
+      "kind": "unknown",
+      "contentType": "fancy_part",
+      "raw": {
+       "content_type": "fancy_part",
+       "x": 1
+      }
+     }
+    ]
+   }
   }
  ]
 }
