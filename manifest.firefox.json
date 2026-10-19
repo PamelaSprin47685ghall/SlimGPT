@@ -18,14 +18,14 @@
     },
     {
       "matches": ["https://chatgpt.com/*"],
-      "js": ["main-mitm.js"],
+      "js": ["main-hook.js"],
       "run_at": "document_start",
       "world": "MAIN"
     }
   ],
   "web_accessible_resources": [
     {
-      "resources": ["index.html", "assets/*", "main-mitm.js"],
+      "resources": ["index.html", "assets/*", "main-hook.js"],
       "matches": ["https://chatgpt.com/*"]
     }
   ],
