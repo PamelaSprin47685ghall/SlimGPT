@@ -229,6 +229,27 @@ export function mergeConversation(previous, incoming) {
       const message = inNode.message ?? old.message;
       nodes.set(id, setNodeParent({ ...old, message }, parentId));
     }
+    // A complete canonical history is the truth: live-only nodes it does not
+    // contain (stream-internal placeholders, aborted drafts, temporary ids)
+    // are dropped so they cannot linger as phantom branches. A node still
+    // streaming re-appears with its next snapshot.
+    // Exception: the live path that continues the canonical current node
+    // (canonical fetched while a reply is still streaming).
+    if (incoming.complete && incoming.nodes.size) {
+      const keep = new Set();
+      const leaf = previous.currentNodeId;
+      if (leaf && nodes.get(leaf)?.message?.source === 'live' && incoming.currentNodeId && incoming.nodes.has(incoming.currentNodeId) &&
+          isAncestor(nodes, incoming.currentNodeId, leaf)) {
+        const seen = new Set();
+        for (let cursor = leaf; cursor && !seen.has(cursor) && !incoming.nodes.has(cursor); cursor = nodes.get(cursor)?.parentId ?? null) {
+          seen.add(cursor);
+          keep.add(cursor);
+        }
+      }
+      for (const [id, node] of nodes) {
+        if (!incoming.nodes.has(id) && node.message?.source === 'live' && !keep.has(id)) nodes.delete(id);
+      }
+    }
     const merged = rebuildChildren(nodes, hintsFrom(previous.nodes, incoming.nodes));
     let currentNodeId = incoming.currentNodeId && merged.has(incoming.currentNodeId) ? incoming.currentNodeId : previous.currentNodeId;
     // Keep a newer live leaf that continues the canonical current path.
@@ -299,13 +320,43 @@ export function applyLiveMessage(conversation, raw, context = {}) {
       }
     }
 
-    // The newest live leaf becomes current (new turn, regenerate, edit).
+    // The newest live leaf becomes current (new turn, regenerate, edit) when
+    // it continues the current path or is something the reader sees. A hidden
+    // or still-empty side leaf (stream-internal system/context node) never
+    // steals the current path.
     let currentNodeId = base.currentNodeId;
-    if (!node.childIds.length || !currentNodeId || !nodes.has(currentNodeId)) currentNodeId = message.id;
+    // A non-hidden streaming placeholder counts: a regenerate shows its new
+    // (still empty) reply at once.
+    const visible = !message.hidden && (message.role === 'user' || message.blocks.length > 0 || message.status === 'streaming');
+    if (!currentNodeId || !nodes.has(currentNodeId)) currentNodeId = message.id;
+    else if (!node.childIds.length && (visible || isAncestor(nodes, currentNodeId, message.id))) currentNodeId = message.id;
     const weak = new Set(weakParentsOf(base));
     weak.delete(message.id);
     return withPrivate({ ...base, nodes, currentNodeId }, weak);
   } catch {
     return base;
+  }
+}
+
+/**
+ * Mark every live message that is still 'streaming' as 'interrupted'. Used
+ * when a stream ends early (user pressed Stop, connection dropped): the
+ * partial reply stays visible as an unfinished answer until the canonical
+ * refresh replaces it. Canonical messages are untouched.
+ * @param {Conversation} conversation
+ * @returns {Conversation}
+ */
+export function interruptLiveMessages(conversation) {
+  if (!isConversation(conversation)) return conversation;
+  try {
+    let nodes = null;
+    for (const [id, node] of conversation.nodes) {
+      if (node.message?.source !== 'live' || node.message.status !== 'streaming') continue;
+      nodes ||= new Map(conversation.nodes);
+      nodes.set(id, { ...node, message: { ...node.message, status: 'interrupted' } });
+    }
+    return nodes ? withPrivate({ ...conversation, nodes }, new Set(weakParentsOf(conversation))) : conversation;
+  } catch {
+    return conversation;
   }
 }

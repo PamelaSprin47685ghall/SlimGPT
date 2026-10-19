@@ -21,14 +21,36 @@ export function pathTo(conversation, leafId) {
   return path.reverse();
 }
 
+/** A message the reader actually sees in a turn. */
+function isVisibleContent(message) {
+  return Boolean(message) && !message.hidden && (message.role === 'user' || message.blocks.length > 0);
+}
+
+/**
+ * Does the subtree under `nodeId` contain anything a reader would see?
+ * Hidden system/context nodes, abandoned empty placeholders and other
+ * stream-internal nodes never count as a branch (no phantom "2/2").
+ */
+function producesContent(conversation, nodeId) {
+  const stack = [nodeId];
+  const seen = new Set();
+  while (stack.length && seen.size < 10_000) {
+    const id = stack.pop();
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const node = conversation.nodes.get(id);
+    if (!node) continue;
+    if (isVisibleContent(node.message)) return true;
+    for (const child of node.childIds) stack.push(child);
+  }
+  return false;
+}
+
 function siblingsOf(conversation, nodeId) {
   const node = conversation.nodes.get(nodeId);
   const parent = node?.parentId ? conversation.nodes.get(node.parentId) : null;
   if (!parent) return [nodeId];
-  const siblings = parent.childIds.filter((id) => {
-    const sibling = conversation.nodes.get(id);
-    return sibling && sibling.message;
-  });
+  const siblings = parent.childIds.filter((id) => id === nodeId || producesContent(conversation, id));
   return siblings.includes(nodeId) ? siblings : [...siblings, nodeId];
 }
 
@@ -50,7 +72,8 @@ function defaultLeaf(conversation) {
 function newestChild(conversation, node) {
   let best = null;
   let bestTime = -Infinity;
-  for (const id of node.childIds) {
+  const productive = node.childIds.filter((id) => producesContent(conversation, id));
+  for (const id of productive.length ? productive : node.childIds) {
     const child = conversation.nodes.get(id);
     if (!child) continue;
     const time = child.message?.createdAt ?? -Infinity;

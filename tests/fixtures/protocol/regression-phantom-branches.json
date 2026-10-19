@@ -1,0 +1,490 @@
+{
+ "_about": "Regression for live bug (bda5542): a fresh first reply showed ‹ 2/2 › with an empty branch, a regenerate showed 4/4. Real v1 streams add stream-internal siblings under the user message (hidden model_editable_context, an abandoned empty placeholder) that canonical history does not contain. Siblings count only content-producing subtrees, and a complete canonical refresh drops live-only nodes.",
+ "conversationId": "68f4c2a1-0b6e-8007-9c1d-3e2f5a7b9c10",
+ "ids": {
+  "sys": "b1a2c3d4-0000-4000-8000-000000000001",
+  "u1": "aaaa1111-2222-4333-8444-555566667777",
+  "mec": "c0ffee00-0000-4000-8000-0000000000a1",
+  "p1": "feed0000-0000-4000-8000-0000000000b1",
+  "t1": "d00d0000-0000-4000-8000-0000000000c1",
+  "c1": "ca11ca11-0000-4000-8000-0000000000d1",
+  "r1": "ae5u1700-0000-4000-8000-0000000000e1",
+  "a1": "a1a1a1a1-0000-4000-8000-0000000000f1",
+  "mec2": "c0ffee00-0000-4000-8000-0000000000a2",
+  "p2": "feed0000-0000-4000-8000-0000000000b2",
+  "t2": "d00d0000-0000-4000-8000-0000000000c2",
+  "a2": "a2a2a2a2-0000-4000-8000-0000000000f2"
+ },
+ "streams": {
+  "first": {
+   "file": "streams/live-first-reply-websearch.sse",
+   "userMessageId": "aaaa1111-2222-4333-8444-555566667777",
+   "parentMessageId": "client-created-root"
+  },
+  "regenerate": {
+   "file": "streams/live-regenerate.sse",
+   "userMessageId": null,
+   "parentMessageId": "aaaa1111-2222-4333-8444-555566667777"
+  }
+ },
+ "canonicalAfterFirst": {
+  "title": "Rust news",
+  "create_time": 1,
+  "update_time": 12,
+  "mapping": {
+   "client-created-root": {
+    "id": "client-created-root",
+    "parent": null,
+    "children": [
+     "b1a2c3d4-0000-4000-8000-000000000001"
+    ],
+    "message": null
+   },
+   "b1a2c3d4-0000-4000-8000-000000000001": {
+    "id": "b1a2c3d4-0000-4000-8000-000000000001",
+    "parent": "client-created-root",
+    "children": [
+     "aaaa1111-2222-4333-8444-555566667777"
+    ],
+    "message": {
+     "id": "b1a2c3d4-0000-4000-8000-000000000001",
+     "author": {
+      "role": "system",
+      "name": null,
+      "metadata": {}
+     },
+     "create_time": 1,
+     "update_time": null,
+     "content": {
+      "content_type": "text",
+      "parts": [
+       ""
+      ]
+     },
+     "status": "finished_successfully",
+     "end_turn": null,
+     "weight": 1,
+     "metadata": {
+      "is_visually_hidden_from_conversation": true
+     },
+     "recipient": "all",
+     "channel": null
+    }
+   },
+   "aaaa1111-2222-4333-8444-555566667777": {
+    "id": "aaaa1111-2222-4333-8444-555566667777",
+    "parent": "b1a2c3d4-0000-4000-8000-000000000001",
+    "children": [
+     "d00d0000-0000-4000-8000-0000000000c1"
+    ],
+    "message": {
+     "id": "aaaa1111-2222-4333-8444-555566667777",
+     "author": {
+      "role": "user",
+      "name": null,
+      "metadata": {}
+     },
+     "create_time": 2,
+     "update_time": null,
+     "content": {
+      "content_type": "text",
+      "parts": [
+       "latest news on rust 2026?"
+      ]
+     },
+     "status": "finished_successfully",
+     "end_turn": null,
+     "weight": 1,
+     "metadata": {},
+     "recipient": "all",
+     "channel": null
+    }
+   },
+   "d00d0000-0000-4000-8000-0000000000c1": {
+    "id": "d00d0000-0000-4000-8000-0000000000c1",
+    "parent": "aaaa1111-2222-4333-8444-555566667777",
+    "children": [
+     "ca11ca11-0000-4000-8000-0000000000d1"
+    ],
+    "message": {
+     "id": "d00d0000-0000-4000-8000-0000000000c1",
+     "author": {
+      "role": "assistant",
+      "name": null,
+      "metadata": {}
+     },
+     "create_time": 4,
+     "update_time": null,
+     "content": {
+      "content_type": "thoughts",
+      "thoughts": [
+       {
+        "summary": "Searching",
+        "content": "Need fresh results."
+       }
+      ]
+     },
+     "status": "finished_successfully",
+     "end_turn": null,
+     "weight": 1,
+     "metadata": {
+      "finished_duration_sec": 3
+     },
+     "recipient": "all",
+     "channel": null
+    }
+   },
+   "ca11ca11-0000-4000-8000-0000000000d1": {
+    "id": "ca11ca11-0000-4000-8000-0000000000d1",
+    "parent": "d00d0000-0000-4000-8000-0000000000c1",
+    "children": [
+     "ae5u1700-0000-4000-8000-0000000000e1"
+    ],
+    "message": {
+     "id": "ca11ca11-0000-4000-8000-0000000000d1",
+     "author": {
+      "role": "assistant",
+      "name": null,
+      "metadata": {}
+     },
+     "create_time": 5,
+     "update_time": null,
+     "content": {
+      "content_type": "code",
+      "language": "unknown",
+      "text": "{\"search_query\":[{\"q\":\"rust 2026\"}]}"
+     },
+     "status": "finished_successfully",
+     "end_turn": null,
+     "weight": 1,
+     "metadata": {},
+     "recipient": "web.run",
+     "channel": null
+    }
+   },
+   "ae5u1700-0000-4000-8000-0000000000e1": {
+    "id": "ae5u1700-0000-4000-8000-0000000000e1",
+    "parent": "ca11ca11-0000-4000-8000-0000000000d1",
+    "children": [
+     "a1a1a1a1-0000-4000-8000-0000000000f1"
+    ],
+    "message": {
+     "id": "ae5u1700-0000-4000-8000-0000000000e1",
+     "author": {
+      "role": "tool",
+      "name": "web.run",
+      "metadata": {}
+     },
+     "create_time": 6,
+     "update_time": null,
+     "content": {
+      "content_type": "text",
+      "parts": [
+       ""
+      ]
+     },
+     "status": "finished_successfully",
+     "end_turn": null,
+     "weight": 1,
+     "metadata": {
+      "search_result_groups": []
+     },
+     "recipient": "all",
+     "channel": null
+    }
+   },
+   "a1a1a1a1-0000-4000-8000-0000000000f1": {
+    "id": "a1a1a1a1-0000-4000-8000-0000000000f1",
+    "parent": "ae5u1700-0000-4000-8000-0000000000e1",
+    "children": [],
+    "message": {
+     "id": "a1a1a1a1-0000-4000-8000-0000000000f1",
+     "author": {
+      "role": "assistant",
+      "name": null,
+      "metadata": {}
+     },
+     "create_time": 7,
+     "update_time": null,
+     "content": {
+      "content_type": "text",
+      "parts": [
+       "Rust 1.95 shipped."
+      ]
+     },
+     "status": "finished_successfully",
+     "end_turn": true,
+     "weight": 1,
+     "metadata": {},
+     "recipient": "all",
+     "channel": null
+    }
+   }
+  },
+  "current_node": "a1a1a1a1-0000-4000-8000-0000000000f1",
+  "conversation_id": "68f4c2a1-0b6e-8007-9c1d-3e2f5a7b9c10",
+  "id": "68f4c2a1-0b6e-8007-9c1d-3e2f5a7b9c10",
+  "is_archived": false
+ },
+ "canonicalAfterRegenerate": {
+  "title": "Rust news",
+  "create_time": 1,
+  "update_time": 12,
+  "mapping": {
+   "client-created-root": {
+    "id": "client-created-root",
+    "parent": null,
+    "children": [
+     "b1a2c3d4-0000-4000-8000-000000000001"
+    ],
+    "message": null
+   },
+   "b1a2c3d4-0000-4000-8000-000000000001": {
+    "id": "b1a2c3d4-0000-4000-8000-000000000001",
+    "parent": "client-created-root",
+    "children": [
+     "aaaa1111-2222-4333-8444-555566667777"
+    ],
+    "message": {
+     "id": "b1a2c3d4-0000-4000-8000-000000000001",
+     "author": {
+      "role": "system",
+      "name": null,
+      "metadata": {}
+     },
+     "create_time": 1,
+     "update_time": null,
+     "content": {
+      "content_type": "text",
+      "parts": [
+       ""
+      ]
+     },
+     "status": "finished_successfully",
+     "end_turn": null,
+     "weight": 1,
+     "metadata": {
+      "is_visually_hidden_from_conversation": true
+     },
+     "recipient": "all",
+     "channel": null
+    }
+   },
+   "aaaa1111-2222-4333-8444-555566667777": {
+    "id": "aaaa1111-2222-4333-8444-555566667777",
+    "parent": "b1a2c3d4-0000-4000-8000-000000000001",
+    "children": [
+     "d00d0000-0000-4000-8000-0000000000c1",
+     "d00d0000-0000-4000-8000-0000000000c2"
+    ],
+    "message": {
+     "id": "aaaa1111-2222-4333-8444-555566667777",
+     "author": {
+      "role": "user",
+      "name": null,
+      "metadata": {}
+     },
+     "create_time": 2,
+     "update_time": null,
+     "content": {
+      "content_type": "text",
+      "parts": [
+       "latest news on rust 2026?"
+      ]
+     },
+     "status": "finished_successfully",
+     "end_turn": null,
+     "weight": 1,
+     "metadata": {},
+     "recipient": "all",
+     "channel": null
+    }
+   },
+   "d00d0000-0000-4000-8000-0000000000c1": {
+    "id": "d00d0000-0000-4000-8000-0000000000c1",
+    "parent": "aaaa1111-2222-4333-8444-555566667777",
+    "children": [
+     "ca11ca11-0000-4000-8000-0000000000d1"
+    ],
+    "message": {
+     "id": "d00d0000-0000-4000-8000-0000000000c1",
+     "author": {
+      "role": "assistant",
+      "name": null,
+      "metadata": {}
+     },
+     "create_time": 4,
+     "update_time": null,
+     "content": {
+      "content_type": "thoughts",
+      "thoughts": [
+       {
+        "summary": "Searching",
+        "content": "Need fresh results."
+       }
+      ]
+     },
+     "status": "finished_successfully",
+     "end_turn": null,
+     "weight": 1,
+     "metadata": {
+      "finished_duration_sec": 3
+     },
+     "recipient": "all",
+     "channel": null
+    }
+   },
+   "ca11ca11-0000-4000-8000-0000000000d1": {
+    "id": "ca11ca11-0000-4000-8000-0000000000d1",
+    "parent": "d00d0000-0000-4000-8000-0000000000c1",
+    "children": [
+     "ae5u1700-0000-4000-8000-0000000000e1"
+    ],
+    "message": {
+     "id": "ca11ca11-0000-4000-8000-0000000000d1",
+     "author": {
+      "role": "assistant",
+      "name": null,
+      "metadata": {}
+     },
+     "create_time": 5,
+     "update_time": null,
+     "content": {
+      "content_type": "code",
+      "language": "unknown",
+      "text": "{\"search_query\":[{\"q\":\"rust 2026\"}]}"
+     },
+     "status": "finished_successfully",
+     "end_turn": null,
+     "weight": 1,
+     "metadata": {},
+     "recipient": "web.run",
+     "channel": null
+    }
+   },
+   "ae5u1700-0000-4000-8000-0000000000e1": {
+    "id": "ae5u1700-0000-4000-8000-0000000000e1",
+    "parent": "ca11ca11-0000-4000-8000-0000000000d1",
+    "children": [
+     "a1a1a1a1-0000-4000-8000-0000000000f1"
+    ],
+    "message": {
+     "id": "ae5u1700-0000-4000-8000-0000000000e1",
+     "author": {
+      "role": "tool",
+      "name": "web.run",
+      "metadata": {}
+     },
+     "create_time": 6,
+     "update_time": null,
+     "content": {
+      "content_type": "text",
+      "parts": [
+       ""
+      ]
+     },
+     "status": "finished_successfully",
+     "end_turn": null,
+     "weight": 1,
+     "metadata": {
+      "search_result_groups": []
+     },
+     "recipient": "all",
+     "channel": null
+    }
+   },
+   "a1a1a1a1-0000-4000-8000-0000000000f1": {
+    "id": "a1a1a1a1-0000-4000-8000-0000000000f1",
+    "parent": "ae5u1700-0000-4000-8000-0000000000e1",
+    "children": [],
+    "message": {
+     "id": "a1a1a1a1-0000-4000-8000-0000000000f1",
+     "author": {
+      "role": "assistant",
+      "name": null,
+      "metadata": {}
+     },
+     "create_time": 7,
+     "update_time": null,
+     "content": {
+      "content_type": "text",
+      "parts": [
+       "Rust 1.95 shipped."
+      ]
+     },
+     "status": "finished_successfully",
+     "end_turn": true,
+     "weight": 1,
+     "metadata": {},
+     "recipient": "all",
+     "channel": null
+    }
+   },
+   "d00d0000-0000-4000-8000-0000000000c2": {
+    "id": "d00d0000-0000-4000-8000-0000000000c2",
+    "parent": "aaaa1111-2222-4333-8444-555566667777",
+    "children": [
+     "a2a2a2a2-0000-4000-8000-0000000000f2"
+    ],
+    "message": {
+     "id": "d00d0000-0000-4000-8000-0000000000c2",
+     "author": {
+      "role": "assistant",
+      "name": null,
+      "metadata": {}
+     },
+     "create_time": 11,
+     "update_time": null,
+     "content": {
+      "content_type": "thoughts",
+      "thoughts": [
+       {
+        "summary": "Again",
+        "content": "retry"
+       }
+      ]
+     },
+     "status": "finished_successfully",
+     "end_turn": null,
+     "weight": 1,
+     "metadata": {
+      "finished_duration_sec": 1
+     },
+     "recipient": "all",
+     "channel": null
+    }
+   },
+   "a2a2a2a2-0000-4000-8000-0000000000f2": {
+    "id": "a2a2a2a2-0000-4000-8000-0000000000f2",
+    "parent": "d00d0000-0000-4000-8000-0000000000c2",
+    "children": [],
+    "message": {
+     "id": "a2a2a2a2-0000-4000-8000-0000000000f2",
+     "author": {
+      "role": "assistant",
+      "name": null,
+      "metadata": {}
+     },
+     "create_time": 12,
+     "update_time": null,
+     "content": {
+      "content_type": "text",
+      "parts": [
+       "Second answer."
+      ]
+     },
+     "status": "finished_successfully",
+     "end_turn": true,
+     "weight": 1,
+     "metadata": {},
+     "recipient": "all",
+     "channel": null
+    }
+   }
+  },
+  "current_node": "a2a2a2a2-0000-4000-8000-0000000000f2",
+  "conversation_id": "68f4c2a1-0b6e-8007-9c1d-3e2f5a7b9c10",
+  "id": "68f4c2a1-0b6e-8007-9c1d-3e2f5a7b9c10",
+  "is_archived": false
+ }
+}

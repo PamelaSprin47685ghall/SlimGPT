@@ -26,6 +26,7 @@ import { normalizeMessage as normalizeMessageImpl } from './message.js';
 import {
   applyLiveMessage as applyLiveMessageImpl,
   createConversation as createConversationImpl,
+  interruptLiveMessages as interruptLiveMessagesImpl,
   mergeConversation as mergeConversationImpl,
   parseConversation as parseConversationImpl,
 } from './conversation.js';
@@ -229,4 +230,14 @@ export function messageToPlainText(message) {
  */
 export function conversationToMarkdown(conversation, options = {}) {
   return conversationToMarkdownImpl(conversation, options);
+}
+
+/**
+ * Mark live messages that are still streaming as interrupted (additive, for
+ * a stream that ended early: Stop or a dropped connection). Never throws.
+ * @param {Conversation} conversation
+ * @returns {Conversation}
+ */
+export function interruptLiveMessages(conversation) {
+  return interruptLiveMessagesImpl(conversation);
 }

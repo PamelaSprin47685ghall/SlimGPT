@@ -1,0 +1,62 @@
+event: delta_encoding
+data: "v1"
+
+data: {"type":"resume_conversation_token","kind":"topic","token":"redacted","conversation_id":"68f4c2a1-0b6e-8007-9c1d-3e2f5a7b9c10"}
+
+event: delta
+data: {"p":"","o":"add","v":{"message":{"id":"b1a2c3d4-0000-4000-8000-000000000001","author":{"role":"system","name":null,"metadata":{}},"create_time":1,"update_time":null,"content":{"content_type":"text","parts":[""]},"status":"finished_successfully","end_turn":null,"weight":1,"metadata":{"is_visually_hidden_from_conversation":true,"parent_id":"client-created-root"},"recipient":"all","channel":null},"conversation_id":"68f4c2a1-0b6e-8007-9c1d-3e2f5a7b9c10","error":null},"c":0}
+
+data: {"type":"input_message","input_message":{"id":"aaaa1111-2222-4333-8444-555566667777","author":{"role":"user","name":null,"metadata":{}},"create_time":2,"update_time":null,"content":{"content_type":"text","parts":["latest news on rust 2026?"]},"status":"finished_successfully","end_turn":null,"weight":1,"metadata":{"request_id":"r","message_source":null,"selected_github_repos":[]},"recipient":"all","channel":null},"conversation_id":"68f4c2a1-0b6e-8007-9c1d-3e2f5a7b9c10"}
+
+event: delta
+data: {"p":"","o":"add","v":{"message":{"id":"c0ffee00-0000-4000-8000-0000000000a1","author":{"role":"assistant","name":null,"metadata":{}},"create_time":3,"update_time":null,"content":{"content_type":"model_editable_context","model_set_context":"","repository":null},"status":"finished_successfully","end_turn":null,"weight":1,"metadata":{"parent_id":"aaaa1111-2222-4333-8444-555566667777","is_visually_hidden_from_conversation":true},"recipient":"all","channel":null},"conversation_id":"68f4c2a1-0b6e-8007-9c1d-3e2f5a7b9c10","error":null},"c":1}
+
+event: delta
+data: {"p":"","o":"add","v":{"message":{"id":"feed0000-0000-4000-8000-0000000000b1","author":{"role":"assistant","name":null,"metadata":{}},"create_time":3,"update_time":null,"content":{"content_type":"text","parts":[""]},"status":"in_progress","end_turn":null,"weight":1,"metadata":{"parent_id":"aaaa1111-2222-4333-8444-555566667777","message_type":"next"},"recipient":"all","channel":null},"conversation_id":"68f4c2a1-0b6e-8007-9c1d-3e2f5a7b9c10","error":null},"c":2}
+
+data: {"type":"message_marker","conversation_id":"68f4c2a1-0b6e-8007-9c1d-3e2f5a7b9c10","message_id":"feed0000-0000-4000-8000-0000000000b1","marker":"user_visible_token","event":"first"}
+
+event: delta
+data: {"p":"","o":"add","v":{"message":{"id":"d00d0000-0000-4000-8000-0000000000c1","author":{"role":"assistant","name":null,"metadata":{}},"create_time":4,"update_time":null,"content":{"content_type":"thoughts","thoughts":[],"source_analysis_msg_id":"x"},"status":"in_progress","end_turn":null,"weight":1,"metadata":{"parent_id":"aaaa1111-2222-4333-8444-555566667777"},"recipient":"all","channel":null},"conversation_id":"68f4c2a1-0b6e-8007-9c1d-3e2f5a7b9c10","error":null},"c":3}
+
+event: delta
+data: {"p":"/message/content/thoughts","o":"append","v":[{"summary":"Searching","content":"Need fresh results.","chunks":[],"finished":true}]}
+
+event: delta
+data: {"p":"","o":"patch","v":[{"p":"/message/status","o":"replace","v":"finished_successfully"},{"p":"/message/metadata","o":"append","v":{"finished_duration_sec":3}}]}
+
+event: delta
+data: {"p":"","o":"add","v":{"message":{"id":"ca11ca11-0000-4000-8000-0000000000d1","author":{"role":"assistant","name":null,"metadata":{}},"create_time":5,"update_time":null,"content":{"content_type":"code","language":"unknown","text":""},"status":"in_progress","end_turn":null,"weight":1,"metadata":{"parent_id":"d00d0000-0000-4000-8000-0000000000c1"},"recipient":"web.run","channel":null},"conversation_id":"68f4c2a1-0b6e-8007-9c1d-3e2f5a7b9c10","error":null},"c":4}
+
+event: delta
+data: {"p":"/message/content/text","o":"append","v":"{\"search_query\":[{\"q\":\"rust 2026\"}]}"}
+
+event: delta
+data: {"p":"/message/status","o":"replace","v":"finished_successfully"}
+
+event: delta
+data: {"p":"","o":"add","v":{"message":{"id":"ae5u1700-0000-4000-8000-0000000000e1","author":{"role":"tool","name":"web.run","metadata":{}},"create_time":6,"update_time":null,"content":{"content_type":"text","parts":[""]},"status":"finished_successfully","end_turn":null,"weight":1,"metadata":{"parent_id":"ca11ca11-0000-4000-8000-0000000000d1","search_result_groups":[{"domain":"blog.rust-lang.org","entries":[{"url":"https://blog.rust-lang.org/","title":"Rust Blog"}]}]},"recipient":"all","channel":null},"conversation_id":"68f4c2a1-0b6e-8007-9c1d-3e2f5a7b9c10","error":null},"c":5}
+
+event: delta
+data: {"p":"","o":"add","v":{"message":{"id":"a1a1a1a1-0000-4000-8000-0000000000f1","author":{"role":"assistant","name":null,"metadata":{}},"create_time":7,"update_time":null,"content":{"content_type":"text","parts":[""]},"status":"in_progress","end_turn":null,"weight":1,"metadata":{"parent_id":"ae5u1700-0000-4000-8000-0000000000e1"},"recipient":"all","channel":null},"conversation_id":"68f4c2a1-0b6e-8007-9c1d-3e2f5a7b9c10","error":null},"c":6}
+
+event: delta
+data: {"p":"/message/content/parts/0","o":"append","v":"Rust "}
+
+event: delta
+data: {"p":"/message/content/parts/0","o":"append","v":"1.95 "}
+
+event: delta
+data: {"p":"/message/content/parts/0","o":"append","v":"shipped."}
+
+event: delta
+data: {"p":"","o":"patch","v":[{"p":"/message/status","o":"replace","v":"finished_successfully"},{"p":"/message/end_turn","o":"replace","v":true}]}
+
+data: {"type":"server_ste_metadata","metadata":{"turn_exchange_id":"x"},"conversation_id":"68f4c2a1-0b6e-8007-9c1d-3e2f5a7b9c10"}
+
+data: {"type":"title_generation","title":"Rust news","conversation_id":"68f4c2a1-0b6e-8007-9c1d-3e2f5a7b9c10"}
+
+data: {"type":"message_stream_complete","conversation_id":"68f4c2a1-0b6e-8007-9c1d-3e2f5a7b9c10"}
+
+data: [DONE]
+

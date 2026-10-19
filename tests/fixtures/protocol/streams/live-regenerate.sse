@@ -1,0 +1,24 @@
+event: delta_encoding
+data: "v1"
+
+data: {"type":"resume_conversation_token","kind":"topic","token":"redacted","conversation_id":"68f4c2a1-0b6e-8007-9c1d-3e2f5a7b9c10"}
+
+event: delta
+data: {"p":"","o":"add","v":{"message":{"id":"c0ffee00-0000-4000-8000-0000000000a2","author":{"role":"assistant","name":null,"metadata":{}},"create_time":10,"update_time":null,"content":{"content_type":"model_editable_context","model_set_context":""},"status":"finished_successfully","end_turn":null,"weight":1,"metadata":{"parent_id":"aaaa1111-2222-4333-8444-555566667777","is_visually_hidden_from_conversation":true},"recipient":"all","channel":null},"conversation_id":"68f4c2a1-0b6e-8007-9c1d-3e2f5a7b9c10","error":null},"c":0}
+
+event: delta
+data: {"p":"","o":"add","v":{"message":{"id":"feed0000-0000-4000-8000-0000000000b2","author":{"role":"assistant","name":null,"metadata":{}},"create_time":10,"update_time":null,"content":{"content_type":"text","parts":[""]},"status":"in_progress","end_turn":null,"weight":1,"metadata":{"parent_id":"aaaa1111-2222-4333-8444-555566667777"},"recipient":"all","channel":null},"conversation_id":"68f4c2a1-0b6e-8007-9c1d-3e2f5a7b9c10","error":null},"c":1}
+
+event: delta
+data: {"p":"","o":"add","v":{"message":{"id":"d00d0000-0000-4000-8000-0000000000c2","author":{"role":"assistant","name":null,"metadata":{}},"create_time":11,"update_time":null,"content":{"content_type":"thoughts","thoughts":[{"summary":"Again","content":"retry"}]},"status":"finished_successfully","end_turn":null,"weight":1,"metadata":{"parent_id":"aaaa1111-2222-4333-8444-555566667777","finished_duration_sec":1},"recipient":"all","channel":null},"conversation_id":"68f4c2a1-0b6e-8007-9c1d-3e2f5a7b9c10","error":null},"c":2}
+
+event: delta
+data: {"p":"","o":"add","v":{"message":{"id":"a2a2a2a2-0000-4000-8000-0000000000f2","author":{"role":"assistant","name":null,"metadata":{}},"create_time":12,"update_time":null,"content":{"content_type":"text","parts":["Second answer."]},"status":"in_progress","end_turn":null,"weight":1,"metadata":{"parent_id":"d00d0000-0000-4000-8000-0000000000c2"},"recipient":"all","channel":null},"conversation_id":"68f4c2a1-0b6e-8007-9c1d-3e2f5a7b9c10","error":null},"c":3}
+
+event: delta
+data: {"p":"/message/status","o":"replace","v":"finished_successfully"}
+
+data: {"type":"message_stream_complete","conversation_id":"68f4c2a1-0b6e-8007-9c1d-3e2f5a7b9c10"}
+
+data: [DONE]
+

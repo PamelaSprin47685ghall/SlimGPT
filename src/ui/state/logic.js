@@ -210,6 +210,8 @@ function onConversation(state, message, P) {
     sync: withEntry(state.sync, id, page >= pages ? { state: 'ready' } : { state: 'loading', page, pages }),
   };
   if (next.opening === id) next.opening = undefined;
+  // The full history replaced whatever the broken stream left behind.
+  if (page >= pages && next.streamError?.conversationId === id) next.streamError = null;
   const selected = next.leaf[id];
   if (selected && !conv.nodes.has(selected)) next.leaf = withEntry(next.leaf, id, undefined);
   if (conv.title) {
@@ -289,11 +291,21 @@ function onStreamEnd(state, message, P) {
   const stream = state.streams[message.streamId];
   if (!stream) return { state, effects: [] };
   let result = { state, effects: [] };
-  if (!stream.failed) result = applyStreamEvents(state, message.streamId, stream.decoder.end(), P);
+  let early = message.ok === false;
+  if (!stream.failed) {
+    // An early end (Stop, dropped connection) is an interrupted reply, not a
+    // parse failure: no warning, the canonical refresh below settles it.
+    const events = stream.decoder.end();
+    if (events.some((event) => event?.type === 'error' && event.code === 'truncated')) early = true;
+    result = applyStreamEvents(state, message.streamId, early ? events.filter((event) => event?.type !== 'error') : events, P);
+  }
   const finalStream = result.state.streams[message.streamId] || stream;
-  const next = { ...result.state, streams: withEntry(result.state.streams, message.streamId, undefined) };
+  let next = { ...result.state, streams: withEntry(result.state.streams, message.streamId, undefined) };
   const effects = [...result.effects];
   const id = finalStream.conversationId;
+  if (early && id && next.convs[id] && typeof P.interruptLiveMessages === 'function') {
+    next = { ...next, convs: withEntry(next.convs, id, P.interruptLiveMessages(next.convs[id])) };
+  }
   if (finalStream.device) {
     // Free mode: no server history exists; keep what we saw on this device.
     if (id) {
