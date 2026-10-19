@@ -209,6 +209,30 @@ test('schedule() defers to the official fetch: noteObserved cancels the own load
   assert.equal(h.requests.length, 1);
 });
 
+test('official paged view with has_versions → one own full-tree load (cooldown-gated); 404 disables it', async () => {
+  const h = harness((url) => (url.pathname.startsWith('/backend-api/conversation/') ? json({ conversation_id: ID, mapping: {} }) : json({}, { status: 500 })));
+  authed(h);
+  assert.equal(h.loader.noteObserved(ID), false, 'plain observation loads nothing');
+  assert.equal(h.loader.noteObserved(ID, { wantsFullTree: true }), true);
+  await settle();
+  assert.deepEqual(h.requests.map((r) => r.url.pathname), [`/backend-api/conversation/${ID}`]);
+  assert.equal(h.events.at(-1).type, 'conversation');
+  assert.equal(h.loader.noteObserved(ID, { wantsFullTree: true }), false, 'within cooldown');
+  h.advance(6000);
+  assert.equal(h.loader.noteObserved(ID, { wantsFullTree: true }), true);
+  await settle();
+  assert.equal(h.requests.length, 2);
+
+  const paged = { conversation_id: ID, messages: [], page_info: { has_previous_page: false } };
+  const gone = harness((url) => (url.pathname.startsWith('/backend-api/conversation/') ? json({}, { status: 404 }) : json(paged)));
+  authed(gone);
+  gone.loader.noteObserved(ID, { wantsFullTree: true });
+  await settle();
+  assert.deepEqual(gone.requests.map((r) => r.url.pathname), [`/backend-api/conversation/${ID}`, `/backend-api/conversations/${ID}`]);
+  gone.advance(60_000);
+  assert.equal(gone.loader.noteObserved(ID, { wantsFullTree: true }), false, 'no full tree endpoint: do not keep asking');
+});
+
 test('invalid ids are refused', () => {
   const h = harness(() => json({}));
   authed(h);

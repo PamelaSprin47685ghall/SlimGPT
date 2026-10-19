@@ -50,7 +50,7 @@ test('SSE: official app gets the identical Response, untouched; the tee forwards
   assert.deepEqual(events[0], ['headers', 'Bearer t']);
   assert.deepEqual(events[1], ['submission', { ok: true, status: 200 }]);
   const start = events.find((event) => event[0] === 'start')[1];
-  assert.deepEqual({ ...start, streamId: 'x' }, { streamId: 'x', conversationId: ID, userMessageId: 'u1', parentMessageId: 'p1', resume: false, format: 'sse' });
+  assert.deepEqual({ ...start, streamId: 'x' }, { streamId: 'x', conversationId: ID, userMessageId: 'u1', parentMessageId: 'p1', userText: null, resume: false, format: 'sse' });
   const chunks = events.filter((event) => event[0] === 'chunk');
   assert.equal(chunks.map((event) => event[2]).join(''), parts.join(''));
   assert.ok(chunks.every((event) => event[1] === start.streamId));

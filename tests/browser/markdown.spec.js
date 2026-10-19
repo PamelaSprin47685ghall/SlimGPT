@@ -364,6 +364,36 @@ if (scenario === 'normal') {
   }
 
   // ------------------------------------------------------------ app flow
+  await test('store: nothing is saved before stored values are read back (device conversations are never wiped)', async () => {
+    const sets = [];
+    let release;
+    let push;
+    const existing = { v: 1, id: '00000000-0000-4000-8000-0000000000e1', title: 'old', updatedAt: 1, currentNode: '00000000-0000-4000-8000-0000000000e3',
+      messages: [
+        { id: '00000000-0000-4000-8000-0000000000e2', parent: null, role: 'user', text: 'old question', status: 'finished_successfully' },
+        { id: '00000000-0000-4000-8000-0000000000e3', parent: '00000000-0000-4000-8000-0000000000e2', role: 'assistant', text: 'old answer', status: 'finished_successfully' },
+      ] };
+    const store = createStore({
+      protocol: RealProtocol,
+      bridgeFactory: ({ onMessage }) => {
+        push = (type, fields = {}) => onMessage({ type, ...fields });
+        return { connected: true, send: () => true, nextId: (p) => `${p}-1`,
+          storageGet: () => new Promise((resolve) => { release = resolve; }),
+          storageSet: async (values) => { sets.push(values); return {}; }, destroy() {} };
+      },
+    });
+    const stop = store.start();
+    cleanups.push(stop);
+    push('hello', { ready: true, loggedIn: false, auth: 'anon' });
+    push('location', { conversationId: null, url: 'https://chatgpt.com/' });
+    push('stream-start', { streamId: 's', conversationId: '00000000-0000-4000-8000-0000000000f1', userMessageId: '00000000-0000-4000-8000-0000000000f2', parentMessageId: null, resume: false, format: 'conversation-source', userText: 'new' });
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    equal(sets.filter((values) => 'localConversations' in values).length, 0, 'saved before hydrate');
+    release({ localConversations: [existing] });
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    const saved = sets.filter((values) => 'localConversations' in values).at(-1)?.localConversations || [];
+    equal(JSON.stringify(saved.map((record) => record.id).sort()), JSON.stringify(['00000000-0000-4000-8000-0000000000e1', '00000000-0000-4000-8000-0000000000f1']));
+  });
   await test('app (Framework7): panel list, open, status subnavbar, IME-safe Enter send, stop, popover menu', async () => {
     const sent = [];
     let push;

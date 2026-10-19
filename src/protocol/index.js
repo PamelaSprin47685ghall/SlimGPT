@@ -225,7 +225,8 @@ export function messageToPlainText(message) {
 /**
  * Markdown export of the selected path.
  * @param {Conversation} conversation
- * @param {{ leafId?: string|null, includeReasoning?: boolean, includeTools?: boolean }} [options]
+ * @param {{ leafId?: string|null, includeReasoning?: boolean, includeTools?: boolean, title?: string }} [options]
+ *   `title` overrides the conversation's own (e.g. the sidebar title of a live chat).
  * @returns {string}
  */
 export function conversationToMarkdown(conversation, options = {}) {

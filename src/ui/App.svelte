@@ -52,7 +52,7 @@
   function exportMarkdown() {
     if (!conv) return;
     let text = '';
-    try { text = P.conversationToMarkdown(conv, { leafId: L.selectedLeaf(s), includeReasoning: false, includeTools: false }); } catch { text = ''; }
+    try { text = P.conversationToMarkdown(conv, { leafId: L.selectedLeaf(s), includeReasoning: false, includeTools: false, title: s.list.find((item) => item.id === conv.id)?.title || '' }); } catch { text = ''; }
     if (!text.trim()) { notify('当前对话暂无可导出的消息'); return; }
     if (downloadText(text, safeFileName(title))) { notify('已导出 Markdown'); return; }
     void copyText(text).then((ok) => notify(ok ? '无法下载文件，已复制 Markdown 到剪贴板' : '导出失败'), () => notify('导出失败'));
@@ -83,7 +83,7 @@
         {running}
         pending={!!s.pending}
         blocked={!check.ok}
-        notice={['branch', 'loading', 'pending'].includes(check.reason) ? L.blockedText(check.reason) : ''}
+        notice={['branch', 'loading', 'pending', 'device-readonly', 'opening'].includes(check.reason) ? L.blockedText(check.reason) : ''}
         {offBranch}
         error={sendError}
         efforts={s.efforts}

@@ -53,7 +53,7 @@ chatgpt.com 页面
 - 旁听 `POST /unauth-mweb/conversation/updates` 的 `conversation-source+ndjson` 流，由 `createConversationSourceDecoder` 按 revision / baseRevision 校验后还原；链条断裂时保留已收到的文字并标为 “回答未完成”，绝不猜测拼接；
 - 只从请求表单里读取 `prompt`、`userMessageId`、`conversationState`（公开的会话 id / 父消息 id），各种 token 一律不读不转发；
 - 对话只保存在本机（扩展存储键 `localConversations`，最多 50 个、约 150 万字符，旧的先淘汰），侧栏标记 “本机”；登录模式下不显示、也不保存任何对话内容；
-- 打开本机对话 = 真正跳转到 `/uc/<id>`（官方页面据此续接上下文）；免费模式下隐藏分支切换。
+- 打开本机对话：直接从本机存储显示，不做页面跳转（重新加载 `/uc/<id>` 经常被服务器重定向回首页）。只有官方页面正处在这个对话上时才能继续发送；否则对话只读，并提示 “该本机对话已无法继续，可新建对话”。SlimGPT 不会伪造官方请求里的 `conversationState`。免费模式下隐藏分支切换。
 
 ## 开发
 

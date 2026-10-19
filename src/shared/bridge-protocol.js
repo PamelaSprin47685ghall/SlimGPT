@@ -27,7 +27,8 @@
 //                      format: 'sse'|'conversation-source', userText?: string }
 //                    format 'conversation-source' = free-mode NDJSON (decode with
 //                    createConversationSourceDecoder); userText = the submitted prompt
-//                    (free mode only, the one request field forwarded besides ids).
+//                    (plain text of the last user message; the one request field
+//                    forwarded besides ids; also for 'sse' since 2026-10-19).
 //   stream-chunk     { streamId: string, chunk: string }
 //   stream-end       { streamId: string, ok: boolean }
 //   send-result      { commandId: string, ok: boolean, error: SendErrorCode|null }

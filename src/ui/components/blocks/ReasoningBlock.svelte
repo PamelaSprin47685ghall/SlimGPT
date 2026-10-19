@@ -2,7 +2,7 @@
   import Markdown from './Markdown.svelte';
   let { block, streaming = false } = $props();
   let open = $state(false);
-  const label = $derived(streaming ? '思考中…' : block.durationSec ? `思考 · ${Math.max(1, Math.round(block.durationSec))} 秒` : '思考');
+  const label = $derived(streaming ? '思考中…' : block.label ? block.label : block.durationSec ? `思考 · ${Math.max(1, Math.round(block.durationSec))} 秒` : '思考');
 </script>
 
 <details class="fold reasoning" bind:open>

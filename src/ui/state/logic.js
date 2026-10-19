@@ -29,6 +29,10 @@ export function initialState() {
     list: [],
     listComplete: false,
     currentId: null,
+    // Conversation the official page is on (from `location`). In free mode a
+    // device conversation can only be continued while the official page is
+    // on it; otherwise it is shown read-only from storage.
+    officialId: null,
     opening: undefined,
     convs: {},
     leaf: {},
@@ -164,9 +168,20 @@ function onHello(state, message) {
 
 function onLocation(state, message, P) {
   const id = typeof message.conversationId === 'string' && message.conversationId ? message.conversationId : null;
+  if (isFreeMode(state)) {
+    // Device conversations are opened in place (no navigation), so the view
+    // follows the official page only while it was following it already (or
+    // shows a new chat). A redirect away from /uc/<id> never drops the
+    // conversation on screen; it just becomes read-only.
+    const following = state.currentId === null || state.currentId === state.officialId || state.opening === id;
+    let next = { ...state, officialId: id };
+    if (state.opening !== undefined && id === state.opening) next.opening = undefined;
+    if (following && id !== null && id !== state.currentId) next = { ...next, currentId: id, sendError: null };
+    return { state: next, effects: [] };
+  }
   // While the user is opening a conversation, ignore stale locations.
-  if (state.opening !== undefined && id !== state.opening) return { state, effects: [] };
-  let next = { ...state, opening: undefined };
+  if (state.opening !== undefined && id !== state.opening) return { state: { ...state, officialId: id }, effects: [] };
+  let next = { ...state, opening: undefined, officialId: id };
   const effects = [];
   if (id !== state.currentId) next = { ...next, currentId: id, sendError: null };
   // Free mode has no server history to ask for.
@@ -183,10 +198,13 @@ function onList(state, message, P) {
   let list;
   if (!message.offset) {
     // Keep locally known conversations the server list does not have yet
-    // (fresh chats) and device-only free-mode conversations.
+    // (fresh chats) and device-only free-mode conversations. Only a complete
+    // first page replaces the rest; a partial one (the official app asks for
+    // 20) is merged on top so the sidebar never shrinks to that page.
     const ids = new Set(items.map((item) => item.id));
-    const local = state.list.filter((item) => !ids.has(item.id) && (item.local || item.device));
-    list = [...local, ...items];
+    const rest = state.list.filter((item) => !ids.has(item.id));
+    const local = rest.filter((item) => item.local || item.device);
+    list = message.complete ? [...local, ...items] : [...local, ...items, ...rest.filter((item) => !item.local && !item.device)];
   } else {
     list = state.list;
     for (const item of items) list = upsertListItem(list, item);
@@ -235,9 +253,10 @@ function onStreamStart(state, message, P) {
   const device = message.format === FREE_FORMAT;
   const userMessageId = message.userMessageId || null;
   const parentMessageId = message.parentMessageId || null;
-  // Free mode: the submitted prompt (forwarded by the page) becomes the user
-  // message; the server never sends it back.
-  const userRaw = device && userMessageId && typeof message.userText === 'string'
+  // The submitted prompt (forwarded by the page) becomes the user message at
+  // once: free mode never sends it back, and the signed-in stream may echo it
+  // late (or not at all before a Stop). Canonical history replaces it.
+  const userRaw = userMessageId && typeof message.userText === 'string' && message.userText
     ? P.userMessageFromPrompt({ id: userMessageId, text: message.userText, parentId: parentMessageId })
     : null;
   const stream = {
@@ -250,6 +269,8 @@ function onStreamStart(state, message, P) {
     title: userRaw ? titleFrom(message.userText) : '',
     decoder: device ? P.createConversationSourceDecoder() : P.createStreamDecoder(),
     failed: false,
+    finished: false,
+    refreshed: false,
     buffered: userRaw && !conversationId ? [userRaw] : [],
   };
   let next = { ...state, streams: withEntry(state.streams, streamId, stream), streamError: null };
@@ -314,12 +335,19 @@ function onStreamEnd(state, message, P) {
     }
     return { state: next, effects };
   }
-  // Canonical history is re-fetched after EVERY stream end; it is also the
-  // recovery path after a stream error (which already asked once at failure).
-  if (id && !effects.some((effect) => effect.message === 'refresh' && effect.fields.conversationId === id)) {
+  // Canonical history is re-fetched after EVERY stream end (once: at [DONE]
+  // if it came); it is also the recovery path after a stream error (which
+  // already asked once at failure).
+  if (id && !finalStream.refreshed && !effects.some((effect) => effect.message === 'refresh' && effect.fields.conversationId === id)) {
     effects.push(post('refresh', { conversationId: id }));
   }
   return { state: next, effects };
+}
+
+/** An assistant message addressed to the user, finished, ending the turn. */
+function isFinalAnswer(raw) {
+  return !!raw && raw.author?.role === 'assistant' && raw.status === 'finished_successfully' && raw.end_turn === true
+    && (raw.recipient ?? 'all') === 'all';
 }
 
 /** Apply decoder events of one stream. Exported for tests. */
@@ -348,7 +376,7 @@ export function applyStreamEvents(state, streamId, events, P) {
       next = noteDeviceConversation(next, conversationId, stream.title);
       effects.push(save('localConversations'));
     } else if (!next.list.some((item) => item.id === conversationId)) {
-      next = { ...next, list: upsertListItem(next.list, { id: conversationId, title: '', updatedAt: Math.floor(Date.now() / 1000), local: true }, { front: true }) };
+      next = { ...next, list: upsertListItem(next.list, { id: conversationId, title: stream.title || '', updatedAt: Math.floor(Date.now() / 1000), local: true }, { front: true }) };
     }
     const buffered = stream.buffered;
     stream = { ...stream, buffered: [] };
@@ -363,6 +391,15 @@ export function applyStreamEvents(state, streamId, events, P) {
       if (event.conversationId) adoptConversation(event.conversationId);
       if (stream.conversationId) applyMessage(stream.conversationId, event.raw);
       else if (stream.buffered.length < MAX_BUFFERED_EVENTS) stream = { ...stream, buffered: [...stream.buffered, event.raw] };
+      // The final answer is complete: stop showing "generating" right away,
+      // even if the connection lingers before [DONE] / its end.
+      if (isFinalAnswer(event.raw)) stream = { ...stream, finished: true };
+    } else if (event.type === 'done') {
+      stream = { ...stream, finished: true };
+      if (!stream.refreshed && stream.conversationId) {
+        stream = { ...stream, refreshed: true };
+        effects.push(stream.device ? save('localConversations') : post('refresh', { conversationId: stream.conversationId }));
+      }
     } else if (event.type === 'title' && typeof event.title === 'string') {
       if (event.conversationId) adoptConversation(event.conversationId);
       const id = stream.conversationId;
@@ -401,6 +438,12 @@ export function reduceAction(state, action, P) {
   switch (action?.type) {
     case 'open': {
       const id = action.conversationId ?? null;
+      if (isFreeMode(state)) {
+        // Device conversations open in place from storage; only a new chat
+        // asks the official page to start fresh (when it is not already).
+        const next = { ...state, currentId: id, opening: undefined, sendError: null };
+        return { state: next, effects: id === null && state.officialId !== null ? [post('open', { conversationId: null })] : [] };
+      }
       let next = { ...state, currentId: id, opening: id, sendError: null };
       if (id && !state.convs[id]) next.sync = withEntry(next.sync, id, { state: 'loading' });
       return { state: next, effects: [post('open', { conversationId: id })] };
@@ -505,11 +548,11 @@ export function isOffBranch(state) {
 }
 
 export function isRunning(state, conversationId = state.currentId) {
-  return Object.values(state.streams).some((stream) => !stream.failed && (stream.conversationId ?? null) === (conversationId ?? null));
+  return Object.values(state.streams).some((stream) => !stream.failed && !stream.finished && (stream.conversationId ?? null) === (conversationId ?? null));
 }
 
 export function runningIds(state) {
-  return new Set(Object.values(state.streams).filter((stream) => !stream.failed && stream.conversationId).map((stream) => stream.conversationId));
+  return new Set(Object.values(state.streams).filter((stream) => !stream.failed && !stream.finished && stream.conversationId).map((stream) => stream.conversationId));
 }
 
 export function currentDraft(state) {
@@ -528,6 +571,10 @@ export function canSend(state) {
   if (state.bridge.loggedIn === false && !isFreeMode(state)) return { ok: false, reason: 'login' };
   if (state.pending) return { ok: false, reason: 'pending' };
   if (isRunning(state)) return { ok: false, reason: 'running' };
+  if (isFreeMode(state) && (state.currentId ?? null) !== (state.officialId ?? null)) {
+    // The official page is elsewhere: sending would go to ITS conversation.
+    return { ok: false, reason: state.currentId ? 'device-readonly' : 'opening' };
+  }
   if (isOffBranch(state)) return { ok: false, reason: 'branch' };
   if (state.currentId && state.sync[state.currentId]?.state === 'loading' && !currentConversation(state)?.complete) return { ok: false, reason: 'loading' };
   return { ok: true, reason: null };
@@ -598,6 +645,8 @@ const BLOCKED = {
   running: '正在生成回答，请稍候…',
   branch: '正在只读查看其他分支；发送前请切回最新分支',
   loading: '对话仍在加载，请加载完成后再发送',
+  'device-readonly': '该本机对话已无法继续，可新建对话',
+  opening: '正在打开新对话…',
 };
 
 export function blockedText(reason) {

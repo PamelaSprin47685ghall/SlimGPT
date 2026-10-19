@@ -110,7 +110,8 @@ export function conversationToMarkdown(conversation, options = {}) {
     const settings = { includeReasoning: opts.includeReasoning === true, includeTools: opts.includeTools === true };
     const numbering = new Map();
     const sections = [];
-    if (conversation.title) sections.push(`# ${conversation.title.replace(/\s+/g, ' ').trim()}`);
+    const title = typeof opts.title === 'string' && opts.title.trim() ? opts.title : conversation.title;
+    if (title) sections.push(`# ${title.replace(/\s+/g, ' ').trim()}`);
     for (const turn of selectTurns(conversation, opts.leafId ?? null)) {
       if (turn.user) {
         const body = messageToMarkdown(turn.user, settings, numbering);

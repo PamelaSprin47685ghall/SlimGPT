@@ -156,10 +156,12 @@ test('runtime free mode: a free-mode request makes hello ready without Authoriza
   await settle();
   assert.ok(!fetched.some((path) => path.startsWith('/backend-api/')), fetched.join());
 
-  // Opening a free conversation is a real navigation to /uc/<id>.
+  // Opening a device conversation never navigates (the UI shows it from
+  // storage; /uc/<id> loads are redirected by the server). New chat on / is a no-op.
   env.fromFrame(UI('open', { conversationId: FREE_ID }));
   env.fromFrame(UI('open', { conversationId: null }));
-  assert.deepEqual(env.assigned, [`https://chatgpt.com/uc/${FREE_ID}`]);
+  await settle();
+  assert.deepEqual(env.assigned, []);
 
   // A signed-in session always wins.
   await env.win.fetch('/backend-api/me', { headers: { authorization: 'Bearer t' } });
@@ -183,6 +185,11 @@ test('runtime free mode: /uc/ route and loaded free-mode scripts are evidence; n
   assert.equal(location.conversationId, FREE_ID);
   await new Promise((resolve) => setTimeout(resolve, 1400));
   assert.deepEqual(fetched, []);
+  // On /uc/<id>: opening another device conversation stays put; new chat goes to /.
+  env.fromFrame(UI('open', { conversationId: '00000000-0000-4000-8000-0000000000ff' }));
+  env.fromFrame(UI('open', { conversationId: null }));
+  await settle();
+  assert.deepEqual(env.assigned, ['https://chatgpt.com/']);
 
   let observerCallback = null;
   const scripts = fakeWindow(async () => new Response('{}'), {
@@ -219,4 +226,29 @@ test('runtime free mode: the NDJSON stream reaches the UI as a conversation-sour
   assert.ok(!JSON.stringify(env.posted).includes('SECRET'));
   assert.equal(env.posted.filter((p) => p.message.type === 'stream-chunk').map((p) => p.message.chunk).join(''), body);
   assert.ok(env.posted.some((p) => p.message.type === 'stream-end' && p.message.ok === true));
+});
+
+test('runtime: official paged history with has_versions triggers one own full-tree load (real HAR body)', async () => {
+  const { readFileSync } = await import('node:fs');
+  const paged = readFileSync(new URL('../fixtures/protocol/har-history-after-regenerate.json', import.meta.url), 'utf8');
+  const CONV = JSON.parse(paged).conversation_id;
+  const requests = [];
+  const env = fakeWindow(async (url) => {
+    const path = new URL(url, 'https://chatgpt.com').pathname;
+    requests.push(path);
+    if (path === `/backend-api/conversations/${CONV}`) return new Response(paged, { headers: { 'content-type': 'application/json' } });
+    return new Response(JSON.stringify({ conversation_id: CONV, mapping: {} }), { headers: { 'content-type': 'application/json' } });
+  }, { url: `https://chatgpt.com/c/${CONV}` });
+  installHook(env.win);
+  env.frameListeners.load();
+  await env.win.fetch('/backend-api/me', { headers: { authorization: 'Bearer t' } });
+  await settle();
+  const before = requests.length;
+  await env.win.fetch(`/backend-api/conversations/${CONV}?num_turns=10&include_has_versions=true`, { headers: { authorization: 'Bearer t' } });
+  await settle();
+  const own = requests.slice(before).filter((path) => path === `/backend-api/conversation/${CONV}`);
+  assert.equal(own.length, 1, 'full mapping fetched once');
+  const bodies = env.posted.filter((p) => p.message.type === 'conversation').map((p) => p.message.body);
+  assert.ok(bodies.includes(paged), 'official paged view forwarded as is');
+  assert.ok(bodies.some((body) => body.includes('"mapping"')), 'full tree forwarded');
 });

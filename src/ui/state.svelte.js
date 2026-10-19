@@ -13,6 +13,12 @@ export function createStore({ protocol = P, bridgeFactory = createBridgeClient, 
   let state = $state.raw(L.initialState());
   const saveTimers = new Map();
   let bridge = null;
+  // Nothing is written before the stored values are read back: an early save
+  // (e.g. a free-mode stream right after reload) would otherwise overwrite
+  // the device conversations with only the new one.
+  let hydrated = false;
+  let localUnreadable = false;
+  const deferred = new Set();
 
   function run(effects) {
     for (const effect of effects) {
@@ -23,6 +29,8 @@ export function createStore({ protocol = P, bridgeFactory = createBridgeClient, 
 
   function scheduleSave(key) {
     if (!STORAGE_KEYS.includes(key) || !bridge?.connected) return;
+    if (!hydrated) { deferred.add(key); return; }
+    if (key === 'localConversations' && localUnreadable) return;
     clearTimeout(saveTimers.get(key));
     saveTimers.set(key, setTimeout(() => {
       saveTimers.delete(key);
@@ -55,7 +63,19 @@ export function createStore({ protocol = P, bridgeFactory = createBridgeClient, 
     win?.addEventListener?.('offline', offline);
     if (win?.navigator && win.navigator.onLine === false) offline();
     const grace = setTimeout(() => dispatch({ type: 'bridge-timeout' }), BRIDGE_GRACE_MS);
-    void bridge.storageGet(['settings', 'drafts', 'conversationIndex', 'localConversations']).then((stored) => { state = L.hydrate(state, stored, protocol); });
+    const afterHydrate = () => {
+      hydrated = true;
+      for (const key of deferred) scheduleSave(key);
+      deferred.clear();
+    };
+    let reading;
+    try { reading = Promise.resolve(bridge.storageGet(['settings', 'drafts', 'conversationIndex', 'localConversations'])); } catch (error) { reading = Promise.reject(error); }
+    void reading
+      .then((stored) => {
+        if (!stored || typeof stored !== 'object') localUnreadable = true;
+        state = L.hydrate(state, stored || {}, protocol);
+      }, () => { localUnreadable = true; })
+      .finally(afterHydrate);
     return () => {
       clearTimeout(grace);
       win?.removeEventListener?.('online', online);

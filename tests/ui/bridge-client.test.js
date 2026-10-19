@@ -44,7 +44,7 @@ test('accepts only well-formed page messages from the parent and the exact origi
   assert.deepEqual(received, ['hello'], 'no delivery after destroy');
 });
 
-test('storage requests resolve with the matching storage-result and time out to {}', async () => {
+test('storage requests resolve with the matching storage-result; a read that times out is null, a write {}', async () => {
   const win = fakeWindow();
   const received = [];
   const client = createBridgeClient({ window: win, onMessage: (m) => received.push(m.type), timeoutMs: 20 });
@@ -56,6 +56,10 @@ test('storage requests resolve with the matching storage-result and time out to 
   win.emit({ source: win.parent, origin: PAGE_ORIGIN, data: bridgeMessage('page-to-ui', 'storage-result', { requestId: request.requestId, values: { drafts: { a: 'x' } } }) });
   assert.deepEqual(await pending, { drafts: { a: 'x' } });
   assert.deepEqual(await client.storageSet({ settings: {} }), {}, 'unanswered request times out');
+  assert.equal(await client.storageGet(['localConversations']), null, 'unreadable storage is not "empty"');
+  const failed = client.storageGet(['localConversations']);
+  win.emit({ source: win.parent, origin: PAGE_ORIGIN, data: bridgeMessage('page-to-ui', 'storage-result', { requestId: win.parent.posted.at(-1).data.requestId, ok: false, values: {}, error: 'quota' }) });
+  assert.equal(await failed, null);
   assert.deepEqual(received, [], 'storage results are not forwarded to the app');
   client.destroy();
 });

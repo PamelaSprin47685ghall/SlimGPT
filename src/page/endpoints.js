@@ -7,7 +7,8 @@
 //   POST /backend-api/(f/)conversation/resume  official SSE stream (resume)
 //   GET  /backend-api/conversation/<uuid>      official full history (mapping)
 //   GET  /backend-api/conversations/<uuid>     official paged history (what the app uses)
-//   GET  /backend-api/conversations            conversation list
+//   GET  /backend-api/conversations            conversation list (unfiltered: no
+//                                              conversation_origin / archived / starred filter)
 //   POST /unauth-mweb/conversation/updates     logged-out (free mode) NDJSON stream
 // Matching is on the exact pathname of a same-origin URL; query strings are
 // ignored, everything else (memories, prepare, init, textdocs, …) is rejected.
@@ -71,6 +72,11 @@ export function classifyEndpoint(method, rawUrl, pageOrigin) {
     return isConversationId(id) ? { kind: 'history', conversationId: id } : null;
   }
   if (LIST_PATH.test(path)) {
+    // Filtered side lists (e.g. `conversation_origin=tpp`, archived, starred)
+    // are not the sidebar list: observing them would replace it with a
+    // partial or empty one.
+    const query = url.searchParams;
+    if (query.has('conversation_origin') || query.get('is_archived') === 'true' || query.get('is_starred') === 'true') return null;
     const offset = Number(url.searchParams.get('offset') || 0);
     return { kind: 'list', offset: Number.isInteger(offset) && offset >= 0 ? offset : 0 };
   }
@@ -136,13 +142,14 @@ export function conversationIdFromRoute(rawUrl, pageOrigin) {
 }
 
 /**
- * Ids carried by the official submit/resume request body. Reads only the
- * top-level envelope and the last user message id; never message content.
+ * Ids carried by the official submit/resume request body, plus the plain text
+ * the user just typed (string parts of the last user message) so the UI can
+ * show the question before the stream echoes it. Nothing else is read.
  * @param {unknown} bodyText
- * @returns {{ conversationId: string|null, userMessageId: string|null, parentMessageId: string|null }}
+ * @returns {{ conversationId: string|null, userMessageId: string|null, parentMessageId: string|null, userText: string|null }}
  */
 export function readStreamRequestIds(bodyText) {
-  const empty = { conversationId: null, userMessageId: null, parentMessageId: null };
+  const empty = { conversationId: null, userMessageId: null, parentMessageId: null, userText: null };
   if (typeof bodyText !== 'string' || !bodyText || bodyText.length > MAX_REQUEST_BODY_CHARS) return empty;
   let value;
   try {
@@ -154,16 +161,18 @@ export function readStreamRequestIds(bodyText) {
   const conversationId = isConversationId(value.conversation_id) ? value.conversation_id : null;
   const parentMessageId = idString(value.parent_message_id);
   let userMessageId = null;
+  let userText = null;
   if (Array.isArray(value.messages)) {
     for (let index = value.messages.length - 1; index >= 0; index -= 1) {
       const message = value.messages[index];
       if (message && typeof message === 'object' && message.author?.role === 'user') {
         userMessageId = idString(message.id);
+        userText = promptText(message.content);
         break;
       }
     }
   }
-  return { conversationId, userMessageId, parentMessageId };
+  return { conversationId, userMessageId, parentMessageId, userText };
 }
 
 /**
@@ -203,6 +212,13 @@ export function readFreeModeRequest(form) {
   } catch {
     return empty;
   }
+}
+
+/** Plain text of a submitted user message (string parts only), bounded. */
+function promptText(content) {
+  if (!content || typeof content !== 'object' || !Array.isArray(content.parts)) return null;
+  const text = content.parts.filter((part) => typeof part === 'string').join('\n');
+  return text && text.length <= MAX_PROMPT_CHARS ? text : null;
 }
 
 function idString(value) {

@@ -25,7 +25,8 @@ export function createBridgeClient({ window: win = globalThis.window, origin = P
       if (entry) {
         waiting.delete(message.requestId);
         clearTimeout(entry.timer);
-        entry.resolve(message.values && typeof message.values === 'object' ? message.values : {});
+        const values = message.values && typeof message.values === 'object' ? message.values : {};
+        entry.resolve(message.ok === false ? entry.failValue : values);
       }
       return;
     }
@@ -46,12 +47,12 @@ export function createBridgeClient({ window: win = globalThis.window, origin = P
     return true;
   }
 
-  function request(type, fields) {
+  function request(type, fields, failValue = {}) {
     if (!parent) return Promise.resolve({});
     const requestId = nextId('req');
     return new Promise((resolve) => {
-      const timer = setTimeout(() => { waiting.delete(requestId); resolve({}); }, timeoutMs);
-      waiting.set(requestId, { resolve, timer });
+      const timer = setTimeout(() => { waiting.delete(requestId); resolve(failValue); }, timeoutMs);
+      waiting.set(requestId, { resolve, timer, failValue });
       send(type, { ...fields, requestId });
     });
   }
@@ -60,13 +61,17 @@ export function createBridgeClient({ window: win = globalThis.window, origin = P
     connected: !!parent,
     send,
     nextId,
-    /** @param {string[]} keys @returns {Promise<object>} never rejects; {} on timeout */
-    storageGet: (keys) => request('storage-get', { keys }),
+    /**
+     * @param {string[]} keys
+     * @returns {Promise<object|null>} never rejects; null when storage could not
+     *   be read (timeout / error), so callers do not mistake it for "empty"
+     */
+    storageGet: (keys) => request('storage-get', { keys }, null),
     /** @param {object} values */
     storageSet: (values) => request('storage-set', { values }),
     destroy() {
       win?.removeEventListener?.('message', listener);
-      for (const entry of waiting.values()) { clearTimeout(entry.timer); entry.resolve({}); }
+      for (const entry of waiting.values()) { clearTimeout(entry.timer); entry.resolve(entry.failValue); }
       waiting.clear();
     },
   };

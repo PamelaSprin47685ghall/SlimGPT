@@ -17,6 +17,7 @@ export const DEFAULT_LIMITS = Object.freeze({
   listPageSize: 100,
   listMaxItems: 500,
   listCooldownMs: 5_000,
+  fullTreeCooldownMs: 5_000,
   backoffBaseMs: 1_500,
   backoffMaxMs: 60_000,
 });
@@ -90,6 +91,8 @@ export function createHistoryLoader(options) {
   let listBootstrapped = false;
   let listLastAt = -Infinity;
   let listQueued = false;
+  let singularMissing = false;     // the full-tree endpoint answered 404/405 (paged only)
+  const lastLoaded = new Map();     // id -> time of the last successful own load
 
   function setHeaders(source) {
     headers = sanitizeHeaders(source);
@@ -136,10 +139,25 @@ export function createHistoryLoader(options) {
     }, delayMs));
   }
 
-  /** The official app fetched this history itself (already forwarded). */
-  function noteObserved(conversationId) {
+  /**
+   * The official app fetched this history itself (already forwarded). Its
+   * paged path view (`/conversations/<id>`) carries only `has_versions`, not
+   * the sibling branches: with `wantsFullTree` the full tree is loaded once
+   * more (coalesced, cooldown- and back-off-gated) unless that endpoint is
+   * known to be unavailable. Returns true when a load was started.
+   */
+  function noteObserved(conversationId, { wantsFullTree = false } = {}) {
     cancelScheduled(conversationId);
-    backoff.delete(conversationId);
+    if (!wantsFullTree) {
+      backoff.delete(conversationId);
+      return false;
+    }
+    if (singularMissing || !isConversationId(conversationId)) return false;
+    const blocked = backoff.get(conversationId);
+    if (blocked && blocked.until > now()) return false;
+    const last = lastLoaded.get(conversationId);
+    if (last !== undefined && now() - last < limits.fullTreeCooldownMs) return false;
+    return load(conversationId);
   }
 
   function cancelScheduled(conversationId) {
@@ -165,6 +183,8 @@ export function createHistoryLoader(options) {
     try {
       const pages = await fetchConversation(conversationId);
       backoff.delete(conversationId);
+      lastLoaded.set(conversationId, now());
+      if (lastLoaded.size > 500) lastLoaded.delete(lastLoaded.keys().next().value);
       pages.forEach((body, index) => {
         emit('conversation', { conversationId, body, page: index + 1, pages: pages.length });
       });
@@ -195,7 +215,9 @@ export function createHistoryLoader(options) {
       return [full.text];
     }
     if (full.status !== 404 && full.status !== 405) throw failure(full);
-    return fetchPaged(conversationId);
+    const pages = await fetchPaged(conversationId);
+    singularMissing = true;
+    return pages;
   }
 
   async function fetchPaged(conversationId) {

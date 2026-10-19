@@ -18,6 +18,12 @@ test('allowlist accepts exactly the official stream, history and list endpoints'
   assert.deepEqual(classifyEndpoint('GET', `/backend-api/conversations/${ID}?num_turns=10&include_has_versions=true`, O), { kind: 'history', conversationId: ID });
   assert.deepEqual(classifyEndpoint('GET', '/backend-api/conversations?offset=28&limit=28', O), { kind: 'list', offset: 28 });
   assert.deepEqual(classifyEndpoint('GET', '/backend-api/conversations', O), { kind: 'list', offset: 0 });
+  // Real HAR: the official app fetches the sidebar list and a filtered (empty) tpp list.
+  const q = 'expand=false&hide_snorlax=false&is_archived=false&is_starred=false&limit=20&order=updated&offset=0';
+  assert.deepEqual(classifyEndpoint('GET', `/backend-api/conversations?exclude_conversation_origin=tpp&${q}`, O), { kind: 'list', offset: 0 });
+  assert.equal(classifyEndpoint('GET', `/backend-api/conversations?conversation_origin=tpp&${q}`, O), null);
+  assert.equal(classifyEndpoint('GET', '/backend-api/conversations?is_archived=true&offset=0', O), null);
+  assert.equal(classifyEndpoint('GET', '/backend-api/conversations?is_starred=true', O), null);
 });
 
 test('allowlist rejects look-alikes (memories, prepare, init, sub-resources, other origins, wrong methods)', () => {
@@ -75,7 +81,7 @@ test('route conversation ids', () => {
   assert.equal(isConversationId('memories'), false);
 });
 
-test('request body ids: envelope + last user message id only', () => {
+test('request body: envelope ids + the last user message id and its plain text only', () => {
   const body = JSON.stringify({
     action: 'next',
     conversation_id: ID,
@@ -85,11 +91,13 @@ test('request body ids: envelope + last user message id only', () => {
       { id: 'u-2', author: { role: 'user' }, content: { content_type: 'text', parts: ['hello'] } },
     ],
   });
-  assert.deepEqual(readStreamRequestIds(body), { conversationId: ID, userMessageId: 'u-2', parentMessageId: 'p-1' });
+  assert.deepEqual(readStreamRequestIds(body), { conversationId: ID, userMessageId: 'u-2', parentMessageId: 'p-1', userText: 'hello' });
   assert.deepEqual(readStreamRequestIds(JSON.stringify({ conversation_id: 'WEB:temp', messages: [] })),
-    { conversationId: null, userMessageId: null, parentMessageId: null });
+    { conversationId: null, userMessageId: null, parentMessageId: null, userText: null });
+  const multimodal = JSON.stringify({ messages: [{ id: 'u', author: { role: 'user' }, content: { content_type: 'multimodal_text', parts: [{ asset_pointer: 'sediment://x' }, 'look'] } }] });
+  assert.equal(readStreamRequestIds(multimodal).userText, 'look', 'string parts only, no asset pointers');
   for (const garbage of [null, '', '{', '[]', '"x"', 42, JSON.stringify({ messages: 'no' }), 'x'.repeat(1024 * 1024 + 1)]) {
-    assert.deepEqual(readStreamRequestIds(garbage), { conversationId: null, userMessageId: null, parentMessageId: null });
+    assert.deepEqual(readStreamRequestIds(garbage), { conversationId: null, userMessageId: null, parentMessageId: null, userText: null });
   }
   assert.equal(readStreamRequestIds(JSON.stringify({ parent_message_id: 'has space' })).parentMessageId, null);
 });

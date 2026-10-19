@@ -23,6 +23,11 @@ import { HOOK_MARK } from './hook-mark.js';
 
 const LOCATION_LOAD_DELAY_MS = 1_200;
 
+/** A paged path view (no `mapping`) that says some message has other versions. Text test only. */
+export function pagedViewWithVersions(body) {
+  return typeof body === 'string' && /"has_versions"\s*:\s*true/.test(body) && !/"mapping"\s*:/.test(body);
+}
+
 /** Install the hook into `win`. Idempotent. */
 export function installHook(win) {
   if (win.__SLIMGPT_HOOK_V2__) return;
@@ -82,14 +87,20 @@ export function installHook(win) {
         activeStreams.add(start.streamId);
         post('stream-start', start);
       },
-      onStreamChunk: (streamId, chunk) => post('stream-chunk', { streamId, chunk }),
+      onStreamChunk(streamId, chunk) {
+        // The official app is idle again once the stream says [DONE], even if
+        // the connection lingers; do not report the composer as busy.
+        if (chunk.includes('data: [DONE]')) activeStreams.delete(streamId);
+        post('stream-chunk', { streamId, chunk });
+      },
       onStreamEnd(streamId, ok) {
         activeStreams.delete(streamId);
         post('stream-end', { streamId, ok });
       },
       onHistory(conversationId, body) {
-        history.noteObserved(conversationId);
         post('conversation', { conversationId, body, page: 1, pages: 1 });
+        // The official paged view hides sibling branches behind `has_versions`.
+        history.noteObserved(conversationId, { wantsFullTree: pagedViewWithVersions(body) });
       },
       onList: (offset, body) => post('conversation-list', { body, offset, complete: listPageComplete(body, offset) }),
     },
@@ -162,12 +173,14 @@ export function installHook(win) {
 
   function navigate(conversationId) {
     if (auth === 'anon') {
-      // The logged-out app renders each conversation server-side (with its
-      // continuation state in the composer form): a real navigation is the
-      // only way to make the official composer target this conversation.
-      const path = conversationId ? `/uc/${encodeURIComponent(conversationId)}` : '/';
-      if (win.location.pathname === path) return false;
-      win.location.assign(new URL(path, origin).href);
+      // Logged-out: device conversations are shown by the UI from local
+      // storage, in place. A full load of /uc/<id> is not reliable (the
+      // server often redirects it to /), so it is never used to open one.
+      // Only "new chat" navigates, to give the official composer a fresh,
+      // empty conversation.
+      if (conversationId) return false;
+      if (win.location.pathname === '/') return false;
+      win.location.assign(new URL('/', origin).href);
       return true;
     }
     const target = new URL(conversationId ? `/c/${encodeURIComponent(conversationId)}` : '/', origin);
