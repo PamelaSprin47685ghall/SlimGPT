@@ -1,6 +1,6 @@
 {
   "name": "slimgpt",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,14 +9,10 @@
     "build:extension": "node scripts/build.mjs chrome",
     "build:firefox": "node scripts/build.mjs firefox",
     "build:orion": "node scripts/build.mjs orion",
-    "live:smoke": "npm run build:extension && node scripts/live-smoke.mjs",
-    "live:smoke:real": "npm run build:extension && node scripts/live-smoke.mjs --live",
-    "test": "node --test tests/protocol tests/page",
+    "test": "node --test tests/protocol tests/page tests/ui",
     "test:markdown": "node scripts/markdown-smoke.mjs",
-    "check": "node --check src/page/hook.js && node --check src/page/runtime.js && node --check src/page/bridge.js && node --check src/page/bridge-core.js && node --check src/page/fetch-tee.js && node --check src/page/history.js && node --check src/page/composer.js && node --check src/page/dom.js && node --check src/page/takeover.js && node --check src/page/link.js && node --check src/page/endpoints.js && node --check src/shared/bridge-protocol.js && node --check src/shared/origin.js && node --check scripts/build.mjs && node --check vite.config.js && node -e \"const fs=require('node:fs'); for (const f of ['manifest.json','manifest.firefox.json','manifest.orion.json']) JSON.parse(fs.readFileSync(f,'utf8'))\"",
-    "test:page": "node --test tests/page",
-    "test:legacy": "node --test tests/*.test.js",
-    "build:legacy": "node scripts/build.mjs chrome --legacy && node scripts/build.mjs firefox --legacy && node scripts/build.mjs orion --legacy"
+    "check": "node scripts/check.mjs",
+    "test:page": "node --test tests/page"
   },
   "dependencies": {
     "highlight.js": "11.12.0",

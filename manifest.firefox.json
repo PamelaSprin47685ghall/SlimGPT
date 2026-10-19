@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "SlimGPT",
   "description": "A lightweight takeover UI for your own ChatGPT web session. Firefox uses a page-world bridge and never reads cookies.",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "icons": {
     "48": "icons/slimgpt-48.png",
     "128": "icons/slimgpt-128.png"

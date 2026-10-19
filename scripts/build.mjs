@@ -5,18 +5,16 @@ import { deflateRawSync, deflateSync } from 'node:zlib';
 import { build as viteBuild } from 'vite';
 import { outDirFor, pageScriptConfig, TARGETS } from '../vite.config.js';
 
-// Usage: node scripts/build.mjs <chrome|firefox|orion> [--legacy]
-//   default   page scripts from src/page (main-hook.js + isolated-bridge.js)
-//   --legacy  pre-0.4 page scripts (root main-mitm.js + isolated-bridge.js);
-//             removed in the clean-break cutover.
+// Usage: node scripts/build.mjs <chrome|firefox|orion>
+//   1. vite builds the UI frame (index.html → src/ui)
+//   2. src/page/bridge.js → isolated-bridge.js, src/page/hook.js → main-hook.js (classic IIFE)
+//   3. manifest copied, referenced files asserted, release archive written
 const target = process.argv[2];
-const legacy = process.argv.includes('--legacy');
 if (!TARGETS.includes(target)) {
-  throw new Error('Usage: node scripts/build.mjs <chrome|firefox|orion> [--legacy]');
+  throw new Error('Usage: node scripts/build.mjs <chrome|firefox|orion>');
 }
 
 await ensureIcons();
-await assertUiBuildable();
 await run(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['vite', 'build', '--mode', target]);
 
 const output = outDirFor(target);
@@ -24,43 +22,25 @@ const manifestPath = target === 'chrome' ? 'manifest.json' : `manifest.${target}
 await mkdir(output, { recursive: true });
 const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
 
-if (legacy) {
-  for (const file of ['main-mitm.js', 'isolated-bridge.js']) await cp(file, `${output}/${file}`);
-  await writeFile(`${output}/manifest.json`, `${JSON.stringify(toLegacyManifest(manifest), null, 2)}\n`);
-} else {
-  await viteBuild(pageScriptConfig(target, 'src/page/bridge.js', 'isolated-bridge.js'));
-  await viteBuild(pageScriptConfig(target, 'src/page/hook.js', 'main-hook.js'));
-  await cp(manifestPath, `${output}/manifest.json`);
-}
+await viteBuild(pageScriptConfig(target, 'src/page/bridge.js', 'isolated-bridge.js'));
+await viteBuild(pageScriptConfig(target, 'src/page/hook.js', 'main-hook.js'));
+await cp(manifestPath, `${output}/manifest.json`);
 
-await assertManifestFiles(output, manifest, legacy);
+await assertManifestFiles(output, manifest);
 await reportSizes(output);
 await writeReleaseArchive(output, target, manifest.version);
 
-function toLegacyManifest(source) {
-  const rename = (file) => (file === 'main-hook.js' ? 'main-mitm.js' : file);
-  return {
-    ...source,
-    content_scripts: source.content_scripts.map((script) => ({ ...script, js: script.js.map(rename) })),
-    web_accessible_resources: source.web_accessible_resources.map((entry) => ({
-      ...entry,
-      resources: entry.resources.map(rename),
-    })),
-  };
-}
-
-async function assertManifestFiles(directory, source, legacyBuild) {
+async function assertManifestFiles(directory, source) {
   const files = new Set();
   for (const script of source.content_scripts) for (const file of script.js) files.add(file);
   for (const entry of source.web_accessible_resources) {
     for (const file of entry.resources) if (!file.includes('*')) files.add(file);
   }
   for (const file of files) {
-    const name = legacyBuild && file === 'main-hook.js' ? 'main-mitm.js' : file;
     try {
-      await stat(`${directory}/${name}`);
+      await stat(`${directory}/${file}`);
     } catch {
-      throw new Error(`manifest references missing file: ${directory}/${name}`);
+      throw new Error(`manifest references missing file: ${directory}/${file}`);
     }
   }
 }
@@ -72,29 +52,6 @@ async function reportSizes(directory) {
     .map((file) => ({ name: file.name, bytes: file.data.length, gzip: deflateSync(file.data, { level: 9 }).length }));
   for (const row of rows) {
     console.log(`  ${row.name.padEnd(44)} ${(row.bytes / 1024).toFixed(1).padStart(8)} kB   ~${(row.gzip / 1024).toFixed(1)} kB deflate`);
-  }
-}
-
-// index.html is owned by the UI workstream. Until it switches to the new UI
-// (src/ui/main.js), the legacy UI needs Framework7, which is no longer a
-// dependency. Fail early with an actionable message instead of a resolver trace.
-async function assertUiBuildable() {
-  const html = await readFile('index.html', 'utf8');
-  if (!html.includes('/src/main.js')) return;
-  const missing = [];
-  for (const name of ['framework7', 'framework7-svelte', 'smol-toml']) {
-    try {
-      await stat(`node_modules/${name}/package.json`);
-    } catch {
-      missing.push(name);
-    }
-  }
-  if (missing.length) {
-    throw new Error(
-      `index.html still loads the legacy UI (src/main.js), which needs ${missing.join(', ')}. ` +
-      'Merge the new UI (cbo/ui) or install them temporarily: ' +
-      'npm i --no-save framework7@9.1.3 framework7-svelte@9.1.3 smol-toml@1.8.0',
-    );
   }
 }
 
