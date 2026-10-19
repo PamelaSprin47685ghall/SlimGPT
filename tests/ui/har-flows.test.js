@@ -22,7 +22,10 @@ const afterRegen = fixture('har-history-after-regenerate.json');
 const stoppedSse = (() => {
   const first = regenSse.indexOf('\\u4e0b\\u9762');
   const cut = regenSse.indexOf('event: delta', first) + 30; // inside the following event
-  return regenSse.slice(0, cut).replace(/00000000-0000-4000-8000-0000000000(0[3-9]|1[0-9])/g, (id) => id.replace('-0000000000', '-9999999999'));
+  return regenSse.slice(0, cut)
+    .replace(/00000000-0000-4000-8000-0000000000(0[3-9]|1[0-9])/g, (id) => id.replace('-0000000000', '-9999999999'))
+    // ...and earlier: the stopped reply was streamed ~40 s before the regenerate.
+    .replace(/"create_time":179240099(\d)/g, (_, digit) => `"create_time":179240095${digit}`);
 })();
 
 function run(state, messages) {
@@ -80,7 +83,9 @@ test('HAR: Stop mid-stream → quiet interruption; regenerate → 2/2 with both 
       if (body) state = run(state, [history(body)]).state;
       assert.deepEqual(shape(state), [{ user: USER, replies: [ANSWER], replyCount: 2 }], body ? 'after history' : 'live');
       const turn = L.currentTurns(state, P)[0];
-      const other = L.reduceAction(state, { type: 'switch-branch', nodeId: turn.replyBranch.siblingIds[1], delta: -1 }, P).state;
+      // The regenerated answer is the newer branch: ‹ 2/2 ›, older one first.
+      assert.equal(turn.replyBranch.index, 1, body ? 'after history: 2/2' : 'live: 2/2');
+      const other = L.reduceAction(state, { type: 'switch-branch', nodeId: turn.replyBranch.siblingIds[turn.replyBranch.index], delta: -1 }, P).state;
       const otherTurns = L.currentTurns(other, P);
       assert.equal(otherTurns[0].replies.length, 1, 'older branch has its (stopped) reply');
       assert.equal(otherTurns[0].replies[0].status, 'interrupted');

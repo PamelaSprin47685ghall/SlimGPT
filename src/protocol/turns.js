@@ -46,12 +46,47 @@ function producesContent(conversation, nodeId) {
   return false;
 }
 
+/**
+ * When a branch began: its own create_time, else (hidden system / context
+ * nodes often have none) the earliest create_time below it. A branch with no
+ * time at all is one being streamed right now: newest.
+ */
+function branchTime(conversation, nodeId) {
+  const own = conversation.nodes.get(nodeId)?.message?.createdAt;
+  if (Number.isFinite(own)) return own;
+  let best = Infinity;
+  const stack = [nodeId];
+  const seen = new Set();
+  while (stack.length && seen.size < 10_000) {
+    const id = stack.pop();
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const node = conversation.nodes.get(id);
+    if (!node) continue;
+    const time = node.message?.createdAt;
+    if (Number.isFinite(time) && time < best) best = time;
+    for (const child of node.childIds) stack.push(child);
+  }
+  return best;
+}
+
+/**
+ * Children in branch order: by create_time, ties by id. Independent of the
+ * server's `children` order and of the order sources were merged in, so the
+ * position shown always matches the official ‹ n/m ›.
+ */
+function orderedChildren(conversation, ids) {
+  const keyed = ids.map((id) => ({ id, time: branchTime(conversation, id) }));
+  keyed.sort((a, b) => (a.time === b.time ? (a.id < b.id ? -1 : a.id > b.id ? 1 : 0) : a.time < b.time ? -1 : 1));
+  return keyed.map((entry) => entry.id);
+}
+
 function siblingsOf(conversation, nodeId) {
   const node = conversation.nodes.get(nodeId);
   const parent = node?.parentId ? conversation.nodes.get(node.parentId) : null;
   if (!parent) return [nodeId];
   const siblings = parent.childIds.filter((id) => id === nodeId || producesContent(conversation, id));
-  return siblings.includes(nodeId) ? siblings : [...siblings, nodeId];
+  return orderedChildren(conversation, siblings.includes(nodeId) ? siblings : [...siblings, nodeId]);
 }
 
 function branchInfo(conversation, nodeId) {
@@ -70,16 +105,9 @@ function defaultLeaf(conversation) {
 }
 
 function newestChild(conversation, node) {
-  let best = null;
-  let bestTime = -Infinity;
   const productive = node.childIds.filter((id) => producesContent(conversation, id));
-  for (const id of productive.length ? productive : node.childIds) {
-    const child = conversation.nodes.get(id);
-    if (!child) continue;
-    const time = child.message?.createdAt ?? -Infinity;
-    if (best === null || time >= bestTime) { best = id; bestTime = time; }
-  }
-  return best;
+  const candidates = (productive.length ? productive : node.childIds).filter((id) => conversation.nodes.has(id));
+  return candidates.length ? orderedChildren(conversation, candidates).at(-1) : null;
 }
 
 /** Follow the newest child down to a leaf. */
