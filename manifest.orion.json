@@ -18,7 +18,7 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["index.html", "assets/*", "main-mitm.js"],
+      "resources": ["index.html", "assets/*", "main-hook.js"],
       "matches": ["https://chatgpt.com/*"]
     }
   ]
