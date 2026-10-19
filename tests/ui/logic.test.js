@@ -222,12 +222,14 @@ test('send: guarded, single in flight, failure keeps the draft and explains, tim
 });
 
 test('stop, show-official and effort map to page commands', () => {
-  const h = harness().ready();
+  const h = harness();
+  h.page('hello', { ready: true, loggedIn: true, efforts: ['standard', 'extended'] });
   h.act('open', { conversationId: 'c1' });
   h.act('stop');
   h.act('continue', { messageId: 'a9' }); // removed action: ignored
   h.act('show-official');
   h.act('set-effort', { effort: 'extended' });
+  h.act('set-effort', { effort: 'heavy' }); // not offered: saved, not sent
   h.act('set-effort', { effort: '' });
   assert.deepEqual(h.posts().slice(1).map((e) => [e.message, e.fields]), [
     ['stop', {}], ['show-official', {}], ['set-effort', { effort: 'extended' }],

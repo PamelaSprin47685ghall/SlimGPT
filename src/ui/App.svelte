@@ -21,6 +21,7 @@
   import Composer from './components/Composer.svelte';
   import StatusLine from './components/StatusLine.svelte';
   import { downloadText, safeFileName } from './lib/download.js';
+  import { stabilizeTurns } from './lib/stable-turns.js';
 
   /** @type {{ store?: ReturnType<typeof createStore> }} */
   let { store: provided } = $props();
@@ -29,10 +30,26 @@
   setContext('slimgpt', { protocol: P, dispatch: (action) => store.dispatch(action) });
 
   const s = $derived(store.state);
+  // Unchanged turns keep their identity: a streaming delta re-renders only its own turn.
+  let shownTurns = [];
   const view = $derived.by(() => {
-    try { return { turns: L.currentTurns(s, P), failed: false }; } catch { return { turns: [], failed: true }; }
+    try { shownTurns = stabilizeTurns(shownTurns, L.displayTurns(s, P)); return { turns: shownTurns, failed: false }; } catch { return { turns: [], failed: true }; }
   });
   const running = $derived(L.isRunning(s));
+  // Stable sidebar inputs: a streaming delta does not touch the list, so it
+  // must not hand the sidebar a new array / Set (that re-renders every row).
+  let lastList = { source: null, mode: null, value: [] };
+  const sidebarList = $derived.by(() => {
+    const mode = L.isFreeMode(s);
+    if (lastList.source !== s.list || lastList.mode !== mode) lastList = { source: s.list, mode, value: L.visibleList(s) };
+    return lastList.value;
+  });
+  let lastRunning = new Set();
+  const sidebarRunning = $derived.by(() => {
+    const next = L.runningIds(s);
+    if (next.size !== lastRunning.size || [...next].some((id) => !lastRunning.has(id))) lastRunning = next;
+    return lastRunning;
+  });
   const check = $derived(L.canSend(s));
   const offBranch = $derived(L.isOffBranch(s));
   const conv = $derived(L.currentConversation(s));
@@ -40,6 +57,13 @@
   const status = $derived(view.failed ? { tone: 'error', text: '消息解析失败', action: { label: '重试同步', type: 'retry-sync' } } : L.statusLine(s));
   const sendError = $derived(s.sendError && (s.sendError.conversationId ?? null) === (s.currentId ?? null) ? L.sendErrorText(s.sendError.code) : '');
   const feature = $derived(L.features(s));
+  // Primitive props as their own deriveds: a prop written as \`s.x\` would make
+  // every row / message that reads it re-run on ANY state change (each
+  // streaming delta), even when its value did not change.
+  const currentId = $derived(s.currentId);
+  const freeMode = $derived(L.isFreeMode(s));
+  const branchesOn = $derived(feature.branches);
+  const turns = $derived(view.turns);
   const emptyText = $derived(!s.currentId ? '开始新的对话' : s.sync[s.currentId]?.state === 'loading' ? '正在加载对话…' : conv ? '对话暂无消息' : L.isFreeMode(s) ? '这个免费模式对话没有保存在本机' : '对话暂未加载');
 
   onMount(() => store.start());
@@ -61,7 +85,7 @@
 
 <F7App {...f7params}>
   <Panel left cover visibleBreakpoint={960}>
-    <Sidebar list={L.visibleList(s)} currentId={s.currentId} running={L.runningIds(s)} freeMode={L.isFreeMode(s)} onopen={open} />
+    <Sidebar list={sidebarList} {currentId} running={sidebarRunning} {freeMode} onopen={open} />
   </Panel>
   <View main>
     <Page pageContent={false} withSubnavbar={!!status} class="chat">
@@ -72,10 +96,10 @@
         {#if status}<StatusLine {status} onaction={(type) => store.dispatch({ type })} />{/if}
       </Navbar>
       <Thread
-        turns={view.turns}
-        conversationKey={s.currentId ?? ''}
+        {turns}
+        conversationKey={currentId ?? ''}
         {running}
-        branches={feature.branches}
+        branches={branchesOn}
         empty={emptyText}
       />
       <Composer
@@ -88,6 +112,8 @@
         error={sendError}
         efforts={s.efforts}
         effort={s.settings.effort}
+        currentEffort={s.effort.current}
+        effortError={L.effortErrorText(s.effortError)}
         onsend={(text) => store.dispatch({ type: 'send', text })}
         onstop={() => store.dispatch({ type: 'stop' })}
         ondraft={(text) => store.dispatch({ type: 'draft', text })}

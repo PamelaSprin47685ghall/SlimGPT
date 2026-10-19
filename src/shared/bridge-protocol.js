@@ -14,7 +14,8 @@
 // `event.source === frame.contentWindow && event.origin === <extension origin>`.
 //
 // Page → UI
-//   hello            { ready: boolean, loggedIn: boolean|null, auth: AuthMode, url: string, efforts: EffortValue[] }   (efforts additive, C: [] = selector hidden)
+//   hello            { ready: boolean, loggedIn: boolean|null, auth: AuthMode, url: string, efforts: EffortValue[] }   (efforts additive, C: values the
+//                    account offers now; fewer than 2 = no choice, selector hidden; [] when logged out)
 //                    auth 'user' = signed in (server history); 'anon' = logged-out free mode
 //                    (no server history: the UI keeps conversations on this device);
 //                    'unknown' = not determined yet. ready: user → official headers seen;
@@ -33,7 +34,8 @@
 //   stream-end       { streamId: string, ok: boolean }
 //   send-result      { commandId: string, ok: boolean, error: SendErrorCode|null }
 //   command-result   { commandId: string|null, command: 'stop'|'switch-branch'|'set-effort', ok: boolean, error: CommandErrorCode|null }   (additive, C)
-//   effort           { available: boolean, effort: EffortValue|null }                                       (additive, C)
+//   effort           { available: boolean, effort: EffortValue|null }   (additive, C) effort the official app uses now
+//                    (last submit body / confirmed choice); null = unknown (official default)
 //   takeover         { visible: boolean, reason: 'ready'|'user'|'blocking-official-ui'|'composer-unavailable' }
 //   storage-result   { requestId: string, ok: boolean, values: object, error: string|null }   (sent by the isolated bridge)
 //
@@ -92,10 +94,14 @@ export const COMMAND_ERROR_CODES = Object.freeze([
 export const CONVERSATION_ERROR_CODES = Object.freeze(['auth', 'rate-limit', 'network', 'too-large', 'invalid']);
 
 /**
- * Reasoning effort, lowest → highest, mapped linearly onto the official
- * slider's range. @typedef {'lowest'|'low'|'medium'|'high'|'highest'} EffortValue
+ * Reasoning effort (思考强度): the official app's own value names, e.g.
+ * "instant", "standard", "extended" — whatever the account offers
+ * (settings/user `available_options.backend_reasoning_effort`, or a model's
+ * `thinking_efforts`). Not a fixed enum. @typedef {string} EffortValue
  */
-export const EFFORT_VALUES = Object.freeze(['lowest', 'low', 'medium', 'high', 'highest']);
+export const EFFORT_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
+/** @param {unknown} value */
+export const isEffortValue = (value) => typeof value === 'string' && EFFORT_PATTERN.test(value);
 
 /** @typedef {'user'|'anon'|'unknown'} AuthMode */
 export const AUTH_MODES = Object.freeze(['user', 'anon', 'unknown']);

@@ -11,7 +11,8 @@
 // /uc/<id> route. Free mode has no server history: nothing is loaded from the
 // server, the UI keeps conversations on the device.
 
-import { PAGE_ORIGIN, EFFORT_VALUES } from '../shared/bridge-protocol.js';
+import { PAGE_ORIGIN, isEffortValue } from '../shared/bridge-protocol.js';
+import { createEffortTracker } from './effort.js';
 import { createFetchTee, installFetchTee } from './fetch-tee.js';
 import { createHistoryLoader, listPageComplete } from './history.js';
 import { createComposerDriver } from './composer.js';
@@ -21,7 +22,12 @@ import { createPageLink } from './link.js';
 import { conversationIdFromRoute, isConversationId, isFreeModeRoute, isFreeModeUrl } from './endpoints.js';
 import { HOOK_MARK } from './hook-mark.js';
 
-const LOCATION_LOAD_DELAY_MS = 1_200;
+// After a route change, our own history load is only a fallback for when the
+// official app does not fetch it. The official fetch starts within a few
+// milliseconds of the route change; once it has started we wait for its
+// response (up to OFFICIAL_HISTORY_GRACE_MS) instead of duplicating it.
+const LOCATION_LOAD_DELAY_MS = 400;
+const OFFICIAL_HISTORY_GRACE_MS = 8_000;
 
 /** A paged path view (no `mapping`) that says some message has other versions. Text test only. */
 export function pagedViewWithVersions(body) {
@@ -45,6 +51,7 @@ export function installHook(win) {
   let resourceObserver = null;
   let lastHref = null;
   let lastConversationId = null;
+  const effort = createEffortTracker();
 
   const link = createPageLink({ window: win, onCommand: handleCommand, onUiReady: announce });
   const post = link.post;
@@ -97,12 +104,16 @@ export function installHook(win) {
         activeStreams.delete(streamId);
         post('stream-end', { streamId, ok });
       },
+      onHistoryRequest: (conversationId) => history.noteRequested(conversationId, OFFICIAL_HISTORY_GRACE_MS),
       onHistory(conversationId, body) {
         post('conversation', { conversationId, body, page: 1, pages: 1 });
         // The official paged view hides sibling branches behind `has_versions`.
         history.noteObserved(conversationId, { wantsFullTree: pagedViewWithVersions(body) });
       },
       onList: (offset, body) => post('conversation-list', { body, offset, complete: listPageComplete(body, offset) }),
+      onModels: (body) => { if (effort.noteModels(body)) announceEffort(); },
+      onUserSettings: (body) => { if (effort.noteSettings(body)) announceEffort(); },
+      onSubmitChoice: (choice) => { if (effort.noteSubmit(choice)) announceEffort(); },
     },
   });
   installFetchTee(win, tee);
@@ -146,17 +157,29 @@ export function installHook(win) {
     }
   }
 
+  /** Effort values the signed-in account offers now (none when logged out). */
+  const efforts = () => (auth === 'user' ? effort.efforts() : []);
+
   function sendHello() {
-    // Effort control is unverified against the live UI: advertise none until it is.
     const ready = auth === 'anon' ? true : history.hasHeaders();
     const reportedLogin = auth === 'anon' ? false : loggedIn;
-    post('hello', { ready, loggedIn: reportedLogin, auth, url: win.location.href, efforts: [] });
+    post('hello', { ready, loggedIn: reportedLogin, auth, url: win.location.href, efforts: efforts() });
+  }
+
+  function postEffort() {
+    post('effort', { available: efforts().length > 1, effort: auth === 'user' ? effort.current() : null });
+  }
+
+  function announceEffort() {
+    sendHello();
+    postEffort();
   }
 
   function announce() {
     sendHello();
     post('location', { url: win.location.href, conversationId: lastConversationId });
     post('takeover', { visible: takeover.isVisible(), reason: takeover.reason() });
+    postEffort();
   }
 
   function checkLocation() {
@@ -232,9 +255,11 @@ export function installHook(win) {
       case 'switch-branch':
         return reply(message, 'switch-branch', composer.switchBranch(message.messageId, Number(message.direction)));
       case 'set-effort': {
-        const result = await reply(message, 'set-effort', composer.setEffort(message.effort));
-        const reached = result.ok && EFFORT_VALUES.includes(message.effort) ? message.effort : null;
-        post('effort', { available: result.ok || result.error !== 'control-not-found', effort: reached });
+        const value = message.effort;
+        const offered = isEffortValue(value) && efforts().length > 1 && efforts().includes(value);
+        const result = await reply(message, 'set-effort', offered ? composer.setEffort(value) : Promise.resolve({ ok: false, error: 'invalid-argument' }));
+        if (result.ok) effort.noteChosen(value);
+        postEffort();
         return;
       }
       case 'show-official':

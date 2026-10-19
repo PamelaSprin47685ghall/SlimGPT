@@ -124,3 +124,4 @@
 }
 .sidebar .conv-list .conv.current .item-title { font-weight: 500; }
 .sidebar .conv-list .conv .item-after { font-size: 12px; color: var(--muted); }
+.effort .effort-error { color: var(--f7-color-red, #d33); }

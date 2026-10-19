@@ -1,6 +1,6 @@
 // Thin adapter over the real DOM used by the composer driver. Keeping every
 // DOM touch here lets the driver be tested against a plain-object fake.
-// The adapter reads official *controls* (buttons, composer, slider) only; it
+// The adapter reads official *controls* (buttons, composer, menus) only; it
 // never reads message content.
 
 /**
@@ -19,9 +19,6 @@
  * @property {(element: Element) => void} click
  * @property {(element: Element) => void} activate
  * @property {(element: Element, key: string) => void} pressKey
- * @property {(element: Element) => boolean} isRangeInput
- * @property {(element: Element, value: number) => void} setRangeValue
- * @property {(element: Element) => { value: number, min: number, max: number }} sliderState
  * @property {(value: string) => string} escape
  */
 
@@ -144,24 +141,6 @@ export function createDomAdapter(win) {
       try { /** @type {HTMLElement} */ (element).focus({ preventScroll: true }); } catch { /* ignore */ }
       element.dispatchEvent(new win.KeyboardEvent('keydown', { key, code: key, bubbles: true, cancelable: true }));
       element.dispatchEvent(new win.KeyboardEvent('keyup', { key, code: key, bubbles: true }));
-    },
-    isRangeInput: (element) => element instanceof win.HTMLInputElement && element.type === 'range',
-    setRangeValue(element, value) {
-      const setter = Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, 'value')?.set;
-      if (setter) setter.call(element, String(value));
-      else /** @type {HTMLInputElement} */ (element).value = String(value);
-      element.dispatchEvent(new win.Event('input', { bubbles: true }));
-      element.dispatchEvent(new win.Event('change', { bubbles: true }));
-    },
-    sliderState(element) {
-      if (element instanceof win.HTMLInputElement) {
-        return { value: Number(element.value), min: Number(element.min || 0), max: Number(element.max || 100) };
-      }
-      return {
-        value: Number(element.getAttribute('aria-valuenow')),
-        min: Number(element.getAttribute('aria-valuemin')),
-        max: Number(element.getAttribute('aria-valuemax')),
-      };
     },
     escape: (value) => (win.CSS?.escape ? win.CSS.escape(value) : String(value).replace(/["\\]/g, '\\$&')),
   };

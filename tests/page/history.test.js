@@ -271,3 +271,27 @@ test('conversation list stops on a repeated page instead of looping', async () =
   assert.equal(h.requests.length, 2);
   assert.equal(h.events.length, 1);
 });
+
+test('noteRequested: an official history fetch in flight defers the fallback load (no duplicate), its response cancels it', async () => {
+  const h = harness(() => json({ mapping: {} }));
+  authed(h);
+  h.loader.schedule(ID, 400);
+  h.advance(100);
+  h.loader.noteRequested(ID, 8000);
+  h.advance(1000);
+  await settle();
+  assert.equal(h.requests.length, 0, 'fallback waits for the official response');
+  h.loader.noteObserved(ID);
+  h.advance(10000);
+  await settle();
+  assert.equal(h.requests.length, 0, 'the official response cancelled it');
+  h.loader.noteRequested(ID, 10); // nothing scheduled: no-op
+  h.advance(100);
+  await settle();
+  assert.equal(h.pendingTimers(), 0);
+  h.loader.schedule(ID, 400);
+  h.loader.noteRequested(ID, 8000);
+  h.advance(8100);
+  await settle();
+  assert.equal(h.requests.length, 1, 'safety net when the official response never shows');
+});

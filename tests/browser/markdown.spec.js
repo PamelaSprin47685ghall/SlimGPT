@@ -471,6 +471,79 @@ if (scenario === 'normal') {
     flushSync();
     equal(sent.at(-1)[0], 'show-official');
   });
+  await test('app: the sent question shows at once; 思考强度 select only with 2+ offered values; long threads open newest-first', async () => {
+    const sent = [];
+    let push;
+    const store = createStore({
+      protocol: RealProtocol,
+      bridgeFactory: ({ onMessage }) => {
+        push = (type, fields = {}) => { onMessage({ type, ...fields }); flushSync(); };
+        let n = 0;
+        return { connected: true, send: (type, fields) => { sent.push([type, fields]); return true; }, nextId: (p) => `${p}-${++n}`,
+          storageGet: async () => ({ settings: { effort: 'extended' } }), storageSet: async () => ({}), destroy() {} };
+      },
+    });
+    const target = document.createElement('div');
+    target.style.height = '700px';
+    document.body.append(target);
+    const app = mount(App, { target, props: { store } });
+    cleanups.push(() => unmount(app));
+    flushSync();
+    await tick();
+    push('hello', { ready: true, loggedIn: true, auth: 'user', efforts: ['instant'] });
+    equal(target.querySelector('.composer .effort'), null, 'one value is no choice');
+    push('hello', { ready: true, loggedIn: true, auth: 'user', efforts: ['standard', 'extended'] });
+    push('effort', { available: true, effort: 'standard' });
+    const select = target.querySelector('.composer .effort select');
+    ok(select, 'effort select missing with 2 values');
+    equal([...select.options].map((o) => o.textContent.trim()).join('|'), '默认|标准|进阶');
+    equal(select.value, 'extended', 'saved choice shown');
+    select.value = 'standard';
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    flushSync();
+    equal(JSON.stringify(sent.filter(([type]) => type === 'set-effort').at(-1)), JSON.stringify(['set-effort', { effort: 'standard' }]));
+    push('hello', { ready: true, loggedIn: false, auth: 'anon', efforts: [] });
+    equal(target.querySelector('.composer .effort'), null, 'hidden when logged out');
+    push('hello', { ready: true, loggedIn: true, auth: 'user', efforts: [] });
+
+    // Long conversation: the newest turns render first, the rest catch up.
+    const id = '00000000-0000-4000-8000-0000000000c1';
+    const mapping = {};
+    let parent = null;
+    for (let i = 0; i < 80; i++) {
+      for (const role of ['user', 'assistant']) {
+        const mid = `00000000-0000-4000-8000-${String(1000 + 2 * i + (role === 'user' ? 0 : 1)).padStart(12, '0')}`;
+        mapping[mid] = { id: mid, parent, children: [], message: { id: mid, author: { role }, create_time: 1 + 2 * i + (role === 'user' ? 0 : 1), status: 'finished_successfully', content: { content_type: 'text', parts: [`${role} ${i}`] }, metadata: {} } };
+        if (parent) mapping[parent].children.push(mid);
+        parent = mid;
+      }
+    }
+    push('conversation-list', { body: JSON.stringify({ items: [{ id, title: '长对话' }] }), offset: 0, complete: true });
+    push('location', { conversationId: id, url: `https://chatgpt.com/c/${id}` });
+    store.dispatch({ type: 'open', conversationId: id });
+    push('conversation', { conversationId: id, body: JSON.stringify({ conversation_id: id, current_node: parent, title: '长对话', mapping }), page: 1, pages: 1 });
+    const first = target.querySelectorAll('.turn').length;
+    ok(first > 0 && first <= 12, `first frame renders the newest turns only (${first})`);
+    equal(target.querySelector('.turn:last-child .msg[data-role="assistant"] .md').textContent, 'assistant 79');
+    await waitFor(() => target.querySelectorAll('.turn').length === 80, 'older turns never rendered');
+    equal(target.querySelector('.turn .msg[data-role="user"] .md').textContent, 'user 0');
+
+    // Send: the question is in the thread before the official page answers.
+    const area = target.querySelector('.composer textarea');
+    area.value = '再来一个';
+    area.dispatchEvent(new Event('input', { bubbles: true }));
+    flushSync();
+    area.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    flushSync();
+    const userMsgs = () => [...target.querySelectorAll('.msg[data-role="user"] .md')].map((el) => el.textContent);
+    equal(userMsgs().at(-1), '再来一个', 'question not shown at once');
+    ok(target.querySelector('.turn:last-child .pending'), 'generating placeholder missing');
+    equal(area.value, '', 'composer not cleared');
+    const send = sent.find(([type]) => type === 'send');
+    push('send-result', { commandId: send[1].commandId, ok: false, error: 'composer-not-found' });
+    equal(area.value, '再来一个', 'text restored after a failed send');
+    ok(!userMsgs().includes('再来一个'), 'echo left behind after failure');
+  });
 } else {
   // Lazy chunks (highlight.js, KaTeX) fail to load: content must stay intact.
   await test('a highlight.js chunk failure leaves code raw, intact and copyable', async () => {

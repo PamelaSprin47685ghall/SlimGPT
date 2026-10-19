@@ -26,6 +26,9 @@ export function initialState() {
     online: true,
     officialVisible: false,
     efforts: [],
+    // Effort the official app reports using now (null = its default / unknown).
+    effort: { available: false, current: null },
+    effortError: null,
     list: [],
     listComplete: false,
     currentId: null,
@@ -39,6 +42,9 @@ export function initialState() {
     sync: {},
     streams: {},
     pending: null,
+    // The question just sent, shown at once while the official request is
+    // in flight (until its stream starts or the send fails).
+    echo: null,
     sendError: null,
     streamError: null,
     drafts: {},
@@ -149,6 +155,13 @@ export function reducePage(state, message, P) {
     case 'stream-end': return onStreamEnd(state, message, P);
     case 'send-result': return onSendResult(state, message);
     case 'takeover': return { state: { ...state, officialVisible: !!message.visible }, effects: [] };
+    case 'effort': return {
+      state: { ...state, effort: { available: !!message.available, current: typeof message.effort === 'string' && message.effort ? message.effort : null } },
+      effects: [],
+    };
+    case 'command-result':
+      if (message.command !== 'set-effort') return { state, effects: [] };
+      return { state: { ...state, effortError: message.ok ? null : (message.error || 'not-confirmed') }, effects: [] };
     default: return { state, effects: [] };
   }
 }
@@ -162,7 +175,10 @@ function onHello(state, message) {
     efforts,
   };
   const effects = [];
-  if (next.settings.effort && efforts.includes(next.settings.effort)) effects.push(post('set-effort', { effort: next.settings.effort }));
+  // Re-apply a saved choice only when there is a choice (2+ values offered).
+  if (efforts.length > 1 && next.settings.effort && efforts.includes(next.settings.effort) && next.effort.current !== next.settings.effort && !next.effortError) {
+    effects.push(post('set-effort', { effort: next.settings.effort }));
+  }
   return { state: next, effects };
 }
 
@@ -230,6 +246,8 @@ function onConversation(state, message, P) {
   if (next.opening === id) next.opening = undefined;
   // The full history replaced whatever the broken stream left behind.
   if (page >= pages && next.streamError?.conversationId === id) next.streamError = null;
+  // A confirmed send whose stream we never saw: the history now has the question.
+  if (next.echo && !next.pending && (next.echo.conversationId ?? null) === id) next.echo = null;
   const selected = next.leaf[id];
   if (selected && !conv.nodes.has(selected)) next.leaf = withEntry(next.leaf, id, undefined);
   if (conv.title) {
@@ -273,7 +291,7 @@ function onStreamStart(state, message, P) {
     refreshed: false,
     buffered: userRaw && !conversationId ? [userRaw] : [],
   };
-  let next = { ...state, streams: withEntry(state.streams, streamId, stream), streamError: null };
+  let next = { ...state, streams: withEntry(state.streams, streamId, stream), streamError: null, echo: null };
   const effects = [];
   if (conversationId) {
     if (!next.convs[conversationId]) next.convs = withEntry(next.convs, conversationId, P.createConversation(conversationId));
@@ -429,7 +447,7 @@ function onSendResult(state, message) {
       effects: [save('drafts')],
     };
   }
-  return { state: { ...state, pending: null, sendError: { code: message.error || 'send-not-confirmed', conversationId: pending.conversationId } }, effects: [] };
+  return { state: { ...state, pending: null, echo: null, sendError: { code: message.error || 'send-not-confirmed', conversationId: pending.conversationId } }, effects: [] };
 }
 
 // ---------------------------------------------------------------- UI actions
@@ -455,11 +473,13 @@ export function reduceAction(state, action, P) {
         return { state: check.reason === 'bridge' ? { ...state, sendError: { code: 'bridge', conversationId: state.currentId } } : state, effects: [] };
       }
       const pending = { commandId: action.commandId, conversationId: state.currentId, draftKey: keyOf(state.currentId), text };
-      return { state: { ...state, pending, sendError: null }, effects: [post('send', { commandId: action.commandId, text })] };
+      const echo = { commandId: action.commandId, conversationId: state.currentId, text };
+      return { state: { ...state, pending, echo, sendError: null }, effects: [post('send', { commandId: action.commandId, text })] };
     }
     case 'send-timeout': {
+      if (state.echo?.commandId === action.commandId && state.pending?.commandId !== action.commandId) return { state: { ...state, echo: null }, effects: [] };
       if (!state.pending || state.pending.commandId !== action.commandId) return { state, effects: [] };
-      return { state: { ...state, pending: null, sendError: { code: 'timeout', conversationId: state.pending.conversationId } }, effects: [] };
+      return { state: { ...state, pending: null, echo: null, sendError: { code: 'timeout', conversationId: state.pending.conversationId } }, effects: [] };
     }
     case 'stop': return { state, effects: [post('stop')] };
     case 'retry-sync': {
@@ -490,8 +510,8 @@ export function reduceAction(state, action, P) {
     case 'set-effort': {
       const effort = String(action.effort ?? '');
       const effects = [save('settings')];
-      if (effort) effects.unshift(post('set-effort', { effort }));
-      return { state: { ...state, settings: { ...state.settings, effort } }, effects };
+      if (effort && state.efforts.includes(effort)) effects.unshift(post('set-effort', { effort }));
+      return { state: { ...state, settings: { ...state.settings, effort }, effortError: null }, effects };
     }
     case 'show-official': return { state, effects: [post('show-official')] };
     case 'online': return { state: { ...state, online: !!action.online }, effects: [] };
@@ -556,7 +576,27 @@ export function runningIds(state) {
 }
 
 export function currentDraft(state) {
+  // The sent question has left the composer (it is shown in the thread).
+  if (state.echo && keyOf(state.echo.conversationId) === keyOf(state.currentId)) return '';
   return state.drafts[keyOf(state.currentId)] || '';
+}
+
+/**
+ * The thread as shown: the current turns plus, right after a send, the
+ * question and a "generating" placeholder until the official stream starts.
+ */
+export function displayTurns(state, P) {
+  const turns = currentTurns(state, P);
+  const echo = state.echo;
+  if (!echo || (echo.conversationId ?? null) !== (state.currentId ?? null)) return turns;
+  const at = `echo-${echo.commandId}`;
+  const message = (id, role, blocks, status) => ({ id, parentId: null, role, status, hidden: false, model: null, createdAt: null, source: 'live', blocks });
+  return [...turns, {
+    user: message(at, 'user', [{ kind: 'text', markdown: echo.text, citations: [] }], 'done'),
+    replies: [message(`${at}-reply`, 'assistant', [], 'streaming')],
+    userBranch: { index: 0, count: 0, siblingIds: [] },
+    replyBranch: { index: 0, count: 0, siblingIds: [] },
+  }];
 }
 
 export function currentTitle(state) {
@@ -569,7 +609,7 @@ export function currentTitle(state) {
 export function canSend(state) {
   if (!state.bridge.connected || !state.bridge.ready) return { ok: false, reason: 'bridge' };
   if (state.bridge.loggedIn === false && !isFreeMode(state)) return { ok: false, reason: 'login' };
-  if (state.pending) return { ok: false, reason: 'pending' };
+  if (state.pending || state.echo) return { ok: false, reason: 'pending' };
   if (isRunning(state)) return { ok: false, reason: 'running' };
   if (isFreeMode(state) && (state.currentId ?? null) !== (state.officialId ?? null)) {
     // The official page is elsewhere: sending would go to ITS conversation.
@@ -648,6 +688,16 @@ const BLOCKED = {
   'device-readonly': '该本机对话已无法继续，可新建对话',
   opening: '正在打开新对话…',
 };
+
+const EFFORT_ERRORS = {
+  'control-not-found': '官方界面没有找到思考强度选项',
+  busy: '正在生成或发送，稍后再切换思考强度',
+  'blocked-by-official-ui': '官方界面有弹窗，无法切换思考强度',
+};
+
+export function effortErrorText(code) {
+  return code ? EFFORT_ERRORS[code] || '思考强度未能在官方界面切换' : '';
+}
 
 export function blockedText(reason) {
   return BLOCKED[reason] || '';

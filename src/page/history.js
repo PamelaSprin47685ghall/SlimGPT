@@ -140,6 +140,17 @@ export function createHistoryLoader(options) {
   }
 
   /**
+   * The official app has just STARTED its own history fetch: a scheduled
+   * fallback load waits for it (its response cancels the fallback via
+   * noteObserved); `graceMs` is the safety net if that response never shows.
+   */
+  function noteRequested(conversationId, graceMs) {
+    if (!scheduled.has(conversationId)) return;
+    cancelScheduled(conversationId);
+    schedule(conversationId, graceMs);
+  }
+
+  /**
    * The official app fetched this history itself (already forwarded). Its
    * paged path view (`/conversations/<id>`) carries only `has_versions`, not
    * the sibling branches: with `wantsFullTree` the full tree is loaded once
@@ -357,7 +368,7 @@ export function createHistoryLoader(options) {
     }
   }
 
-  return { setHeaders, hasHeaders, load, schedule, noteObserved, loadList };
+  return { setHeaders, hasHeaders, load, schedule, noteRequested, noteObserved, loadList };
 }
 
 /**

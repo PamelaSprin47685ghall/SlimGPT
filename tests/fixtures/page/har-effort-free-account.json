@@ -1,0 +1,130 @@
+{
+ "_comment": "Sanitized from a logged-in free-account HAR (2026-10-19): only effort-related fields kept; no ids, tokens or text.",
+ "models": {
+  "default_model_slug": "auto",
+  "model_picker_version": 2,
+  "models": [
+   {
+    "slug": "gpt-5-6",
+    "title": "GPT-5.6 Luna",
+    "reasoning_type": "auto",
+    "configurable_thinking_effort": false,
+    "thinking_efforts": []
+   },
+   {
+    "slug": "gpt-5-3-mini",
+    "title": "GPT-5.3 Mini",
+    "reasoning_type": "none",
+    "configurable_thinking_effort": false,
+    "thinking_efforts": []
+   },
+   {
+    "slug": "gpt-5-6-mini",
+    "title": "GPT-5.6 Luna",
+    "reasoning_type": "none",
+    "configurable_thinking_effort": false,
+    "thinking_efforts": []
+   },
+   {
+    "slug": "gpt-5-6-t-mini",
+    "title": "GPT-5.6 Luna",
+    "reasoning_type": "reasoning",
+    "configurable_thinking_effort": false,
+    "thinking_efforts": []
+   },
+   {
+    "slug": "gpt-5-6-t-mini-mini",
+    "title": "GPT-5.6 Luna",
+    "reasoning_type": "reasoning",
+    "configurable_thinking_effort": false,
+    "thinking_efforts": []
+   },
+   {
+    "slug": "research",
+    "title": "Deep Research",
+    "reasoning_type": "none",
+    "configurable_thinking_effort": false,
+    "thinking_efforts": []
+   },
+   {
+    "slug": "gpt-6",
+    "title": "GPT-6",
+    "reasoning_type": "auto",
+    "configurable_thinking_effort": false,
+    "thinking_efforts": []
+   },
+   {
+    "slug": "gpt-6-t-mini",
+    "title": "GPT-6",
+    "reasoning_type": "reasoning",
+    "configurable_thinking_effort": false,
+    "thinking_efforts": []
+   },
+   {
+    "slug": "gpt-6-mini",
+    "title": "GPT-6",
+    "reasoning_type": "none",
+    "configurable_thinking_effort": false,
+    "thinking_efforts": []
+   },
+   {
+    "slug": "gpt-6-t-mini-mini",
+    "title": "GPT-6",
+    "reasoning_type": "reasoning",
+    "configurable_thinking_effort": false,
+    "thinking_efforts": []
+   },
+   {
+    "slug": "auto",
+    "title": "Auto",
+    "reasoning_type": "auto",
+    "configurable_thinking_effort": false,
+    "thinking_efforts": []
+   }
+  ],
+  "categories": [
+   {
+    "category": "auto_no_tools",
+    "human_category_name": "Auto",
+    "default_model": "auto",
+    "model_lane": null,
+    "action_pill_short_name": null
+   },
+   {
+    "category": "gpt_6_reasoning_mini",
+    "human_category_name": "Thinking mini",
+    "default_model": "gpt-6-t-mini",
+    "model_lane": "thinking_mini",
+    "action_pill_short_name": "Thinking"
+   },
+   {
+    "category": "gpt_5_auto",
+    "human_category_name": "Instant",
+    "default_model": "gpt-6",
+    "model_lane": "auto",
+    "action_pill_short_name": null
+   }
+  ]
+ },
+ "settingsUser": {
+  "settings": {
+   "wingman_thinking_effort": "instant",
+   "model_picker_persists_ultra_effort": false
+  },
+  "available_options": {
+   "backend_reasoning_effort": [
+    "instant"
+   ]
+  }
+ },
+ "submitBodies": [
+  {
+   "action": "next",
+   "model": "auto"
+  },
+  {
+   "action": "variant",
+   "model": "gpt-6"
+  }
+ ]
+}

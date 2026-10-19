@@ -275,3 +275,37 @@ test('free mode: only the exact updates path is captured; free-mode URLs are sig
   assert.deepEqual(events, []);
   assert.equal(signals, 4);
 });
+
+test('history request start is reported before the response; models / settings bodies and the submit model are observed read-only', async () => {
+  const events = [];
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const tee = createFetchTee({ pageOrigin: O, handlers: {
+    onHistoryRequest: (id) => events.push(['history-request', id]),
+    onHistory: (id) => events.push(['history', id]),
+    onModels: (body) => events.push(['models', JSON.parse(body).default_model_slug]),
+    onUserSettings: (body) => events.push(['settings', JSON.parse(body).available_options.backend_reasoning_effort]),
+    onSubmitChoice: (choice) => events.push(['choice', choice]),
+  } });
+  const upstream = async (url) => {
+    const path = new URL(url, O).pathname;
+    if (path.startsWith('/backend-api/conversations/')) { await gate; return new Response('{"messages":[]}', { headers: { 'content-type': 'application/json' } }); }
+    if (path === '/backend-api/models') return new Response('{"default_model_slug":"auto","models":[]}', { headers: { 'content-type': 'application/json' } });
+    if (path === '/backend-api/settings/user') return new Response('{"available_options":{"backend_reasoning_effort":["instant"]}}', { headers: { 'content-type': 'application/json' } });
+    return streamResponse(['data: [DONE]\n\n']);
+  };
+  const fetch = tee.wrap(upstream);
+  const pending = fetch(`/backend-api/conversations/${ID}?num_turns=10&include_has_versions=true`);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(events, [['history-request', ID]], 'reported at request start');
+  release();
+  await pending;
+  await fetch('/backend-api/models?iim=false');
+  await fetch('/backend-api/settings/user');
+  const body = JSON.stringify({ action: 'next', model: 'gpt-6', messages: [] });
+  const response = await fetch('/backend-api/f/conversation', { method: 'POST', body });
+  await response.text();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const later = events.slice(1).map((event) => JSON.stringify(event)).sort();
+  assert.deepEqual(later, [['history', ID], ['models', 'auto'], ['settings', ['instant']], ['choice', { model: 'gpt-6', effort: null }]].map((event) => JSON.stringify(event)).sort());
+});

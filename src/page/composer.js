@@ -5,14 +5,14 @@
 // fakes one by sending a continuation message.
 // All DOM access goes through a DomAdapter (see dom.js).
 
-import { EFFORT_VALUES } from '../shared/bridge-protocol.js';
+import { isEffortValue } from '../shared/bridge-protocol.js';
 
 export const DEFAULT_TIMEOUTS = Object.freeze({
   composer: 2_500,
   sendControl: 5_000,
   submission: 10_000,
   branch: 3_000,
-  slider: 5_000,
+  effortMenu: 1_500,
 });
 
 export const COMPOSER_SELECTORS = Object.freeze([
@@ -48,14 +48,34 @@ export const BLOCKER_SELECTORS = Object.freeze([
   '#onetrust-pc-sdk',
 ]);
 
-export const SLIDER_SELECTORS = Object.freeze([
-  '[data-model-reasoning-effort-slider] [role="slider"]',
-  '[data-model-reasoning-effort-slider] input[type="range"]',
-  'input[type="range"][aria-label*="reasoning" i]',
-  'input[type="range"][aria-label*="thinking" i]',
-  '[role="slider"][aria-label*="reasoning" i]',
-  '[role="slider"][aria-label*="thinking" i]',
+// Options of an open official menu (menus render in portals, not in the form).
+export const MENU_OPTION_SELECTORS = Object.freeze([
+  '[role="menuitemradio"]', '[role="option"]', '[role="radio"]', '[role="menuitem"]',
 ]);
+
+// Official labels of known effort values (English / Chinese UI). Unknown
+// values are matched by their own name.
+const EFFORT_LABELS = {
+  instant: ['instant', '即时', '快速'],
+  minimal: ['minimal', '最低'],
+  low: ['low', '低'],
+  light: ['light', '轻度', '轻量'],
+  medium: ['medium', '中'],
+  standard: ['standard', '标准'],
+  high: ['high', '高'],
+  extended: ['extended', '进阶', '扩展', '延长'],
+  heavy: ['heavy', '深度', '重度'],
+};
+const THINKING_SUBMENU = /^(?:thinking(?: time| effort| level)?|reasoning(?: effort)?|思考(?:时间|强度|程度)?|推理(?:强度)?)(?:$|[\s:：(（])/i;
+
+/** Does an official option label name this effort value? (first word, case-insensitive) */
+export function isEffortLabel(label, effort) {
+  const text = String(label || '').trim().toLowerCase();
+  if (!text || !isEffortValue(effort)) return false;
+  const words = EFFORT_LABELS[effort] || [effort];
+  return words.some((word) => text === word || text.startsWith(`${word} `) || text.startsWith(`${word}\n`) ||
+    (/[^\x00-\x7f]/.test(word) && text.startsWith(word)));
+}
 
 const STOP_LABEL = /^(?:stop(?: generating| generation| response| streaming| thinking)?|停止(?:生成|回答|回复|思考)?)[.!。…\s]*$/i;
 const STOP_TESTID = /^stop(?:-button)?$/i;
@@ -68,32 +88,14 @@ export const isStopLabel = (label) => STOP_LABEL.test(label);
 export const isBranchLabel = (label, direction) => (direction < 0 ? PREV_LABEL : NEXT_LABEL).test(label);
 
 /**
- * Map an EffortValue onto a slider range [min, max].
- * @param {string} effort
- * @param {number} min
- * @param {number} max
- * @returns {number|null}
- */
-export function effortToSliderValue(effort, min, max) {
-  const index = EFFORT_VALUES.indexOf(/** @type {any} */ (effort));
-  if (index < 0 || !Number.isFinite(min) || !Number.isFinite(max) || max <= min) return null;
-  return min + Math.round((index * (max - min)) / (EFFORT_VALUES.length - 1));
-}
-
-/** Inverse of effortToSliderValue (nearest). */
-export function sliderValueToEffort(value, min, max) {
-  if (!Number.isFinite(value) || !Number.isFinite(min) || !Number.isFinite(max) || max <= min) return null;
-  const ratio = Math.min(1, Math.max(0, (value - min) / (max - min)));
-  return EFFORT_VALUES[Math.round(ratio * (EFFORT_VALUES.length - 1))];
-}
-
-/**
  * @param {object} options
  * @param {import('./dom.js').DomAdapter} options.dom
  * @param {{ run: <T>(fn: () => Promise<T>) => Promise<T> }} options.officialUi wake the official UI + permit focus while fn runs
  * @param {() => boolean} [options.isStreaming] an official stream is active
  * @param {Partial<typeof DEFAULT_TIMEOUTS>} [options.timeouts]
  */
+const lastWord = (label) => String(label || '').trim().split(/\s+/).at(-1) || '';
+
 export function createComposerDriver({ dom, officialUi, isStreaming = () => false, timeouts = {} }) {
   const limits = { ...DEFAULT_TIMEOUTS, ...timeouts };
   let busy = false;
@@ -144,31 +146,42 @@ export function createComposerDriver({ dom, officialUi, isStreaming = () => fals
       (STOP_TESTID.test(String(dom.attr(button, 'data-testid') || '')) || isStopLabel(dom.label(button)))) || null;
   }
 
-  function findSlider() {
-    for (const selector of SLIDER_SELECTORS) {
-      const slider = dom.queryAll(selector).find((candidate) => dom.isVisible(candidate));
-      if (slider) return slider;
-    }
-    return null;
-  }
-
-  function findEffortMenuTrigger() {
+  /** Effort menu triggers in the composer (the model / thinking pill), plus-button excluded. */
+  function findMenuTriggers() {
     const composer = findComposer();
     const form = composer ? dom.closest(composer, 'form') : null;
-    if (!form) return null;
-    return dom.queryWithin(form, 'button[aria-haspopup="menu"]').find((button) => {
+    if (!form) return [];
+    return dom.queryWithin(form, 'button[aria-haspopup="menu"]').filter((button) => {
       const id = `${dom.attr(button, 'id') || ''} ${dom.attr(button, 'data-testid') || ''}`;
       return !/composer-plus-btn/.test(id) && dom.isEnabledButton(button) && Boolean(dom.label(button));
-    }) || null;
+    }).slice(0, 3);
   }
 
-  function sliderRange(slider) {
-    const state = dom.sliderState(slider);
-    return {
-      value: Number(state.value),
-      min: Number(state.min),
-      max: Number(state.max),
-    };
+  function menuOptions() {
+    const out = [];
+    for (const selector of MENU_OPTION_SELECTORS) {
+      for (const option of dom.queryAll(selector)) if (!out.includes(option) && dom.isVisible(option)) out.push(option);
+    }
+    return out;
+  }
+
+  function optionValue(option) {
+    return [dom.attr(option, 'data-value'), dom.attr(option, 'data-testid'), dom.attr(option, 'value')]
+      .filter(Boolean).join(' ').toLowerCase();
+  }
+
+  function findEffortOption(effort) {
+    const options = menuOptions().filter((option) => dom.attr(option, 'aria-disabled') !== 'true');
+    const byValue = new RegExp(`(?:^|[\\s_:-])${effort}(?:$|[\\s_-])`);
+    return options.find((option) => byValue.test(optionValue(option))) ||
+      options.find((option) => isEffortLabel(dom.label(option), effort)) || null;
+  }
+
+  const isChecked = (option) => ['aria-checked', 'aria-selected'].some((name) => dom.attr(option, name) === 'true') ||
+    dom.attr(option, 'data-state') === 'checked';
+
+  function findThinkingSubmenu() {
+    return menuOptions().find((option) => dom.attr(option, 'aria-haspopup') && THINKING_SUBMENU.test(dom.label(option))) || null;
   }
 
   /** Called by the fetch tee when the official submit request settles. */
@@ -252,59 +265,58 @@ export function createComposerDriver({ dom, officialUi, isStreaming = () => fals
     });
   }
 
-  /** Current effort as seen on the official slider (only when it is rendered). */
-  function readEffort() {
-    const slider = findSlider();
-    if (!slider) return null;
-    const { value, min, max } = sliderRange(slider);
-    return sliderValueToEffort(value, min, max);
-  }
-
+  /**
+   * Pick an effort on the official control, the way a user would: open the
+   * composer's model/thinking menu (and its thinking submenu when there is
+   * one), activate the option, confirm it is checked, close the menu.
+   * Nothing is sent and no request is touched.
+   */
   async function setEffort(effort) {
-    if (!EFFORT_VALUES.includes(/** @type {any} */ (effort))) return { ok: false, error: 'invalid-argument' };
+    if (!isEffortValue(effort)) return { ok: false, error: 'invalid-argument' };
+    if (isStreaming()) return { ok: false, error: 'busy' };
     return exclusive(async () => {
-      let slider = findSlider();
-      let trigger = null;
+      if (findBlocker()) return { ok: false, error: 'blocked-by-official-ui' };
+      let option = findEffortOption(effort);
+      let opened = null;
       try {
-        if (!slider) {
-          trigger = findEffortMenuTrigger();
-          if (!trigger) return { ok: false, error: 'control-not-found' };
+        for (const trigger of option ? [] : findMenuTriggers()) {
           dom.activate(trigger);
-          slider = await dom.waitFor(findSlider, limits.slider);
-        }
-        if (!slider) return { ok: false, error: 'control-not-found' };
-        const range = sliderRange(slider);
-        const target = effortToSliderValue(effort, range.min, range.max);
-        if (target === null) return { ok: false, error: 'control-not-found' };
-        if (dom.isRangeInput(slider)) {
-          dom.setRangeValue(slider, target);
-        } else {
-          let current = range.value;
-          let guard = 0;
-          while (current !== target && guard++ < 16) {
-            const key = target < current ? 'ArrowLeft' : 'ArrowRight';
-            const before = current;
-            dom.pressKey(slider, key);
-            const moved = await dom.waitFor(() => {
-              const next = sliderRange(slider).value;
-              return next !== before ? { next } : null;
-            }, limits.slider);
-            if (!moved) return { ok: false, error: 'not-confirmed' };
-            current = moved.next;
+          opened = trigger;
+          option = await dom.waitFor(() => findEffortOption(effort) || findThinkingSubmenu(), limits.effortMenu);
+          if (option && !findEffortOption(effort)) {
+            dom.activate(option); // the thinking submenu
+            option = await dom.waitFor(() => findEffortOption(effort), limits.effortMenu);
           }
+          if (option) break;
+          close(trigger);
+          opened = null;
         }
-        const reached = await dom.waitFor(() => sliderRange(slider).value === target, limits.slider);
-        return reached ? { ok: true, error: null } : { ok: false, error: 'not-confirmed' };
+        if (!option) return { ok: false, error: 'control-not-found' };
+        if (isChecked(option)) return { ok: true, error: null };
+        dom.activate(option);
+        const confirmed = await dom.waitFor(() => {
+          const now = findEffortOption(effort);
+          if (now) return isChecked(now);
+          // The menu closed on selection: the pill now names the choice.
+          return findMenuTriggers().some((trigger) => isEffortLabel(lastWord(dom.label(trigger)), effort) || isEffortLabel(dom.label(trigger), effort));
+        }, limits.effortMenu);
+        return confirmed ? { ok: true, error: null } : { ok: false, error: 'not-confirmed' };
       } finally {
-        if (trigger && dom.attr(trigger, 'aria-expanded') === 'true') {
-          try { dom.activate(trigger); } catch { /* ignore */ }
-        }
+        if (opened) close(opened);
       }
     });
   }
 
+  function close(trigger) {
+    if (dom.attr(trigger, 'aria-expanded') !== 'true') return;
+    try { dom.pressKey(trigger, 'Escape'); } catch { /* ignore */ }
+    if (dom.attr(trigger, 'aria-expanded') === 'true') {
+      try { dom.activate(trigger); } catch { /* ignore */ }
+    }
+  }
+
   return {
-    send, stop, switchBranch, setEffort, readEffort,
+    send, stop, switchBranch, setEffort,
     noteSubmission, findBlocker, findComposer, hasComposer, isBusy: () => busy,
   };
 }

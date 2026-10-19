@@ -10,6 +10,8 @@
 //   GET  /backend-api/conversations            conversation list (unfiltered: no
 //                                              conversation_origin / archived / starred filter)
 //   POST /unauth-mweb/conversation/updates     logged-out (free mode) NDJSON stream
+//   GET  /backend-api/models                   models the account offers (effort options only)
+//   GET  /backend-api/settings/user            account settings (effort options only)
 // Matching is on the exact pathname of a same-origin URL; query strings are
 // ignored, everything else (memories, prepare, init, textdocs, …) is rejected.
 
@@ -22,6 +24,8 @@ const RESUME_PATH = /^\/backend-api\/(?:f\/)?conversation\/resume$/;
 const HISTORY_PATH = /^\/backend-api\/conversations?\/([^/]+)$/;
 const LIST_PATH = /^\/backend-api\/conversations$/;
 const FREE_UPDATES_PATH = /^\/unauth-mweb\/conversation\/updates$/;
+const MODELS_PATH = /^\/backend-api\/models$/;
+const USER_SETTINGS_PATH = /^\/backend-api\/settings\/user$/;
 // Same-origin path prefixes only the logged-out app uses (evidence of free mode).
 const FREE_MODE_PREFIXES = ['/unauth-mweb/', '/backend-anon/'];
 const FREE_ROUTE_PATH = /^\/uc\/[^/]+\/?$/;
@@ -39,7 +43,7 @@ export function isConversationId(value) {
 }
 
 /**
- * @typedef {{ kind: 'submit'|'resume'|'free-submit' } | { kind: 'history', conversationId: string } | { kind: 'list', offset: number }} Endpoint
+ * @typedef {{ kind: 'submit'|'resume'|'free-submit'|'models'|'user-settings' } | { kind: 'history', conversationId: string } | { kind: 'list', offset: number }} Endpoint
  */
 
 /**
@@ -66,6 +70,8 @@ export function classifyEndpoint(method, rawUrl, pageOrigin) {
     return null;
   }
   if (verb !== 'GET') return null;
+  if (MODELS_PATH.test(path)) return { kind: 'models' };
+  if (USER_SETTINGS_PATH.test(path)) return { kind: 'user-settings' };
   const history = HISTORY_PATH.exec(path);
   if (history) {
     const id = safeDecode(history[1]);
@@ -173,6 +179,27 @@ export function readStreamRequestIds(bodyText) {
     }
   }
   return { conversationId, userMessageId, parentMessageId, userText };
+}
+
+/**
+ * Model and effort the official app chose for this submit (`model`, and
+ * `thinking_effort` / `reasoning_effort` when present). Read only.
+ * @param {unknown} bodyText
+ * @returns {{ model: string|null, effort: string|null }}
+ */
+export function readSubmitChoice(bodyText) {
+  const empty = { model: null, effort: null };
+  if (typeof bodyText !== 'string' || !bodyText || bodyText.length > MAX_REQUEST_BODY_CHARS) return empty;
+  try {
+    const value = JSON.parse(bodyText);
+    if (!value || typeof value !== 'object') return empty;
+    const model = typeof value.model === 'string' && /^[\w.:-]{1,100}$/.test(value.model) ? value.model : null;
+    const raw = [value.thinking_effort, value.reasoning_effort].find((item) => typeof item === 'string');
+    const effort = raw && /^[a-z][a-z0-9_-]{0,31}$/.test(raw.toLowerCase()) ? raw.toLowerCase() : null;
+    return { model, effort };
+  } catch {
+    return empty;
+  }
 }
 
 /**

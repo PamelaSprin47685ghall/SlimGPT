@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  createComposerDriver, effortToSliderValue, isBranchLabel, isStopLabel, sliderValueToEffort,
+  createComposerDriver, isBranchLabel, isEffortLabel, isStopLabel,
 } from '../../src/page/composer.js';
 
 // Plain-object fake of the DomAdapter. `selectors` maps a selector string to
@@ -36,9 +36,6 @@ function fakeDom() {
     click(element) { log.push(['click', element.name]); element.onClick?.(); },
     activate(element) { log.push(['activate', element.name]); element.onActivate?.(); },
     pressKey(element, key) { log.push(['key', key]); element.onKey?.(key); },
-    isRangeInput: (element) => Boolean(element.range),
-    setRangeValue(element, value) { log.push(['range', value]); element.state.value = value; },
-    sliderState: (element) => element.state,
     escape: (value) => value,
   };
   return dom;
@@ -48,7 +45,7 @@ const officialUi = () => {
   const calls = { runs: 0 };
   return { calls, run: async (fn) => { calls.runs += 1; return fn(); } };
 };
-const T = { composer: 30, sendControl: 30, submission: 60, branch: 30, slider: 30 };
+const T = { composer: 30, sendControl: 30, submission: 60, branch: 30, effortMenu: 30 };
 
 function composerSetup(dom) {
   const form = dom.el({ name: 'form', button: false });
@@ -65,16 +62,14 @@ test('label matchers are exact', () => {
   assert.ok(!isBranchLabel('Next response', -1));
 });
 
-test('effort maps linearly onto any slider range', () => {
-  assert.equal(effortToSliderValue('lowest', 0, 4), 0);
-  assert.equal(effortToSliderValue('medium', 0, 4), 2);
-  assert.equal(effortToSliderValue('highest', 1, 5), 5);
-  assert.equal(effortToSliderValue('high', 0, 100), 75);
-  assert.equal(effortToSliderValue('extreme', 0, 4), null);
-  assert.equal(effortToSliderValue('low', 3, 3), null);
-  assert.equal(sliderValueToEffort(3, 1, 5), 'medium');
-  assert.equal(sliderValueToEffort(4, 0, 4), 'highest');
-  assert.equal(sliderValueToEffort(Number.NaN, 0, 4), null);
+test('effort labels: official English / Chinese names, first word, exact', () => {
+  assert.ok(isEffortLabel('Extended', 'extended'));
+  assert.ok(isEffortLabel('Standard Balanced speed', 'standard'));
+  assert.ok(isEffortLabel('进阶', 'extended'));
+  assert.ok(isEffortLabel('Instant', 'instant'));
+  assert.ok(!isEffortLabel('Lightning fast', 'light'));
+  assert.ok(!isEffortLabel('Extended', 'Extended'), 'values are lower-case names');
+  assert.ok(isEffortLabel('Ultra', 'ultra'), 'unknown values match their own name');
 });
 
 test('send: types into the official composer, clicks send, confirms via the official request', async () => {
@@ -173,32 +168,68 @@ test('switch-branch reports not-confirmed when the official UI does not change',
   assert.deepEqual(await driver.switchBranch('m-a', -1), { ok: false, error: 'not-confirmed' });
 });
 
-test('set-effort: opens the official menu, steps an ARIA slider by keys, closes the menu', async () => {
-  const dom = fakeDom();
+// Official effort menu fake: a composer pill opens a menu with radio items.
+function effortMenu(dom, { submenu = false, closesOnPick = false } = {}) {
   const { form } = composerSetup(dom);
-  const slider = dom.el({ name: 'slider', button: false, state: { value: 1, min: 0, max: 4 } });
-  slider.onKey = (key) => setTimeout(() => { slider.state.value += key === 'ArrowRight' ? 1 : -1; }, 1);
-  const trigger = dom.el({ name: 'trigger', label: 'Thinking', attrs: {} });
-  trigger.onActivate = () => {
-    trigger.attrs['aria-expanded'] = trigger.attrs['aria-expanded'] === 'true' ? 'false' : 'true';
-    dom.selectors.set('[data-model-reasoning-effort-slider] [role="slider"]', trigger.attrs['aria-expanded'] === 'true' ? [slider] : []);
+  const items = ['Light', 'Standard', 'Extended'].map((label) => dom.el({ name: label, label, button: false, attrs: { 'aria-checked': label === 'Standard' ? 'true' : 'false' } }));
+  const trigger = dom.el({ name: 'pill', label: 'Thinking Standard', attrs: { 'aria-haspopup': 'menu', 'aria-expanded': 'false' } });
+  const sub = dom.el({ name: 'sub', label: 'Thinking time', button: false, attrs: { 'aria-haspopup': 'menu' } });
+  const open = (value) => {
+    trigger.attrs['aria-expanded'] = value ? 'true' : 'false';
+    dom.selectors.set('[role="menuitemradio"]', value && !submenu ? items : []);
+    dom.selectors.set('[role="menuitem"]', value && submenu ? [sub] : []);
   };
+  trigger.onActivate = () => open(trigger.attrs['aria-expanded'] !== 'true');
+  trigger.onKey = (key) => { if (key === 'Escape') open(false); };
+  sub.onActivate = () => dom.selectors.set('[role="menuitemradio"]', items);
+  for (const item of items) {
+    item.onActivate = () => {
+      for (const other of items) other.attrs['aria-checked'] = other === item ? 'true' : 'false';
+      trigger.label = `Thinking ${item.label}`;
+      if (closesOnPick) open(false);
+    };
+  }
   form.children.set('button[aria-haspopup="menu"]', [dom.el({ name: 'plus', label: 'Add', attrs: { id: 'composer-plus-btn' } }), trigger]);
-  const driver = createComposerDriver({ dom, officialUi: officialUi(), timeouts: T });
-  assert.deepEqual(await driver.setEffort('high'), { ok: true, error: null });
-  assert.equal(slider.state.value, 3);
-  assert.deepEqual(dom.log.map(([kind, value]) => `${kind}:${value}`), ['activate:trigger', 'key:ArrowRight', 'key:ArrowRight', 'activate:trigger']);
-  assert.deepEqual(await driver.setEffort('max'), { ok: false, error: 'invalid-argument' });
+  return { items, trigger };
+}
+
+test('set-effort: opens the composer menu, picks the radio item, confirms aria-checked, closes the menu', async () => {
+  const dom = fakeDom();
+  const { items, trigger } = effortMenu(dom);
+  const ui = officialUi();
+  const driver = createComposerDriver({ dom, officialUi: ui, timeouts: T });
+  assert.deepEqual(await driver.setEffort('extended'), { ok: true, error: null });
+  assert.equal(items[2].attrs['aria-checked'], 'true');
+  assert.equal(trigger.attrs['aria-expanded'], 'false', 'menu closed again');
+  assert.deepEqual(dom.log.map(([kind, value]) => `${kind}:${value}`), ['activate:pill', 'activate:Extended', 'key:Escape']);
+  assert.equal(ui.calls.runs, 1, 'runs with the official UI awake');
+  assert.deepEqual(await driver.setEffort('Extended!'), { ok: false, error: 'invalid-argument' });
 });
 
-test('set-effort on a range input sets the value directly; missing control is reported', async () => {
+test('set-effort: thinking submenu, menu that closes on pick (confirmed by the pill label), already-checked item', async () => {
   const dom = fakeDom();
+  effortMenu(dom, { submenu: true, closesOnPick: true });
   const driver = createComposerDriver({ dom, officialUi: officialUi(), timeouts: T });
-  assert.deepEqual(await driver.setEffort('low'), { ok: false, error: 'control-not-found' });
-  const slider = dom.on('input[type="range"][aria-label*="reasoning" i]', dom.el({ name: 'range', button: false, range: true, state: { value: 5, min: 1, max: 5 } }));
-  assert.deepEqual(await driver.setEffort('lowest'), { ok: true, error: null });
-  assert.equal(slider.state.value, 1);
-  assert.equal(driver.readEffort(), 'lowest');
+  assert.deepEqual(await driver.setEffort('light'), { ok: true, error: null });
+  assert.deepEqual(dom.log.map(([kind, value]) => `${kind}:${value}`), ['activate:pill', 'activate:sub', 'activate:Light']);
+  dom.log.length = 0;
+  const again = fakeDom();
+  effortMenu(again);
+  const second = createComposerDriver({ dom: again, officialUi: officialUi(), timeouts: T });
+  assert.deepEqual(await second.setEffort('standard'), { ok: true, error: null }, 'already checked: nothing to click');
+  assert.ok(!again.log.some(([kind, value]) => kind === 'activate' && value === 'Standard'));
+});
+
+test('set-effort: no such option / no menu → control-not-found (menu closed); never while streaming', async () => {
+  const dom = fakeDom();
+  const { trigger } = effortMenu(dom);
+  const driver = createComposerDriver({ dom, officialUi: officialUi(), timeouts: T });
+  assert.deepEqual(await driver.setEffort('heavy'), { ok: false, error: 'control-not-found' });
+  assert.equal(trigger.attrs['aria-expanded'], 'false');
+  const bare = createComposerDriver({ dom: fakeDom(), officialUi: officialUi(), timeouts: T });
+  assert.deepEqual(await bare.setEffort('light'), { ok: false, error: 'control-not-found' });
+  const streaming = createComposerDriver({ dom, officialUi: officialUi(), isStreaming: () => true, timeouts: T });
+  assert.deepEqual(await streaming.setEffort('light'), { ok: false, error: 'busy' });
 });
 
 test('blocker detection: inert root, :modal or visible dialogs', () => {

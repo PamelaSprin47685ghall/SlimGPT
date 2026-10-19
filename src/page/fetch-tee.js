@@ -6,7 +6,7 @@
 // or touches XHR/WebSocket.
 
 import {
-  classifyEndpoint, isBackendRequest, isFreeModeUrl, readFreeModeRequest, readStreamRequestIds, MAX_REQUEST_BODY_CHARS,
+  classifyEndpoint, isBackendRequest, isFreeModeUrl, readFreeModeRequest, readStreamRequestIds, readSubmitChoice, MAX_REQUEST_BODY_CHARS,
 } from './endpoints.js';
 
 export const MAX_JSON_BODY_BYTES = 20 * 1024 * 1024;
@@ -20,7 +20,11 @@ export const MAX_JSON_BODY_BYTES = 20 * 1024 * 1024;
  * @property {(streamId: string, chunk: string) => void} [onStreamChunk]
  * @property {(streamId: string, ok: boolean) => void} [onStreamEnd]
  * @property {(conversationId: string, body: string) => void} [onHistory]
+ * @property {(conversationId: string) => void} [onHistoryRequest]   an official history fetch just started (URL only)
  * @property {(offset: number, body: string) => void} [onList]
+ * @property {(body: string) => void} [onModels]   GET /backend-api/models body
+ * @property {(body: string) => void} [onUserSettings]   GET /backend-api/settings/user body
+ * @property {(choice: { model: string|null, effort: string|null }) => void} [onSubmitChoice]   model/effort of an official submit
  */
 
 /**
@@ -45,6 +49,7 @@ export function createFetchTee({ pageOrigin, handlers, maxJsonBytes = MAX_JSON_B
         }
         if (url && isFreeModeUrl(url, pageOrigin)) safeCall(handlers.onFreeModeRequest);
         endpoint = url ? classifyEndpoint(method, url, pageOrigin) : null;
+        if (endpoint?.kind === 'history') safeCall(handlers.onHistoryRequest, endpoint.conversationId);
         if (endpoint && (endpoint.kind === 'submit' || endpoint.kind === 'resume')) {
           // Must be taken before upstream consumes a Request body.
           bodyText = readRequestBody(input, init);
@@ -77,6 +82,9 @@ export function createFetchTee({ pageOrigin, handlers, maxJsonBytes = MAX_JSON_B
 
   function observe(endpoint, response, bodyText) {
     if (endpoint.kind === 'submit' || endpoint.kind === 'free-submit') safeCall(handlers.onSubmission, { ok: response.ok, status: response.status });
+    if (endpoint.kind === 'submit' && handlers.onSubmitChoice) {
+      void Promise.resolve(bodyText).catch(() => null).then((text) => safeCall(handlers.onSubmitChoice, readSubmitChoice(text)));
+    }
     if (!response.ok || !response.body) return;
     const mime = String(response.headers.get('content-type') || '').toLowerCase();
     if (endpoint.kind === 'submit' || endpoint.kind === 'resume') {
@@ -103,6 +111,8 @@ export function createFetchTee({ pageOrigin, handlers, maxJsonBytes = MAX_JSON_B
       if (text == null) return;
       if (endpoint.kind === 'history') safeCall(handlers.onHistory, endpoint.conversationId, text);
       else if (endpoint.kind === 'list') safeCall(handlers.onList, endpoint.offset, text);
+      else if (endpoint.kind === 'models') safeCall(handlers.onModels, text);
+      else if (endpoint.kind === 'user-settings') safeCall(handlers.onUserSettings, text);
     });
   }
 

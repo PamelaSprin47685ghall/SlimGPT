@@ -12,7 +12,8 @@
     "test": "node --test tests/protocol tests/page tests/ui",
     "test:markdown": "node scripts/markdown-smoke.mjs",
     "check": "node scripts/check.mjs",
-    "test:page": "node --test tests/page"
+    "test:page": "node --test tests/page",
+    "bench": "node scripts/stream-bench.mjs"
   },
   "dependencies": {
     "framework7": "9.1.3",

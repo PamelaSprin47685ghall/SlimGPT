@@ -9,6 +9,14 @@
   let content = $state();
   let follow = $state(true);
   const FOLLOW_THRESHOLD = 64;
+  // Opening a long conversation: show the newest turns in the first frame,
+  // then add older ones a batch per frame (a bounded catch-up, not a loop
+  // that keeps running).
+  const FIRST_TURNS = 12;
+  const MORE_TURNS = 24;
+  let limit = $state(FIRST_TURNS);
+  const shown = $derived(turns.length > limit ? turns.slice(turns.length - limit) : turns);
+  const hidden = $derived(turns.length - shown.length);
 
   function atBottom() {
     return scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < FOLLOW_THRESHOLD;
@@ -28,7 +36,14 @@
   $effect(() => {
     void conversationKey;
     follow = true;
+    limit = FIRST_TURNS;
     void tick().then(toBottom);
+  });
+
+  $effect(() => {
+    if (hidden <= 0 || typeof requestAnimationFrame !== 'function') { if (hidden > 0) limit = Infinity; return; }
+    const id = requestAnimationFrame(() => { limit += MORE_TURNS; });
+    return () => cancelAnimationFrame(id);
   });
 
   // Keep following while content grows (streaming, late highlighting, images)
@@ -46,8 +61,8 @@
     {#if !turns.length}
       <p class="thread-empty">{empty}</p>
     {/if}
-    {#each turns as turn, index (turn.user?.id ?? `lead-${turn.replies[0]?.id ?? index}`)}
-      <Turn {turn} last={index === turns.length - 1} {running} {branches} />
+    {#each shown as turn, index (turn.user?.id ?? `lead-${turn.replies[0]?.id ?? index + hidden}`)}
+      <Turn {turn} last={index === shown.length - 1} {running} {branches} />
     {/each}
   </div>
   {#if !follow}

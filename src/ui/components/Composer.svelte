@@ -4,15 +4,22 @@
   /**
    * @type {{
    *   draft: string, running: boolean, pending: boolean, blocked: boolean, notice: string, offBranch: boolean,
-   *   error: string, efforts: string[], effort: string,
+   *   error: string, efforts: string[], effort: string, currentEffort?: string|null, effortError?: string,
    *   onsend: (text: string) => void, onstop: () => void, ondraft: (text: string) => void,
    *   onlatest: () => void, ondismiss: () => void, oneffort: (effort: string) => void,
    * }}
    */
-  let { draft, running, pending, blocked, notice, offBranch, error, efforts, effort, onsend, onstop, ondraft, onlatest, ondismiss, oneffort } = $props();
+  let { draft, running, pending, blocked, notice, offBranch, error, efforts, effort, currentEffort = null, effortError = '', onsend, onstop, ondraft, onlatest, ondismiss, oneffort } = $props();
   let area = $state();
 
-  const EFFORT_LABELS = { light: '轻度', standard: '标准', extended: '进阶', heavy: '深度' };
+  // The official value names; unknown ones are shown as they are.
+  const EFFORT_LABELS = {
+    instant: '即时', minimal: '最低', low: '低', light: '轻度', medium: '中', standard: '标准', high: '高', extended: '进阶', heavy: '深度',
+  };
+  const effortLabel = (value) => EFFORT_LABELS[value] || value;
+  // Only a real choice is shown: 2+ values offered by the account.
+  const showEffort = $derived(efforts.length > 1);
+  const selectedEffort = $derived(efforts.includes(effort) ? effort : '');
   const coarse = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
   const canSubmit = $derived(!blocked && !pending && !!draft.trim());
 
@@ -64,13 +71,14 @@
       <Button fill class="send {canSubmit ? '' : 'disabled'}" onClick={submit}>{pending ? '发送中' : '发送'}</Button>
     {/if}
   </div>
-  {#if efforts.length}
+  {#if showEffort}
     <label class="effort">
       <span>思考强度</span>
-      <select value={effort} onchange={(event) => oneffort(event.currentTarget.value)}>
-        <option value="">默认</option>
-        {#each efforts as item (item)}<option value={item}>{EFFORT_LABELS[item] || item}</option>{/each}
+      <select value={selectedEffort} disabled={running || pending} onchange={(event) => oneffort(event.currentTarget.value)}>
+        <option value="">{currentEffort && !selectedEffort ? `默认（${effortLabel(currentEffort)}）` : '默认'}</option>
+        {#each efforts as item (item)}<option value={item}>{effortLabel(item)}</option>{/each}
       </select>
+      {#if effortError}<span class="effort-error" role="status">{effortError}</span>{/if}
     </label>
   {/if}
 </div>
