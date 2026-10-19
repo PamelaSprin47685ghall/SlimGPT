@@ -1,0 +1,5 @@
+{
+ "_about": "Regression for main@11cbb34 core.js:397-422 mergeProgressiveText (bug 4): (\"aa\",\"a\")→\"aa\", (\"x = 1\\n\",\"\\n\")→\"x = 1\\n\", (\"Hello wor\",\"rld\")→\"Hello world\". Deltas must be applied literally.",
+ "id": "a1",
+ "markdown": "aaaHello worrld\nx = 1\n\nThe catcat sat   ```\n```"
+}

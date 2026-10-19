@@ -1,0 +1,18 @@
+{
+ "_about": "Regression for main@11cbb34 main-mitm.js:328/1977 (bug 3): DOM/web-mobile textContent flattened code blocks, tables and lists and picked up UI labels such as \"Copy code\". v2 only reads server text; the Markdown must survive byte-exact.",
+ "raw": {
+  "id": "md",
+  "author": {
+   "role": "assistant"
+  },
+  "content": {
+   "content_type": "text",
+   "parts": [
+    "Here:\n\n```python\nprint(\"a\")\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n- item\n  - nested\n"
+   ]
+  },
+  "status": "finished_successfully",
+  "end_turn": true
+ },
+ "expectMarkdown": "Here:\n\n```python\nprint(\"a\")\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n- item\n  - nested\n"
+}

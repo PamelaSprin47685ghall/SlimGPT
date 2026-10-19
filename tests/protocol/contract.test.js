@@ -1,6 +1,5 @@
 // Contract tests for src/protocol (workstream A). They run against the
-// fixtures in tests/fixtures/protocol and are reported as TODO until the
-// implementation replaces the stubs, so the suite stays green meanwhile.
+// fixtures in tests/fixtures/protocol.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -8,10 +7,7 @@ import * as P from '../../src/protocol/index.js';
 
 const fixture = (name) => readFileSync(new URL(`../fixtures/protocol/${name}`, import.meta.url), 'utf8');
 const json = (name) => JSON.parse(fixture(name));
-const implemented = (() => {
-  try { P.createConversation('probe'); return true; } catch { return false; }
-})();
-const t = (name, fn) => test(name, { todo: implemented ? false : 'protocol core not implemented yet' }, fn);
+const t = (name, fn) => test(name, fn);
 
 /** Assert that `actual` contains every field present in `expected` (deep, arrays by index & length). */
 function assertSubset(actual, expected, path = '$') {

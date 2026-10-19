@@ -1,0 +1,106 @@
+{
+ "_about": "Regression for main@11cbb34 src/lib/content-references.js:23-44 (bug 5): a half-received \\uE200 marker rendered tofu + \"citeturn0\", unresolved markers injected \"〔来源信息未同步〕\" prose, and citations were turned into Markdown links inside the parser. Every streaming prefix must be clean and the final text must carry structured citations only.",
+ "prefixes": [
+  "P",
+  "Pa",
+  "Par",
+  "Pari",
+  "Paris",
+  "Paris ",
+  "Paris i",
+  "Paris is",
+  "Paris is ",
+  "Paris is t",
+  "Paris is th",
+  "Paris is the",
+  "Paris is the ",
+  "Paris is the c",
+  "Paris is the ca",
+  "Paris is the cap",
+  "Paris is the capi",
+  "Paris is the capit",
+  "Paris is the capita",
+  "Paris is the capital",
+  "Paris is the capital",
+  "Paris is the capitalc",
+  "Paris is the capitalci",
+  "Paris is the capitalcit",
+  "Paris is the capitalcite",
+  "Paris is the capitalcite",
+  "Paris is the capitalcitet",
+  "Paris is the capitalcitetu",
+  "Paris is the capitalcitetur",
+  "Paris is the capitalciteturn",
+  "Paris is the capitalciteturn0",
+  "Paris is the capitalciteturn0s",
+  "Paris is the capitalciteturn0se",
+  "Paris is the capitalciteturn0sea",
+  "Paris is the capitalciteturn0sear",
+  "Paris is the capitalciteturn0searc",
+  "Paris is the capitalciteturn0search",
+  "Paris is the capitalciteturn0search0",
+  "Paris is the capitalciteturn0search0",
+  "Paris is the capitalciteturn0search0.",
+  "Paris is the capitalciteturn0search0. ",
+  "Paris is the capitalciteturn0search0. L",
+  "Paris is the capitalciteturn0search0. Ly",
+  "Paris is the capitalciteturn0search0. Lyo",
+  "Paris is the capitalciteturn0search0. Lyon",
+  "Paris is the capitalciteturn0search0. Lyon",
+  "Paris is the capitalciteturn0search0. Lyonc",
+  "Paris is the capitalciteturn0search0. Lyonci",
+  "Paris is the capitalciteturn0search0. Lyoncit",
+  "Paris is the capitalciteturn0search0. Lyoncite",
+  "Paris is the capitalciteturn0search0. Lyoncite",
+  "Paris is the capitalciteturn0search0. Lyoncitet",
+  "Paris is the capitalciteturn0search0. Lyoncitetu",
+  "Paris is the capitalciteturn0search0. Lyoncitetur",
+  "Paris is the capitalciteturn0search0. Lyonciteturn",
+  "Paris is the capitalciteturn0search0. Lyonciteturn0",
+  "Paris is the capitalciteturn0search0. Lyonciteturn0s",
+  "Paris is the capitalciteturn0search0. Lyonciteturn0se",
+  "Paris is the capitalciteturn0search0. Lyonciteturn0sea",
+  "Paris is the capitalciteturn0search0. Lyonciteturn0sear",
+  "Paris is the capitalciteturn0search0. Lyonciteturn0searc",
+  "Paris is the capitalciteturn0search0. Lyonciteturn0search",
+  "Paris is the capitalciteturn0search0. Lyonciteturn0search0",
+  "Paris is the capitalciteturn0search0. Lyonciteturn0search0",
+  "Paris is the capitalciteturn0search0. Lyonciteturn0search0 ",
+  "Paris is the capitalciteturn0search0. Lyonciteturn0search0 t",
+  "Paris is the capitalciteturn0search0. Lyonciteturn0search0 to",
+  "Paris is the capitalciteturn0search0. Lyonciteturn0search0 too",
+  "Paris is the capitalciteturn0search0. Lyonciteturn0search0 too."
+ ],
+ "metadata": {
+  "content_references": [
+   {
+    "matched_text": "citeturn0search0",
+    "type": "grouped_webpages",
+    "items": [
+     {
+      "title": "Wiki",
+      "url": "https://en.wikipedia.org/wiki/Paris"
+     }
+    ]
+   }
+  ]
+ },
+ "finalMarkdown": "Paris is the capital. Lyon too.",
+ "finalCitations": [
+  {
+   "start": 20,
+   "end": 20
+  },
+  {
+   "start": 26,
+   "end": 26
+  }
+ ],
+ "forbidden": [
+  "来源",
+  "〔",
+  "](",
+  "cite",
+  "turn0"
+ ]
+}

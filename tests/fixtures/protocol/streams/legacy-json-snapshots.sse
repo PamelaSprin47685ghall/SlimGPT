@@ -1,0 +1,16 @@
+data: {"message":{"id":"u9","author":{"role":"user"},"content":{"content_type":"text","parts":["q"]},"status":"finished_successfully"},"conversation_id":"c-9"}
+
+data: {"message":{"id":"a9","author":{"role":"assistant"},"content":{"content_type":"text","parts":["A"]},"status":"in_progress","metadata":{"parent_id":"u9"}},"conversation_id":"c-9"}
+
+data: {"message":{"id":"a9","author":{"role":"assistant"},"content":{"content_type":"text","parts":["An"]},"status":"in_progress","metadata":{"parent_id":"u9"}},"conversation_id":"c-9"}
+
+data: {"message":{"id":"a9","author":{"role":"assistant"},"content":{"content_type":"text","parts":["Ans"]},"status":"in_progress","metadata":{"parent_id":"u9"}},"conversation_id":"c-9"}
+
+data: {"message":{"id":"a9","author":{"role":"assistant"},"content":{"content_type":"text","parts":["Answer"]},"status":"finished_successfully","end_turn":true,"metadata":{"parent_id":"u9"}},"conversation_id":"c-9"}
+
+: keep-alive comment
+
+data: {"type":"message_stream_complete","conversation_id":"c-9"}
+
+data: [DONE]
+

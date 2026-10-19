@@ -1,0 +1,38 @@
+event: delta_encoding
+data: "v1"
+
+data: {"type":"input_message","input_message":{"id":"u5","author":{"role":"user"},"content":{"content_type":"text","parts":["计算 1+1 🤔"]},"status":"finished_successfully","metadata":{}},"conversation_id":"c-5"}
+
+event: delta
+data: {"p":"","o":"add","v":{"message":{"id":"k1","author":{"role":"assistant"},"recipient":"python","content":{"content_type":"code","language":"python","text":""},"status":"in_progress","metadata":{"parent_id":"u5"}},"conversation_id":"c-5"},"c":0}
+
+event: delta
+data: {"p":"/message/content/text","o":"append","v":"print(1+1)XX"}
+
+event: delta
+data: {"p":"/message/content/text","o":"truncate","v":10}
+
+event: delta
+data: {"p":"/message/status","o":"replace","v":"finished_successfully"}
+
+event: delta
+data: {"p":"","o":"add","v":{"message":{"id":"k2","author":{"role":"tool","name":"python"},"content":{"content_type":"execution_output","text":"2\n"},"status":"finished_successfully","metadata":{"parent_id":"k1"}},"conversation_id":"c-5"},"c":1}
+
+event: delta
+data: {"p":"","o":"add","v":{"message":{"id":"k3","author":{"role":"assistant"},"content":{"content_type":"text","parts":[""]},"status":"in_progress","metadata":{"parent_id":"k2","tmp":1}},"conversation_id":"c-5"},"c":2}
+
+event: delta
+data: {"p":"/message/metadata/tmp","o":"remove"}
+
+event: delta
+data: {"p":"/message/content/parts/0","o":"append","v":"答案是 **2** 😀"}
+
+event: delta
+data: {"c":2,"p":"","o":"patch","v":[{"p":"/message/status","o":"replace","v":"finished_successfully"},{"p":"/message/end_turn","o":"replace","v":true}]}
+
+data: {"type":"title_generation","title":"计算","conversation_id":"c-5"}
+
+data: {"type":"message_stream_complete","conversation_id":"c-5"}
+
+data: [DONE]
+
