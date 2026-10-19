@@ -198,7 +198,7 @@ Each worker branches from `clean-break-overhaul` (`cbo/protocol`, `cbo/ui`, `cbo
 
 ## 6. Open decisions for Ashley (defaults in bold)
 1. Stop rewriting the official stream (**yes**; hidden official UI may use a bit more CPU while generating).
-2. Replace auto "Continue generating" with an explicit button (**yes**).
+2. Replace auto "Continue generating" with an explicit button (**yes**; superseded 2026-10-19: the official UI no longer has Continue, so SlimGPT has none and `continue` left the wire contract).
 3. Remove Framework7 (**yes**).
 4. Keep reasoning-effort selector (**keep as simple select if reliable**).
 5. Version `0.4.0` (**yes**).

@@ -8,7 +8,7 @@
 //  * Snapshot-only: text is replaced, never heuristically merged/appended.
 //  * Precedence: a canonical message with status 'done' is final; live
 //    snapshots for that id are ignored. Live snapshots may update canonical
-//    nodes that are 'streaming' or 'interrupted' (e.g. Continue generating).
+//    nodes that are 'streaming' or 'interrupted' (e.g. a reply cut off by Stop).
 //    A later canonical ingest always replaces live data for the same id.
 //
 // The page hook (workstream C) does NOT parse protocol bodies: it forwards raw

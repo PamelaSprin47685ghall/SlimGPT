@@ -5,11 +5,14 @@
   import MediaBlock from './MediaBlock.svelte';
   import ErrorBlock from './ErrorBlock.svelte';
   import UnknownBlock from './UnknownBlock.svelte';
+  import DocumentBlock from './DocumentBlock.svelte';
   let { block, streaming = false } = $props();
 </script>
 
 {#if block.kind === 'text'}
   <TextBlock {block} {streaming} />
+{:else if block.kind === 'textdoc'}
+  <DocumentBlock {block} {streaming} />
 {:else if block.kind === 'reasoning'}
   <ReasoningBlock {block} {streaming} />
 {:else if block.kind === 'tool_call' || block.kind === 'tool_result'}

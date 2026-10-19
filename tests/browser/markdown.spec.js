@@ -11,6 +11,7 @@ import { createStore } from '../../src/ui/state.svelte.js';
 import { createFakeProtocol, canonical } from '../ui/fake-protocol.js';
 import * as RealProtocol from '../../src/protocol/index.js';
 import messageFixtures from '../fixtures/protocol/messages.json';
+import { visibleBlocks } from '../../src/ui/lib/visibility.js';
 
 const results = [];
 const scenario = new URLSearchParams(location.search).get('scenario') || 'normal';
@@ -301,20 +302,35 @@ if (scenario === 'normal') {
     equal(unknown.querySelector('.fold-label').textContent, '暂不支持的内容');
     equal(unknown.querySelector('.fold-hint').textContent, 'mystery');
   });
-  await test('interrupted reply offers 继续生成 only when allowed and dispatches continue', () => {
+  await test('interrupted reply shows a note and never a 继续生成 button', () => {
     const message = msg({ id: 'a9', status: 'interrupted', blocks: [text('partial')] });
-    const off = mountWith(Message, { message, canContinue: false });
-    ok(off.textContent.includes('回答未完成'), 'no interrupted note');
-    equal(off.querySelector('.continue'), null, 'continue shown when not allowed');
-    const actions = [];
-    const on = mountWith(Message, { message, canContinue: true }, actions);
-    equal(on.querySelector('.button.continue').textContent.trim(), '继续生成');
-    on.querySelector('.button.continue').click();
-    equal(JSON.stringify(actions), JSON.stringify([{ type: 'continue', messageId: 'a9' }]));
+    const view = mountWith(Message, { message });
+    ok(view.textContent.includes('回答未完成'), 'no interrupted note');
+    equal(view.querySelector('.continue'), null);
+    ok(!view.textContent.includes('继续生成'), 'continue offered');
+  });
+  await test('writing directive renders as a titled card; web search steps are hidden', () => {
+    const doc = mountWith(Block, { block: { kind: 'textdoc', directive: 'writing', variant: 'document', title: '宇宙大爆炸', markdown: '# 标题\n\n**正文**', citations: [] } });
+    equal(doc.querySelector('.doc-card .doc-title').textContent, '宇宙大爆炸');
+    equal(doc.querySelector('.doc-body strong').textContent, '正文');
+    ok(!doc.textContent.includes(':::'), 'raw directive shown');
+    const quiet = mountWith(Message, { message: msg({ id: 'w1', blocks: [
+      { kind: 'tool_call', tool: 'web.run', input: '{"search_query":[{"q":"x"}]}' },
+      { kind: 'tool_result', tool: 'web.run', output: 'results' },
+      { kind: 'tool_call', tool: 'python', input: 'print(1)' },
+    ] }) });
+    equal(quiet.querySelectorAll('details').length, 1, 'only the python card');
+    ok(!quiet.textContent.includes('search_query'), 'web.run call shown');
+    const python = quiet.querySelector('details');
+    equal(python.open, false, 'tool card collapsed');
   });
   await test('branch switcher shows position, dispatches by node and disables while running', () => {
     const actions = [];
     const target = mountWith(Message, { message: msg({ id: 'u5', role: 'user', blocks: [text('q')] }), branch: { index: 1, count: 3, siblingIds: [] } }, actions);
+    const hidden = [];
+    const reply = mountWith(Message, { message: msg({ id: 'a5', blocks: [text('r')] }), branch: { index: 0, count: 2, siblingIds: [] }, branchNodeId: 'sys5' }, hidden);
+    reply.querySelector('[aria-label="下一分支"]').click();
+    equal(JSON.stringify(hidden), JSON.stringify([{ type: 'switch-branch', nodeId: 'sys5', delta: 1 }]), 'reply switcher targets the branch node');
     equal(target.querySelector('.branch-pos').textContent, '2/3');
     target.querySelector('[aria-label="下一分支"]').click();
     target.querySelector('[aria-label="上一分支"]').click();
@@ -338,8 +354,8 @@ if (scenario === 'normal') {
         const html = target.innerHTML;
         ok(!/[\uE200-\uE2FF\uF000-\uF8FF]/.test(target.textContent), `${testCase.name}: private-use marker leaked`);
         ok(!/sediment:\/\/|file-service:\/\//.test(html), `${testCase.name}: asset pointer leaked`);
-        for (const block of message.blocks) {
-          const selector = { text: '.md', reasoning: 'details.reasoning', tool_call: 'details.tool', tool_result: 'details.tool', image: 'figure[data-kind="image"]', file: 'figure.media-card', error: '.block-error', unknown: 'details.unknown' }[block.kind];
+        for (const block of visibleBlocks(message)) {
+          const selector = { text: '.md', textdoc: '.doc-card', reasoning: 'details.reasoning', tool_call: 'details.tool', tool_result: 'details.tool', image: 'figure[data-kind="image"]', file: 'figure.media-card', error: '.block-error', unknown: 'details.unknown' }[block.kind];
           ok(target.querySelector(selector), `${testCase.name}: ${block.kind} not rendered`);
         }
         if (message.status === 'error') ok(target.querySelector('[role="alert"]'), `${testCase.name}: error not styled`);
@@ -381,7 +397,9 @@ if (scenario === 'normal') {
     conv()[0].querySelector('a.item-link').click();
     flushSync();
     equal(JSON.stringify(sent.at(-1)), JSON.stringify(['open', { conversationId: 'c1' }]));
-    ok(conv()[0].querySelector('.item-selected'), 'current conversation not selected');
+    ok(conv()[0].classList.contains('current') && !conv()[1].classList.contains('current'), 'current conversation not selected');
+    equal(target.querySelector('.conv-list.menu-list'), null, 'pill-style menu list');
+    ok(target.querySelector('.sidebar-toggle.panel-open') && !target.querySelector('.panel-toggle'), 'sidebar button must not carry F7 .panel-toggle (open+toggle cancel out)');
     equal(target.querySelector('.page.chat .navbar .title').textContent.trim(), '第一个');
     equal(target.querySelector('.status .status-text')?.textContent.trim(), '正在同步对话…');
     push('conversation', { conversationId: 'c1', body: canonical('c1', [['u1', null, 'user'], ['a1', 'u1']], 'a1', '第一个'), page: 1, pages: 1 });

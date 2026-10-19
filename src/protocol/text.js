@@ -20,6 +20,7 @@ export function messageToPlainText(message) {
     for (const block of message.blocks) {
       if (!isObject(block)) continue;
       if (block.kind === 'text' && block.markdown) primary.push(block.markdown);
+      else if (block.kind === 'textdoc' && (block.title || block.markdown)) primary.push([block.title, block.markdown].filter(Boolean).join('\n\n'));
       else if (block.kind === 'error' && block.message) primary.push(block.message);
       else if (block.kind === 'tool_call' && block.input) secondary.push(block.input);
       else if (block.kind === 'tool_result' && block.output) secondary.push(block.output);
@@ -66,6 +67,11 @@ function blockToMarkdown(block, options, numbering) {
   switch (block.kind) {
     case 'text':
       return block.markdown ? textWithCitations(block, numbering) : '';
+    case 'textdoc': {
+      const body = block.markdown ? textWithCitations(block, numbering) : '';
+      const heading = block.title && !body.trimStart().startsWith('#') ? `## ${block.title}` : '';
+      return [heading, body].filter(Boolean).join('\n\n');
+    }
     case 'reasoning': {
       if (!options.includeReasoning) return '';
       const body = [block.summary ? `**${block.summary}**` : '', block.markdown].filter(Boolean).join('\n\n');

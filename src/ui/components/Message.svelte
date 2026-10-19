@@ -6,13 +6,15 @@
   import Button from 'framework7-svelte/components/button.svelte';
   import { copyText } from '../lib/clipboard.js';
   import { notify } from '../f7.js';
+  import { visibleBlocks } from '../lib/visibility.js';
 
-  /** @type {{ message: import('../../protocol/types.js').Message, branch?: { index: number, count: number } | null, branchDisabled?: boolean, canContinue?: boolean }} */
-  let { message, branch = null, branchDisabled = false, canContinue = false } = $props();
+  /** @type {{ message: import('../../protocol/types.js').Message, branch?: { index: number, count: number } | null, branchNodeId?: string|null, branchDisabled?: boolean }} */
+  let { message, branch = null, branchNodeId = null, branchDisabled = false } = $props();
   const app = getContext('slimgpt');
 
   const streaming = $derived(message.status === 'streaming');
-  const hasContent = $derived(message.blocks.some((block) => ['text', 'image', 'file'].includes(block.kind)));
+  const blocks = $derived(visibleBlocks(message));
+  const hasContent = $derived(message.blocks.some((block) => ['text', 'textdoc', 'image', 'file'].includes(block.kind)));
   const hasErrorBlock = $derived(message.blocks.some((block) => block.kind === 'error'));
   const showBranch = $derived(!!branch && branch.count > 1);
   const showActions = $derived(showBranch || message.status === 'interrupted' || (hasContent && !streaming && (message.role === 'user' || message.role === 'assistant')));
@@ -28,10 +30,10 @@
 
 <article class="msg" data-role={message.role} data-status={message.status} data-id={message.id}>
   <div class="msg-body">
-    {#each message.blocks as block, index (index)}
+    {#each blocks as block, index (index)}
       <Block {block} {streaming} />
     {/each}
-    {#if streaming && !message.blocks.length}
+    {#if streaming && !blocks.length}
       <p class="muted pending">正在生成…</p>
     {/if}
     {#if message.status === 'error' && !hasErrorBlock}
@@ -41,16 +43,13 @@
   {#if showActions}
     <footer class="msg-actions">
       {#if showBranch}
-        <BranchSwitcher {branch} disabled={branchDisabled} onswitch={(delta) => app.dispatch({ type: 'switch-branch', nodeId: message.id, delta })} />
+        <BranchSwitcher {branch} disabled={branchDisabled} onswitch={(delta) => app.dispatch({ type: 'switch-branch', nodeId: branchNodeId ?? message.id, delta })} />
       {/if}
       {#if hasContent && !streaming}
         <Button small class="copy" onClick={copy}>复制</Button>
       {/if}
       {#if message.status === 'interrupted'}
         <span class="muted">回答未完成</span>
-        {#if canContinue}
-          <Button small tonal class="continue" onClick={() => app.dispatch({ type: 'continue', messageId: message.id })}>继续生成</Button>
-        {/if}
       {/if}
     </footer>
   {/if}

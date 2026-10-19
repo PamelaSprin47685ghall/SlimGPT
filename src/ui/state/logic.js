@@ -419,9 +419,6 @@ export function reduceAction(state, action, P) {
       return { state: { ...state, pending: null, sendError: { code: 'timeout', conversationId: state.pending.conversationId } }, effects: [] };
     }
     case 'stop': return { state, effects: [post('stop')] };
-    case 'continue':
-      if (!features(state).continueGeneration) return { state, effects: [] };
-      return { state, effects: [post('continue', { conversationId: state.currentId, messageId: action.messageId ?? null })] };
     case 'retry-sync': {
       const id = action.conversationId ?? state.currentId;
       if (!id || isFreeMode(state)) return { state, effects: [] };
@@ -471,7 +468,9 @@ export function isFreeMode(state) {
 /** Official features available in the current auth mode. */
 export function features(state) {
   const free = isFreeMode(state);
-  return { branches: !free, continueGeneration: !free };
+  // continueGeneration: the official UI has no Continue control any more
+  // (Stop leaves Copy/Regenerate/…), so it is never offered.
+  return { branches: !free, continueGeneration: false };
 }
 
 /**

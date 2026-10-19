@@ -14,6 +14,8 @@ test('allowlist accepts exactly the official stream, history and list endpoints'
   assert.deepEqual(classifyEndpoint('POST', '/backend-api/conversation/resume', O), { kind: 'resume' });
   assert.deepEqual(classifyEndpoint('GET', `/backend-api/conversation/${ID}`, O), { kind: 'history', conversationId: ID });
   assert.deepEqual(classifyEndpoint('GET', `/backend-api/conversation/${ID}?x=1`, O), { kind: 'history', conversationId: ID });
+  // The official app (HAR 2026-10-19) reads history from the plural path.
+  assert.deepEqual(classifyEndpoint('GET', `/backend-api/conversations/${ID}?num_turns=10&include_has_versions=true`, O), { kind: 'history', conversationId: ID });
   assert.deepEqual(classifyEndpoint('GET', '/backend-api/conversations?offset=28&limit=28', O), { kind: 'list', offset: 28 });
   assert.deepEqual(classifyEndpoint('GET', '/backend-api/conversations', O), { kind: 'list', offset: 0 });
 });
@@ -31,7 +33,9 @@ test('allowlist rejects look-alikes (memories, prepare, init, sub-resources, oth
     ['GET', '/backend-api/conversation/init'],
     ['GET', `/backend-api/conversation/${ID}/textdocs`],
     ['GET', `/backend-api/conversation/${ID}/stream_status`],
-    ['GET', `/backend-api/conversations/${ID}`],
+    ['GET', `/backend-api/conversations/${ID}/textdocs`],
+    ['GET', `/backend-api/bazaar/conversation/${ID}/ads`],
+    ['GET', '/backend-api/conversations/not-a-uuid'],
     ['GET', '/backend-api/conversations/search?q=x'],
     ['GET', `/backend-api/conversation/${ID}/`],
     ['GET', '/backend-api/conversation/WEB:abc'],

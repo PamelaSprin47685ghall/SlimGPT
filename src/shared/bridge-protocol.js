@@ -31,7 +31,7 @@
 //   stream-chunk     { streamId: string, chunk: string }
 //   stream-end       { streamId: string, ok: boolean }
 //   send-result      { commandId: string, ok: boolean, error: SendErrorCode|null }
-//   command-result   { commandId: string|null, command: 'stop'|'continue'|'switch-branch'|'set-effort', ok: boolean, error: CommandErrorCode|null }   (additive, C)
+//   command-result   { commandId: string|null, command: 'stop'|'switch-branch'|'set-effort', ok: boolean, error: CommandErrorCode|null }   (additive, C)
 //   effort           { available: boolean, effort: EffortValue|null }                                       (additive, C)
 //   takeover         { visible: boolean, reason: 'ready'|'user'|'blocking-official-ui'|'composer-unavailable' }
 //   storage-result   { requestId: string, ok: boolean, values: object, error: string|null }   (sent by the isolated bridge)
@@ -41,7 +41,7 @@
 //   open             { conversationId: string|null }       null = new chat
 //   send             { commandId: string, text: string }
 //   stop             { commandId?: string }
-//   continue         { conversationId: string|null, messageId: string|null, commandId?: string }   (additive, C) click the official "Continue generating"
+//   (no `continue`: the official UI has no Continue control any more; removed 2026-10-19)
 //   switch-branch    { commandId: string, messageId: string, direction: -1|1 }   (additive, C) one step on the official branch arrows
 //   refresh          { conversationId: string }
 //   refresh-list     {}                                     (additive, C)
@@ -69,7 +69,7 @@ export const PAGE_TO_UI = Object.freeze([
 ]);
 
 export const UI_TO_PAGE = Object.freeze([
-  'ui-ready', 'open', 'send', 'stop', 'continue', 'switch-branch', 'refresh', 'refresh-list',
+  'ui-ready', 'open', 'send', 'stop', 'switch-branch', 'refresh', 'refresh-list',
   'show-official', 'set-effort', 'storage-get', 'storage-set',
 ]);
 

@@ -5,6 +5,7 @@
 // ImageBlock.assetPointer, never in text.
 
 import { extractCitations } from './citations.js';
+import { splitDirectives } from './directives.js';
 import { ROLES } from './types.js';
 import { finiteOrNull, firstString, isObject, safeClone, safeStringify, str } from './util.js';
 
@@ -262,7 +263,10 @@ function contentBlocks(raw, { role, content, metadata, streaming }) {
       ? (text) => [textBlock(text)]
       : (text) => {
         const { markdown, citations } = extractCitations(text, metadata, { streaming });
-        return markdown || citations.length ? [textBlock(markdown, citations)] : [];
+        if (!markdown && !citations.length) return [];
+        return splitDirectives(markdown, citations).map((segment) => (segment.kind === 'textdoc'
+          ? segment
+          : textBlock(segment.markdown, segment.citations)));
       };
     return partsToBlocks(parts, makeText);
   }

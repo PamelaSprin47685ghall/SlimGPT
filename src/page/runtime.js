@@ -216,13 +216,6 @@ export function installHook(win) {
       }
       case 'stop':
         return reply(message, 'stop', composer.stop());
-      case 'continue': {
-        const target = message.conversationId ?? null;
-        if (target !== null && (!isConversationId(target) || target !== lastConversationId)) {
-          return reply(message, 'continue', Promise.resolve({ ok: false, error: 'invalid-argument' }));
-        }
-        return reply(message, 'continue', composer.continueGeneration());
-      }
       case 'switch-branch':
         return reply(message, 'switch-branch', composer.switchBranch(message.messageId, Number(message.direction)));
       case 'set-effort': {

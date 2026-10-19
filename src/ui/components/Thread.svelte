@@ -3,8 +3,8 @@
   import Button from 'framework7-svelte/components/button.svelte';
   import Turn from './Turn.svelte';
 
-  /** @type {{ turns: import('../../protocol/types.js').Turn[], conversationKey: string, running?: boolean, canContinue?: boolean, branches?: boolean, empty?: string }} */
-  let { turns, conversationKey, running = false, canContinue = false, branches = true, empty = '' } = $props();
+  /** @type {{ turns: import('../../protocol/types.js').Turn[], conversationKey: string, running?: boolean, branches?: boolean, empty?: string }} */
+  let { turns, conversationKey, running = false, branches = true, empty = '' } = $props();
   let scroller = $state();
   let content = $state();
   let follow = $state(true);
@@ -47,7 +47,7 @@
       <p class="thread-empty">{empty}</p>
     {/if}
     {#each turns as turn, index (turn.user?.id ?? `lead-${turn.replies[0]?.id ?? index}`)}
-      <Turn {turn} last={index === turns.length - 1} {running} {canContinue} {branches} />
+      <Turn {turn} last={index === turns.length - 1} {running} {branches} />
     {/each}
   </div>
   {#if !follow}

@@ -1,6 +1,8 @@
 // Drives the official ChatGPT composer for explicit UI commands only:
-// send, stop, continue, switch branch, reasoning effort. Nothing here runs on
-// its own (no auto "Continue generating", no DOM observers left running).
+// send, stop, switch branch, reasoning effort. Nothing here runs on its own
+// (no DOM observers left running). There is no "Continue generating": the
+// current official UI has no such control (HAR 2026-10-19), and SlimGPT never
+// fakes one by sending a continuation message.
 // All DOM access goes through a DomAdapter (see dom.js).
 
 import { EFFORT_VALUES } from '../shared/bridge-protocol.js';
@@ -55,14 +57,11 @@ export const SLIDER_SELECTORS = Object.freeze([
   '[role="slider"][aria-label*="thinking" i]',
 ]);
 
-const CONTINUE_LABEL = /^(?:continue(?: generating| response)?|继续(?:生成|回答|回复)?)[.!。…\s]*$/i;
 const STOP_LABEL = /^(?:stop(?: generating| generation| response| streaming| thinking)?|停止(?:生成|回答|回复|思考)?)[.!。…\s]*$/i;
 const STOP_TESTID = /^stop(?:-button)?$/i;
 const PREV_LABEL = /^(?:previous(?: response| message| version)?|上一(?:个|条|版)?(?:回复|回答|消息|版本)?)$/i;
 const NEXT_LABEL = /^(?:next(?: response| message| version)?|下一(?:个|条|版)?(?:回复|回答|消息|版本)?)$/i;
 
-/** @param {string} label */
-export const isContinueLabel = (label) => CONTINUE_LABEL.test(label);
 /** @param {string} label */
 export const isStopLabel = (label) => STOP_LABEL.test(label);
 /** @param {string} label @param {-1|1} direction */
@@ -143,11 +142,6 @@ export function createComposerDriver({ dom, officialUi, isStreaming = () => fals
     if (!form) return null;
     return dom.queryWithin(form, 'button').find((button) => dom.isEnabledButton(button) &&
       (STOP_TESTID.test(String(dom.attr(button, 'data-testid') || '')) || isStopLabel(dom.label(button)))) || null;
-  }
-
-  function findContinueControl() {
-    return dom.queryAll('button').find((button) => dom.isEnabledButton(button) && dom.isVisible(button) &&
-      isContinueLabel(dom.label(button))) || null;
   }
 
   function findSlider() {
@@ -240,19 +234,6 @@ export function createComposerDriver({ dom, officialUi, isStreaming = () => fals
     });
   }
 
-  async function continueGeneration() {
-    if (isStreaming()) return { ok: false, error: 'busy' };
-    return exclusive(async () => {
-      if (findBlocker()) return { ok: false, error: 'blocked-by-official-ui' };
-      const control = findContinueControl();
-      if (!control) return { ok: false, error: 'control-not-found' };
-      const confirmation = waitForSubmission();
-      dom.click(control);
-      const settled = await confirmation;
-      return settled?.ok ? { ok: true, error: null } : { ok: false, error: 'not-confirmed' };
-    });
-  }
-
   async function switchBranch(messageId, direction) {
     if (typeof messageId !== 'string' || !messageId || (direction !== -1 && direction !== 1)) {
       return { ok: false, error: 'invalid-argument' };
@@ -323,7 +304,7 @@ export function createComposerDriver({ dom, officialUi, isStreaming = () => fals
   }
 
   return {
-    send, stop, continueGeneration, switchBranch, setEffort, readEffort,
+    send, stop, switchBranch, setEffort, readEffort,
     noteSubmission, findBlocker, findComposer, hasComposer, isBusy: () => busy,
   };
 }

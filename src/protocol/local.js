@@ -8,6 +8,18 @@ import { isObject } from './util.js';
 import { sourceId, sourceRawMessage } from './conversation-source.js';
 import { parseConversation } from './conversation.js';
 
+
+// Source text of a block for the local (device) store; documents go back to
+// their directive form so re-parsing yields the same blocks.
+function blockSource(block) {
+  if (block?.kind === 'text') return block.markdown;
+  if (block?.kind === 'textdoc') {
+    const attr = (key, value) => (value ? ` ${key}="${String(value).replace(/["\\\n]/g, ' ')}"` : '');
+    return `:::${block.directive || 'writing'}{${(attr('variant', block.variant) + attr('title', block.title)).trim()}}\n${block.markdown}\n:::`;
+  }
+  return null;
+}
+
 export const LOCAL_RECORD_VERSION = 1;
 export const LOCAL_LIMITS = Object.freeze({ maxCount: 50, maxChars: 1_500_000, maxTitleChars: 120 });
 
@@ -27,7 +39,7 @@ export function localRecordFromConversation(conversation, meta = {}) {
     for (const node of conversation.nodes.values()) {
       const message = node?.message;
       if (!message || message.hidden || (message.role !== 'user' && message.role !== 'assistant')) continue;
-      const text = (message.blocks || []).filter((block) => block?.kind === 'text').map((block) => block.markdown).join('\n\n');
+      const text = (message.blocks || []).map(blockSource).filter((part) => part !== null).join('\n\n');
       messages.push({ id: message.id, parent: node.parentId ?? null, role: message.role, text, status: STATUS_TO_RAW[message.status] || 'finished_partial_completion' });
     }
     if (!messages.length) return null;

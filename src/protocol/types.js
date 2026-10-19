@@ -91,8 +91,21 @@
  */
 
 /**
+ * A document (kind 'textdoc') produced by an assistant directive such as
+ * `:::writing{variant="document" id="58321" title="…"}` … `:::` (the official
+ * UI renders it as a document card). Additive (2026-10-19).
+ * @typedef {Object} DocumentBlock
+ * @property {'textdoc'} kind
+ * @property {string} directive    Directive name, e.g. "writing".
+ * @property {string|null} variant e.g. "document", "email".
+ * @property {string|null} title
+ * @property {string} markdown     Body between the fence lines (markers removed).
+ * @property {Citation[]} citations Offsets into `markdown`.
+ */
+
+/**
  * @typedef {TextBlock | ReasoningBlock | ToolCallBlock | ToolResultBlock |
- *   ImageBlock | FileBlock | ErrorBlock | UnknownBlock} Block
+ *   ImageBlock | FileBlock | ErrorBlock | UnknownBlock | DocumentBlock} Block
  */
 
 /**
@@ -158,7 +171,7 @@
 export const ROLES = Object.freeze(['user', 'assistant', 'tool', 'system']);
 export const MESSAGE_STATUSES = Object.freeze(['streaming', 'done', 'interrupted', 'error']);
 export const BLOCK_KINDS = Object.freeze([
-  'text', 'reasoning', 'tool_call', 'tool_result', 'image', 'file', 'error', 'unknown',
+  'text', 'reasoning', 'tool_call', 'tool_result', 'image', 'file', 'error', 'unknown', 'textdoc',
 ]);
 export const STREAM_ERROR_CODES = Object.freeze([
   'invalid-json', 'invalid-delta', 'unsupported-encoding', 'buffer-limit', 'truncated', 'revision-gap',

@@ -221,16 +221,16 @@ test('send: guarded, single in flight, failure keeps the draft and explains, tim
   assert.equal(L.currentDraft(h.state), '问题');
 });
 
-test('stop, continue, show-official and effort map to page commands', () => {
+test('stop, show-official and effort map to page commands', () => {
   const h = harness().ready();
   h.act('open', { conversationId: 'c1' });
   h.act('stop');
-  h.act('continue', { messageId: 'a9' });
+  h.act('continue', { messageId: 'a9' }); // removed action: ignored
   h.act('show-official');
   h.act('set-effort', { effort: 'extended' });
   h.act('set-effort', { effort: '' });
   assert.deepEqual(h.posts().slice(1).map((e) => [e.message, e.fields]), [
-    ['stop', {}], ['continue', { conversationId: 'c1', messageId: 'a9' }], ['show-official', {}], ['set-effort', { effort: 'extended' }],
+    ['stop', {}], ['show-official', {}], ['set-effort', { effort: 'extended' }],
   ]);
   assert.equal(h.state.settings.effort, '');
   assert.ok(h.effects.some((e) => e.type === 'save' && e.key === 'settings'));

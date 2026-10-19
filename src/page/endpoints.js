@@ -5,7 +5,8 @@
 //   POST /backend-api/conversation             official SSE stream (new turn)
 //   POST /backend-api/f/conversation           official SSE stream (new turn)
 //   POST /backend-api/(f/)conversation/resume  official SSE stream (resume)
-//   GET  /backend-api/conversation/<uuid>      official full history
+//   GET  /backend-api/conversation/<uuid>      official full history (mapping)
+//   GET  /backend-api/conversations/<uuid>     official paged history (what the app uses)
 //   GET  /backend-api/conversations            conversation list
 //   POST /unauth-mweb/conversation/updates     logged-out (free mode) NDJSON stream
 // Matching is on the exact pathname of a same-origin URL; query strings are
@@ -15,7 +16,9 @@ export const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0
 
 const SUBMIT_PATH = /^\/backend-api\/(?:f\/)?conversation$/;
 const RESUME_PATH = /^\/backend-api\/(?:f\/)?conversation\/resume$/;
-const HISTORY_PATH = /^\/backend-api\/conversation\/([^/]+)$/;
+// The official app reads history from the plural path (paged path view,
+// `?num_turns=…&include_has_versions=true`); the singular one is the full tree.
+const HISTORY_PATH = /^\/backend-api\/conversations?\/([^/]+)$/;
 const LIST_PATH = /^\/backend-api\/conversations$/;
 const FREE_UPDATES_PATH = /^\/unauth-mweb\/conversation\/updates$/;
 // Same-origin path prefixes only the logged-out app uses (evidence of free mode).

@@ -15,9 +15,13 @@ import { isObject, safeJsonParse } from './util.js';
 // WEAK_PARENTS: node ids whose parent was inferred from page order rather
 // than stated by the server; such parents may be corrected by later data.
 const WEAK_PARENTS = Symbol('slimgpt.weakParents');
+// FULL_TREE: this value came from a full `mapping` history (every node of
+// every branch), as opposed to a paged path view.
+const FULL_TREE = Symbol('slimgpt.fullTree');
 
-function withPrivate(conversation, weakParents) {
+function withPrivate(conversation, weakParents, fullTree = false) {
   Object.defineProperty(conversation, WEAK_PARENTS, { value: weakParents, enumerable: false });
+  Object.defineProperty(conversation, FULL_TREE, { value: fullTree, enumerable: false });
   return conversation;
 }
 
@@ -121,15 +125,18 @@ function parseMapping(body) {
 function parseMessageList(messages) {
   const nodes = new Map();
   const weak = new Set();
-  const stated = messages.some((raw) => isObject(raw) && (raw.parent_id || raw.metadata?.parent_id));
+  const pageIds = new Set(messages.filter(isObject).map((raw) => raw.id).filter((id) => typeof id === 'string'));
   let previousId = null;
   for (const raw of messages) {
     const message = normalizeMessage(raw, { source: 'canonical' });
     if (!message || nodes.has(message.id)) continue;
     let parentId = message.parentId;
-    if (!parentId && !stated && previousId) {
-      // The page states no parents at all: it is an ordered path, so chain it,
-      // but remember the parent is only inferred.
+    if (previousId && (!parentId || !pageIds.has(parentId))) {
+      // The paged history (`/backend-api/conversations/<id>?num_turns=…`) is
+      // the current PATH in order; hidden nodes are omitted, so a stated
+      // parent may point outside the page and the first visible message may
+      // state none. Chain to the previous message, remembering that the
+      // parent is only inferred (a full tree or live data may correct it).
       parentId = previousId;
       weak.add(message.id);
     }
@@ -151,6 +158,7 @@ export function parseConversation(body) {
     let complete;
     if (isObject(value.mapping)) {
       parsed = parseMapping(value);
+      parsed.fullTree = true;
       complete = !isObject(value.page_info) || value.page_info.has_previous_page === false;
     } else if (Array.isArray(value.messages) && ('current_node' in value || 'page_info' in value || 'conversation_id' in value)) {
       parsed = parseMessageList(value.messages);
@@ -168,7 +176,7 @@ export function parseConversation(body) {
       nodes: parsed.nodes,
       currentNodeId: currentNodeId ?? newestLeaf(parsed.nodes),
       complete,
-    }, parsed.weak);
+    }, parsed.weak, parsed.fullTree === true);
   } catch {
     return null;
   }
@@ -235,7 +243,7 @@ export function mergeConversation(previous, incoming) {
     // streaming re-appears with its next snapshot.
     // Exception: the live path that continues the canonical current node
     // (canonical fetched while a reply is still streaming).
-    if (incoming.complete && incoming.nodes.size) {
+    if (incoming[FULL_TREE] === true && incoming.complete && incoming.nodes.size) {
       const keep = new Set();
       const leaf = previous.currentNodeId;
       if (leaf && nodes.get(leaf)?.message?.source === 'live' && incoming.currentNodeId && incoming.nodes.has(incoming.currentNodeId) &&

@@ -32,13 +32,12 @@
     <Button fill class="new-chat" active={currentId === null} onClick={() => onopen(null)}>＋ 新对话</Button>
   </Block>
   {#if items.length}
-    <List menuList class="conv-list">
+    <List noChevron class="conv-list">
       {#each items as item (item.id)}
         <ListItem
           link
-          class="conv"
+          class={item.id === currentId ? 'conv current' : 'conv'}
           title={item.title || '未命名对话'}
-          selected={item.id === currentId}
           after={running.has(item.id) ? '生成中' : item.device ? '本机' : undefined}
           onClick={() => onopen(item.id)}
         />

@@ -91,7 +91,7 @@ test('runtime: hello on frame load, observed history forwarded raw, exact origin
   assert.ok(env.posted.every((p) => !JSON.stringify(p.message).includes('Bearer')), 'credentials never cross the bridge');
 });
 
-test('runtime: commands from a foreign origin are ignored; refresh/open/continue are validated', async () => {
+test('runtime: commands from a foreign origin are ignored; refresh/open are validated; continue is not a command', async () => {
   const requests = [];
   const env = fakeWindow(async (url) => {
     requests.push(new URL(url, 'https://chatgpt.com').pathname);
@@ -121,8 +121,7 @@ test('runtime: commands from a foreign origin are ignored; refresh/open/continue
 
   env.fromFrame(UI('continue', { conversationId: '00000000-0000-4000-8000-000000000000', messageId: 'm' }));
   await settle();
-  const result = env.posted.at(-1).message;
-  assert.deepEqual([result.type, result.command, result.ok, result.error], ['command-result', 'continue', false, 'invalid-argument']);
+  assert.ok(!env.posted.some((p) => p.message.command === 'continue'), 'continue is not part of the bridge contract');
 
   env.fromFrame(UI('send', { commandId: 'c1', text: '   ' }));
   await settle();

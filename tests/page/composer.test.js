@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  createComposerDriver, effortToSliderValue, isBranchLabel, isContinueLabel, isStopLabel, sliderValueToEffort,
+  createComposerDriver, effortToSliderValue, isBranchLabel, isStopLabel, sliderValueToEffort,
 } from '../../src/page/composer.js';
 
 // Plain-object fake of the DomAdapter. `selectors` maps a selector string to
@@ -57,9 +57,6 @@ function composerSetup(dom) {
 }
 
 test('label matchers are exact', () => {
-  assert.ok(isContinueLabel('Continue generating'));
-  assert.ok(isContinueLabel('继续生成'));
-  assert.ok(!isContinueLabel('Continue with Google'));
   assert.ok(isStopLabel('Stop streaming'));
   assert.ok(isStopLabel('停止生成'));
   assert.ok(!isStopLabel('Stop sharing link'));
@@ -146,17 +143,9 @@ test('stop clicks only the official stop control', async () => {
   assert.deepEqual(dom.log.at(-1), ['click', 'stop']);
 });
 
-test('continue is explicit and confirmed by the official request', async () => {
-  const dom = fakeDom();
-  let driver;
-  dom.on('button',
-    dom.el({ name: 'google', label: 'Continue with Google' }),
-    dom.el({ name: 'continue', label: 'Continue generating', onClick: () => queueMicrotask(() => driver.noteSubmission({ ok: true, status: 200 })) }));
-  driver = createComposerDriver({ dom, officialUi: officialUi(), timeouts: T });
-  assert.deepEqual(await driver.continueGeneration(), { ok: true, error: null });
-  assert.deepEqual(dom.log, [['click', 'continue']]);
-  dom.selectors.set('button', []);
-  assert.deepEqual(await driver.continueGeneration(), { ok: false, error: 'control-not-found' });
+test('there is no continue command: the official UI has none, and nothing fakes one', () => {
+  const driver = createComposerDriver({ dom: fakeDom(), officialUi: officialUi(), timeouts: T });
+  assert.equal(driver.continueGeneration, undefined);
 });
 
 test('switch-branch clicks the arrow inside that message turn and waits for the sibling to replace it', async () => {

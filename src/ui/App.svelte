@@ -13,6 +13,7 @@
   import List from 'framework7-svelte/components/list.svelte';
   import ListItem from 'framework7-svelte/components/list-item.svelte';
   import { f7params, notify, closePanel } from './f7.js';
+  import { copyText } from './lib/clipboard.js';
   import { createStore } from './state.svelte.js';
   import * as L from './state/logic.js';
   import Sidebar from './components/Sidebar.svelte';
@@ -53,7 +54,8 @@
     let text = '';
     try { text = P.conversationToMarkdown(conv, { leafId: L.selectedLeaf(s), includeReasoning: false, includeTools: false }); } catch { text = ''; }
     if (!text.trim()) { notify('当前对话暂无可导出的消息'); return; }
-    downloadText(text, safeFileName(title));
+    if (downloadText(text, safeFileName(title))) { notify('已导出 Markdown'); return; }
+    void copyText(text).then((ok) => notify(ok ? '无法下载文件，已复制 Markdown 到剪贴板' : '导出失败'), () => notify('导出失败'));
   }
 </script>
 
@@ -64,7 +66,7 @@
   <View main>
     <Page pageContent={false} withSubnavbar={!!status} class="chat">
       <Navbar>
-        <NavLeft><Link iconOnly panelOpen="left" class="panel-toggle" aria-label="打开会话侧栏">☰</Link></NavLeft>
+        <NavLeft><Link iconOnly panelOpen="left" class="sidebar-toggle" aria-label="打开会话侧栏">☰</Link></NavLeft>
         <NavTitle title={title} />
         <NavRight><Link iconOnly popoverOpen=".menu-popover" aria-label="更多操作">⋯</Link></NavRight>
         {#if status}<StatusLine {status} onaction={(type) => store.dispatch({ type })} />{/if}
@@ -73,7 +75,6 @@
         turns={view.turns}
         conversationKey={s.currentId ?? ''}
         {running}
-        canContinue={feature.continueGeneration && !running && !offBranch && check.reason !== 'bridge' && check.reason !== 'pending'}
         branches={feature.branches}
         empty={emptyText}
       />
