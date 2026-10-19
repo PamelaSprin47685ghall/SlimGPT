@@ -1,27 +1,50 @@
 <script>
+  import Page from 'framework7-svelte/components/page.svelte';
+  import Navbar from 'framework7-svelte/components/navbar.svelte';
+  import Subnavbar from 'framework7-svelte/components/subnavbar.svelte';
+  import Searchbar from 'framework7-svelte/components/searchbar.svelte';
+  import Block from 'framework7-svelte/components/block.svelte';
+  import Button from 'framework7-svelte/components/button.svelte';
+  import List from 'framework7-svelte/components/list.svelte';
+  import ListItem from 'framework7-svelte/components/list-item.svelte';
   import { filterList } from '../state/logic.js';
+
   /** @type {{ list: {id:string,title:string}[], currentId: string|null, running: Set<string>, onopen: (id: string|null) => void }} */
   let { list, currentId, running, onopen } = $props();
   let query = $state('');
   const items = $derived(filterList(list, query));
 </script>
 
-<nav class="sidebar" aria-label="会话侧栏">
-  <div class="sidebar-head">
-    <button type="button" class="btn new-chat" aria-current={currentId === null ? 'page' : undefined} onclick={() => onopen(null)}>＋ 新对话</button>
-    <input class="filter" type="search" placeholder="筛选标题" aria-label="按标题筛选对话" bind:value={query} />
-  </div>
-  <ul class="conv-list">
-    {#each items as item (item.id)}
-      <li>
-        <button type="button" class="conv" aria-current={item.id === currentId ? 'page' : undefined} onclick={() => onopen(item.id)}>
-          <span class="conv-title">{item.title || '未命名对话'}</span>
-          {#if running.has(item.id)}<span class="running-dot" title="生成中" aria-label="生成中"></span>{/if}
-        </button>
-      </li>
-    {/each}
-  </ul>
-  {#if !items.length}
-    <p class="muted sidebar-empty">{query ? '没有匹配的对话' : '暂无对话'}</p>
+<Page withSubnavbar class="sidebar">
+  <Navbar title="对话">
+    <Subnavbar inner={false}>
+      <Searchbar
+        customSearch
+        disableButton={false}
+        clearButton={false}
+        placeholder="筛选标题"
+        onSearchbarSearch={(_bar, value) => (query = value)}
+        onSearchbarClear={() => (query = '')}
+      />
+    </Subnavbar>
+  </Navbar>
+  <Block class="new-chat-block">
+    <Button fill class="new-chat" active={currentId === null} onClick={() => onopen(null)}>＋ 新对话</Button>
+  </Block>
+  {#if items.length}
+    <List menuList class="conv-list">
+      {#each items as item (item.id)}
+        <ListItem
+          link
+          class="conv"
+          title={item.title || '未命名对话'}
+          selected={item.id === currentId}
+          after={running.has(item.id) ? '生成中' : undefined}
+          onClick={() => onopen(item.id)}
+        />
+      {/each}
+    </List>
+  {:else}
+    <Block class="sidebar-empty">{query ? '没有匹配的对话' : '暂无对话'}</Block>
   {/if}
-</nav>
+</Page>

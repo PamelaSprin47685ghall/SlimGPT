@@ -36,13 +36,13 @@ chatgpt.com 页面
 │    自行拉取历史（分页、合并、退避）；按 UI 指令驱动官方输入框
 │    （发送 / 停止 / 继续生成 / 切换分支 / 推理强度）
 └─ iframe: index.html  (扩展页面, src/ui)
-     Svelte 5 界面；所有解析只在这里通过 src/protocol 完成
+     Svelte 5 + Framework7 9 界面；所有解析只在这里通过 src/protocol 完成
 ```
 
 - `src/protocol/`：纯函数解析核心。一个消息模型（Conversation → Node → Message → Block[]），一个 SSE 解析器 + 一个 delta 解码器，只做快照替换，不做文本猜测合并；对任何输入都不抛异常，未知内容显示为可折叠的 “未知” 块。
 - `src/shared/bridge-protocol.js`：页面 ⇄ UI 的线协议（v2），两跳都做精确 origin 校验，凭据不跨桥。
 - `src/page/`：页面钩子与隔离桥。无 DOM 消息抓取、无 web-mobile HTML、无 XHR/WebSocket 钩子、无自动 “继续生成”。
-- `src/ui/`：界面。思考过程、工具调用/结果默认折叠；图片/文件/音频显示为中性卡片；引用显示为编号链接；分支切换只读（非当前分支禁止发送）。
+- `src/ui/`：界面，基于 Framework7（左侧 Panel 会话列表，宽屏常驻、手机端抽屉；Navbar + 单列消息流 + 输入框；Popover 菜单；Toast 提示；跟随系统深色模式），只按需引入用到的 F7 组件。思考过程、工具调用/结果默认折叠；图片/文件/音频显示为中性卡片；引用显示为编号链接；分支切换只读（非当前分支禁止发送）。
 
 ## 开发
 
@@ -64,6 +64,6 @@ npm run dev            # Vite 开发服务器（只用于看界面）
 
 ## English (short)
 
-SlimGPT is an unofficial WebExtension (Chrome MV3, Firefox MV3 incl. Android, Orion) that overlays a lightweight UI on your own logged-in chatgpt.com tab. The page hook only *observes* the official SSE stream and full-history fetch (exact endpoint allowlist, `response.clone()`, never rewritten), forwards raw bodies to the extension frame over an exact-origin bridge, and drives the official composer only for explicit commands. All parsing happens in the pure `src/protocol` core (one message model, snapshot replacement, total parser). Permissions: `storage` only; host `https://chatgpt.com/*`.
+SlimGPT is an unofficial WebExtension (Chrome MV3, Firefox MV3 incl. Android, Orion) that overlays a lightweight Svelte 5 + Framework7 UI on your own logged-in chatgpt.com tab. The page hook only *observes* the official SSE stream and full-history fetch (exact endpoint allowlist, `response.clone()`, never rewritten), forwards raw bodies to the extension frame over an exact-origin bridge, and drives the official composer only for explicit commands. All parsing happens in the pure `src/protocol` core (one message model, snapshot replacement, total parser). Permissions: `storage` only; host `https://chatgpt.com/*`.
 
 Commands: `npm ci && npm test && npm run check && npm run build && npm run test:markdown`. Load `dist-extension/` (Chrome) or `dist-firefox/manifest.json` (Firefox) unpacked.

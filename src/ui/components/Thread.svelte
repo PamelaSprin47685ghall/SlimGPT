@@ -1,5 +1,6 @@
 <script>
   import { tick } from 'svelte';
+  import Button from 'framework7-svelte/components/button.svelte';
   import Turn from './Turn.svelte';
 
   /** @type {{ turns: import('../../protocol/types.js').Turn[], conversationKey: string, running?: boolean, canContinue?: boolean, empty?: string }} */
@@ -40,18 +41,16 @@
   });
 </script>
 
-<div class="thread-wrap">
-  <div class="thread" bind:this={scroller} onscroll={onScroll}>
-    <div class="thread-inner" bind:this={content}>
-      {#if !turns.length}
-        <p class="thread-empty muted">{empty}</p>
-      {/if}
-      {#each turns as turn, index (turn.user?.id ?? `lead-${turn.replies[0]?.id ?? index}`)}
-        <Turn {turn} last={index === turns.length - 1} {running} {canContinue} />
-      {/each}
-    </div>
+<div class="page-content thread" bind:this={scroller} onscroll={onScroll}>
+  <div class="thread-inner" bind:this={content}>
+    {#if !turns.length}
+      <p class="thread-empty">{empty}</p>
+    {/if}
+    {#each turns as turn, index (turn.user?.id ?? `lead-${turn.replies[0]?.id ?? index}`)}
+      <Turn {turn} last={index === turns.length - 1} {running} {canContinue} />
+    {/each}
   </div>
   {#if !follow}
-    <button type="button" class="to-bottom" onclick={toBottom}>回到底部</button>
+    <Button small fill round class="to-bottom" onClick={toBottom}>回到底部</Button>
   {/if}
 </div>

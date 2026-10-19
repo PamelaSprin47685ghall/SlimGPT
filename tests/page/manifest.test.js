@@ -47,14 +47,17 @@ test('Firefox (desktop + Android) gecko settings', async () => {
   assert.ok(Number.parseInt(firefox.browser_specific_settings.gecko.strict_min_version, 10) >= 128, 'MAIN world needs Firefox 128+');
 });
 
-test('dependencies: no Framework7 / smol-toml / PWA; UI runtime deps kept', async () => {
+test('dependencies: Framework7 9.1.3 UI kept; no smol-toml / PWA', async () => {
   const pkg = await read('package.json');
   const all = { ...pkg.dependencies, ...pkg.devDependencies };
-  for (const name of ['framework7', 'framework7-svelte', 'smol-toml', 'vite-plugin-pwa']) assert.equal(all[name], undefined, name);
+  for (const name of ['smol-toml', 'vite-plugin-pwa']) assert.equal(all[name], undefined, name);
   for (const name of ['svelte', 'streaming-markdown', 'highlight.js', 'katex']) assert.ok(pkg.dependencies[name], name);
+  assert.equal(pkg.dependencies.framework7, '9.1.3');
+  assert.equal(pkg.dependencies['framework7-svelte'], '9.1.3');
   const lock = await read('package-lock.json');
-  assert.equal(lock.packages['node_modules/framework7'], undefined);
-  assert.equal(lock.packages[''].dependencies.framework7, undefined);
+  assert.equal(lock.packages['node_modules/framework7']?.version, '9.1.3');
+  assert.equal(lock.packages['node_modules/framework7-svelte']?.version, '9.1.3');
+  assert.equal(lock.packages[''].dependencies.framework7, '9.1.3');
 });
 
 test('build script bundles the new page entries for every target', async () => {

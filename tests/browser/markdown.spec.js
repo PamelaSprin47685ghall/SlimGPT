@@ -249,7 +249,8 @@ if (scenario === 'normal') {
     ok(target.textContent.includes('Hello'), 'streaming text not shown');
     const done = mountWith(Message, { message: msg({ blocks: [text('Hello **world**')] }) });
     equal(done.querySelector('strong')?.textContent, 'world');
-    const copy = [...done.querySelectorAll('.msg-actions button')].find((b) => b.textContent === '复制');
+    const copy = done.querySelector('.msg-actions .button.copy');
+    equal(copy.textContent.trim(), '复制');
     copy.click();
     await waitFor(() => clip.copied !== null);
     equal(clip.copied, 'Hello **world**');
@@ -304,10 +305,11 @@ if (scenario === 'normal') {
     const message = msg({ id: 'a9', status: 'interrupted', blocks: [text('partial')] });
     const off = mountWith(Message, { message, canContinue: false });
     ok(off.textContent.includes('回答未完成'), 'no interrupted note');
-    ok(![...off.querySelectorAll('button')].some((b) => b.textContent === '继续生成'), 'continue shown when not allowed');
+    equal(off.querySelector('.continue'), null, 'continue shown when not allowed');
     const actions = [];
     const on = mountWith(Message, { message, canContinue: true }, actions);
-    [...on.querySelectorAll('button')].find((b) => b.textContent === '继续生成').click();
+    equal(on.querySelector('.button.continue').textContent.trim(), '继续生成');
+    on.querySelector('.button.continue').click();
     equal(JSON.stringify(actions), JSON.stringify([{ type: 'continue', messageId: 'a9' }]));
   });
   await test('branch switcher shows position, dispatches by node and disables while running', () => {
@@ -318,7 +320,9 @@ if (scenario === 'normal') {
     target.querySelector('[aria-label="上一分支"]').click();
     equal(JSON.stringify(actions), JSON.stringify([{ type: 'switch-branch', nodeId: 'u5', delta: 1 }, { type: 'switch-branch', nodeId: 'u5', delta: -1 }]));
     const busy = mountWith(Message, { message: msg({ id: 'u5', role: 'user', blocks: [text('q')] }), branch: { index: 1, count: 3, siblingIds: [] }, branchDisabled: true });
-    ok([...busy.querySelectorAll('.branch button')].every((b) => b.disabled), 'buttons enabled while running');
+    const busyLinks = [...busy.querySelectorAll('.branch .link')];
+    ok(busyLinks.length === 2 && busyLinks.every((b) => b.classList.contains('disabled')), 'links enabled while running');
+    busyLinks[1].click();
     const single = mountWith(Message, { message: msg({ id: 'u6', role: 'user', blocks: [text('q')] }), branch: { index: 0, count: 1, siblingIds: [] } });
     equal(single.querySelector('.branch'), null);
   });
@@ -344,7 +348,7 @@ if (scenario === 'normal') {
   }
 
   // ------------------------------------------------------------ app flow
-  await test('app: list, open, status line, send with Enter, streaming stop, export menu', async () => {
+  await test('app (Framework7): panel list, open, status subnavbar, IME-safe Enter send, stop, popover menu', async () => {
     const sent = [];
     let push;
     const protocol = createFakeProtocol();
@@ -358,27 +362,32 @@ if (scenario === 'normal') {
       },
     });
     const target = document.createElement('div');
+    target.style.height = '700px';
     document.body.append(target);
     const app = mount(App, { target, props: { store } });
     cleanups.push(() => unmount(app));
     flushSync();
     await tick();
-    equal(target.querySelector('.status')?.textContent.trim(), '连接中…');
-    equal(target.querySelector('.composer button[type="submit"]').disabled, true);
+    ok(target.querySelector('.framework7-root .panel.panel-left'), 'no Framework7 left panel');
+    ok(target.querySelector('.view-main .page.chat .navbar'), 'no main view/page/navbar');
+    equal(target.querySelector('.status .status-text')?.textContent.trim(), '连接中…');
+    ok(target.querySelector('.status .preloader'), 'info status has a preloader');
+    ok(target.querySelector('.composer .button.send').classList.contains('disabled'), 'send enabled before bridge');
     push('hello', { ready: true, loggedIn: true });
     equal(target.querySelector('.status'), null, 'status line must disappear when healthy');
     push('conversation-list', { body: JSON.stringify({ items: [{ id: 'c1', title: '第一个' }, { id: 'c2', title: '第二个' }] }), offset: 0, complete: true });
-    const convButtons = [...target.querySelectorAll('.conv')];
-    equal(convButtons.map((b) => b.textContent.trim()).join('|'), '第一个|第二个');
-    convButtons[0].click();
+    const conv = () => [...target.querySelectorAll('.conv-list li')];
+    equal(conv().map((li) => li.querySelector('.item-title').textContent.trim()).join('|'), '第一个|第二个');
+    conv()[0].querySelector('a.item-link').click();
     flushSync();
     equal(JSON.stringify(sent.at(-1)), JSON.stringify(['open', { conversationId: 'c1' }]));
-    equal(target.querySelector('.conv[aria-current="page"]')?.textContent.trim(), '第一个');
-    equal(target.querySelector('.status')?.textContent.trim(), '正在同步对话…');
+    ok(conv()[0].querySelector('.item-selected'), 'current conversation not selected');
+    equal(target.querySelector('.page.chat .navbar .title').textContent.trim(), '第一个');
+    equal(target.querySelector('.status .status-text')?.textContent.trim(), '正在同步对话…');
     push('conversation', { conversationId: 'c1', body: canonical('c1', [['u1', null, 'user'], ['a1', 'u1']], 'a1', '第一个'), page: 1, pages: 1 });
     equal(target.querySelectorAll('.msg').length, 2);
     equal(target.querySelector('.msg[data-role="user"] .md').textContent, 'text u1');
-    const area = target.querySelector('textarea');
+    const area = target.querySelector('.composer textarea');
     equal(area.value, '恢复的草稿', 'draft restored from storage');
     area.value = '新问题';
     area.dispatchEvent(new Event('input', { bubbles: true }));
@@ -394,27 +403,25 @@ if (scenario === 'normal') {
     push('stream-start', { streamId: 's1', conversationId: 'c1', userMessageId: 'u2', parentMessageId: 'a1', resume: false });
     push('stream-chunk', { streamId: 's1', chunk: JSON.stringify([{ type: 'message', conversationId: 'c1', raw: { id: 'u2', role: 'user', status: 'done' } }, { type: 'message', conversationId: 'c1', raw: { id: 'a2' } }]) });
     equal(target.querySelectorAll('.turn').length, 2);
-    ok(target.querySelector('.conv[aria-current="page"] .running-dot'), 'running indicator missing');
-    const stop = target.querySelector('.composer .btn.stop');
+    equal(conv()[0].querySelector('.item-after')?.textContent.trim(), '生成中', 'running indicator missing');
+    const stop = target.querySelector('.composer .button.stop');
     ok(stop, 'stop button missing while streaming');
     stop.click();
     equal(sent.at(-1)[0], 'stop');
     push('stream-end', { streamId: 's1', ok: true });
     equal(JSON.stringify(sent.at(-1)), JSON.stringify(['refresh', { conversationId: 'c1' }]));
-    equal(target.querySelector('.composer .btn.stop'), null);
+    equal(target.querySelector('.composer .button.stop'), null);
     push('conversation-error', { conversationId: 'c1', code: 'network', retryAfterSec: null });
     const status = target.querySelector('.status[data-tone="error"]');
     ok(status, 'sync error not shown');
-    status.querySelector('button').click();
+    status.querySelector('.button').click();
     equal(JSON.stringify(sent.at(-1)), JSON.stringify(['refresh', { conversationId: 'c1' }]));
-    target.querySelector('[aria-label="更多操作"]').click();
-    flushSync();
-    const items = [...target.querySelectorAll('.menu button')].map((b) => b.textContent);
-    equal(items.join('|'), '导出 Markdown|显示官方界面');
-    [...target.querySelectorAll('.menu button')][1].click();
+    const menuItems = [...document.querySelectorAll('.menu-popover .item-link')];
+    equal(menuItems.map((a) => a.textContent.trim()).join('|'), '导出 Markdown|显示官方界面');
+    ok(target.querySelector('[data-popover=".menu-popover"]'), 'menu link does not open the popover');
+    menuItems[1].click();
     flushSync();
     equal(sent.at(-1)[0], 'show-official');
-    equal(target.querySelector('.menu'), null);
   });
 } else {
   // Lazy chunks (highlight.js, KaTeX) fail to load: content must stay intact.

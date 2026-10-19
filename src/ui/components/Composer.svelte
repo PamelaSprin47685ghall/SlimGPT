@@ -1,4 +1,6 @@
 <script>
+  import Button from 'framework7-svelte/components/button.svelte';
+  import Link from 'framework7-svelte/components/link.svelte';
   /**
    * @type {{
    *   draft: string, running: boolean, pending: boolean, blocked: boolean, notice: string, offBranch: boolean,
@@ -12,22 +14,17 @@
 
   const EFFORT_LABELS = { light: '轻度', standard: '标准', extended: '进阶', heavy: '深度' };
   const coarse = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
-
-  function resize() {
-    if (!area) return;
-    area.style.height = 'auto';
-    area.style.height = `${Math.min(area.scrollHeight, Math.round(window.innerHeight * 0.4))}px`;
-  }
+  const canSubmit = $derived(!blocked && !pending && !!draft.trim());
 
   $effect(() => {
     void draft;
-    resize();
+    if (!area) return;
+    area.style.height = 'auto';
+    area.style.height = `${Math.min(area.scrollHeight + 2, Math.round(window.innerHeight * 0.4))}px`; // + borders (border-box)
   });
 
-  function submit(event) {
-    event?.preventDefault();
-    if (blocked || !draft.trim()) return;
-    onsend(draft);
+  function submit() {
+    if (canSubmit) onsend(draft);
   }
 
   function onkeydown(event) {
@@ -38,17 +35,17 @@
   }
 </script>
 
-<form class="composer" onsubmit={submit}>
+<div class="composer">
   {#if error}
-    <p class="composer-error" role="alert">
+    <div class="composer-line is-error" role="alert">
       <span>{error}</span>
-      <button type="button" class="icon-btn" aria-label="关闭提示" onclick={ondismiss}>×</button>
-    </p>
+      <Link iconOnly aria-label="关闭提示" onClick={ondismiss}>×</Link>
+    </div>
   {:else if notice && !running}
-    <p class="composer-notice">
+    <div class="composer-line">
       <span>{notice}</span>
-      {#if offBranch}<button type="button" class="text-btn strong" onclick={onlatest}>回到最新分支</button>{/if}
-    </p>
+      {#if offBranch}<Button small onClick={onlatest}>回到最新分支</Button>{/if}
+    </div>
   {/if}
   <div class="composer-row">
     <textarea
@@ -62,18 +59,18 @@
       {onkeydown}
     ></textarea>
     {#if running}
-      <button type="button" class="btn stop" onclick={onstop}>停止</button>
+      <Button fill color="red" class="stop" onClick={onstop}>停止</Button>
     {:else}
-      <button type="submit" class="btn primary" disabled={blocked || pending || !draft.trim()}>{pending ? '发送中' : '发送'}</button>
+      <Button fill class="send {canSubmit ? '' : 'disabled'}" onClick={submit}>{pending ? '发送中' : '发送'}</Button>
     {/if}
   </div>
   {#if efforts.length}
     <label class="effort">
-      <span class="muted">思考强度</span>
+      <span>思考强度</span>
       <select value={effort} onchange={(event) => oneffort(event.currentTarget.value)}>
         <option value="">默认</option>
         {#each efforts as item (item)}<option value={item}>{EFFORT_LABELS[item] || item}</option>{/each}
       </select>
     </label>
   {/if}
-</form>
+</div>
