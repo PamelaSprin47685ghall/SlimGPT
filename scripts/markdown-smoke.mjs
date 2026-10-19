@@ -6,9 +6,11 @@ import { access, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 
-// Run production Markdown code in a real, clean Chromium DOM. No extension
-// profile, credentials, external requests, test-only globals in the app, or
-// screenshots-as-assertions are needed. Build outputs are temporary.
+// Run the production UI Markdown renderer and components (src/ui) in a real,
+// clean Chromium DOM. No extension profile, credentials, external requests,
+// test-only globals in the app, or screenshots-as-assertions are needed.
+// Build outputs are temporary. Scenario 'asset-failure' makes the lazily
+// loaded highlight.js and KaTeX chunks fail with HTTP 503.
 const temporary = await mkdtemp(join(tmpdir(), 'slimgpt-markdown-'));
 const output = join(temporary, 'bundle');
 let server;
@@ -25,16 +27,16 @@ try {
       rollupOptions: { input: resolve('tests/browser/markdown.spec.js'), output: { entryFileNames: 'test.js' } },
     },
   });
-  let blockToolModule = false;
+  let blockLazyChunks = false;
   server = createServer(async (request, response) => {
     try {
       const path = new URL(request.url, 'http://localhost').pathname;
       response.setHeader('Cache-Control', 'no-store');
-      if (blockToolModule && /\/tool-format[^/]*\.js$/.test(path)) {
+      if (blockLazyChunks && /\/(highlight|katex)-loader[^/]*\.(js|css)$/.test(path)) {
         response.writeHead(503).end('Intentional fixture-only module failure');
         return;
       }
-      response.setHeader('Content-Security-Policy', "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'none'; img-src 'none'; font-src 'none'");
+      response.setHeader('Content-Security-Policy', "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'none'; img-src 'none'; font-src 'none'");
       if (path === '/') {
         response.setHeader('Content-Type', 'text/html; charset=utf-8');
         response.end('<!doctype html><meta charset="utf-8"><pre id="result">PENDING</pre><script type="module" src="/test.js"></script>');
@@ -42,14 +44,14 @@ try {
       }
       const file = resolve(output, `.${path}`);
       if (!file.startsWith(`${output}${sep}`)) { response.writeHead(403).end(); return; }
-      response.setHeader('Content-Type', 'text/javascript; charset=utf-8');
+      response.setHeader('Content-Type', file.endsWith('.css') ? 'text/css; charset=utf-8' : 'text/javascript; charset=utf-8');
       response.end(await readFile(file));
     } catch { response.writeHead(404).end(); }
   });
   await new Promise((accept, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', accept); });
   const reports = [];
-  for (const scenario of ['normal', 'tool-load-failure']) {
-    blockToolModule = scenario === 'tool-load-failure';
+  for (const scenario of ['normal', 'asset-failure']) {
+    blockLazyChunks = scenario === 'asset-failure';
     const result = await new Promise((accept, reject) => {
       child = spawn(chrome, ['--headless=new', '--no-sandbox', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
         '--disable-background-networking', '--disable-sync', `--user-data-dir=${join(temporary, `profile-${scenario}`)}`,
